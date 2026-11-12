@@ -23,6 +23,13 @@ pub use crate::sequence::RekeyPhase;
 use crate::sequence::{Direction, SequenceError, SequenceState};
 use neotales_ssh::compression::CompressionAlgorithm;
 
+/// Independent opt-ins retained across transport rekeys.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompressionPolicy {
+    pub(crate) delayed: bool,
+    pub(crate) immediate: bool,
+}
+
 /// The maximum RFC 4253 identification line length, including CR LF.
 pub const MAX_IDENTIFICATION_LINE: usize = 255;
 
@@ -703,7 +710,7 @@ pub struct ClientTransport<S> {
     pub(crate) write_buffer: ProtectedWriteBuffer,
     pub(crate) established: bool,
     pub(crate) authenticated: bool,
-    pub(crate) delayed_compression: bool,
+    pub(crate) compression_policy: CompressionPolicy,
     pub(crate) client_version: String,
     pub(crate) peer_version: String,
     pub(crate) initial_algorithm: Option<String>,
@@ -755,7 +762,7 @@ where
                 write_buffer: ProtectedWriteBuffer::default(),
                 established: false,
                 authenticated: false,
-                delayed_compression: false,
+                compression_policy: CompressionPolicy::default(),
                 client_version: local_version.to_owned(),
                 peer_version: peer_version.clone(),
                 initial_algorithm: None,

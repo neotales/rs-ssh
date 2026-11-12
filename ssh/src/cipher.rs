@@ -782,7 +782,8 @@ impl PacketProtector {
         })
     }
 
-    /// Creates a handshake context whose compression waits for `USERAUTH_SUCCESS`.
+    /// Creates a NEWKEYS context: delayed zlib waits for `USERAUTH_SUCCESS`,
+    /// while RFC 4253 immediate zlib starts on the first protected packet.
     #[cfg_attr(test, allow(dead_code))] // Some source-borrowing harnesses only test active contexts.
     pub(crate) fn new_with_delayed_compression(
         suite: PacketSuite,
@@ -951,14 +952,15 @@ impl PacketProtector {
         {
             return Err(PacketProtectionError::InvalidPacket);
         }
-        let selected = if self.compression_active {
-            self.compression
-        } else {
-            CompressionAlgorithm::None
-        };
+        let selected =
+            if self.compression_active || self.compression == CompressionAlgorithm::ImmediateZlib {
+                self.compression
+            } else {
+                CompressionAlgorithm::None
+            };
         let (payload, padding) = match selected {
             CompressionAlgorithm::None => (self.stage_seal_input(payload), padding.to_vec()),
-            CompressionAlgorithm::Zlib => {
+            CompressionAlgorithm::Zlib | CompressionAlgorithm::ImmediateZlib => {
                 let mut compressed = self
                     .compressor
                     .get_or_insert_with(CompressionStream::default)
@@ -1123,8 +1125,9 @@ impl PacketProtector {
         sequence_number: u32,
         input: &[u8],
     ) -> Result<Vec<u8>, PacketProtectionError> {
-        let compression = (self.compression_active
-            && self.compression == CompressionAlgorithm::Zlib)
+        let compression = ((self.compression_active
+            || self.compression == CompressionAlgorithm::ImmediateZlib)
+            && self.compression != CompressionAlgorithm::None)
             .then(|| {
                 self.decompressor
                     .get_or_insert_with(DecompressionStream::default)

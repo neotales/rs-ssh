@@ -174,6 +174,68 @@ fn delayed_compression_leaves_authentication_uncompressed() {
 }
 
 #[test]
+fn immediate_zlib_compresses_authentication_and_retains_its_dictionary() {
+    let suite = PacketSuite::new(AES128_GCM_OPENSSH, None).expect("suite");
+    let material = || PacketKeyMaterial::gcm(&[0x56; 12], &[0x45; 16]);
+    // This is the constructor used by handshakes at NEWKEYS, before auth success.
+    let mut sender = PacketProtector::new_with_delayed_compression(
+        suite,
+        material(),
+        CompressionAlgorithm::ImmediateZlib,
+    )
+    .expect("sender");
+    let mut framing = PacketProtector::new(suite, material()).expect("framing");
+    let mut receiver = PacketProtector::new_with_delayed_compression(
+        suite,
+        material(),
+        CompressionAlgorithm::ImmediateZlib,
+    )
+    .expect("receiver");
+    let mut auth = vec![50]; // SSH_MSG_USERAUTH_REQUEST, with password method.
+    for field in [b"fixture".as_slice(), b"ssh-connection", b"password"] {
+        auth.extend_from_slice(&u32::try_from(field.len()).expect("length").to_be_bytes());
+        auth.extend_from_slice(field);
+    }
+    auth.push(0);
+    let password = b"shared authentication dictionary".repeat(64);
+    auth.extend_from_slice(&u32::try_from(password.len()).expect("length").to_be_bytes());
+    auth.extend_from_slice(&password);
+    let mut reader = flate2::Decompress::new(true);
+    let mut chunks = Vec::new();
+    for sequence in 0..2 {
+        let packet = sender.seal(sequence, &auth, &[0xa5; 8]).expect("seal auth");
+        assert_eq!(
+            receiver
+                .open(sequence, &packet)
+                .expect("immediate inbound auth"),
+            auth
+        );
+        let compressed = framing.open(sequence, &packet).expect("decrypt only");
+        assert_ne!(compressed, auth);
+        let mut decoded = Vec::with_capacity(auth.len() + 64);
+        reader
+            .decompress_vec(&compressed, &mut decoded, flate2::FlushDecompress::Sync)
+            .expect("independent zlib reader");
+        assert_eq!(decoded, auth);
+        chunks.push(compressed);
+    }
+    assert!(chunks[1].len() < chunks[0].len());
+    // Raw DEFLATE removes the missing-zlib-header explanation: the second
+    // chunk actually refers to dictionary bytes from the first packet.
+    let mut without_dictionary = Vec::with_capacity(auth.len() + 64);
+    let result = flate2::Decompress::new(false).decompress_vec(
+        &chunks[1],
+        &mut without_dictionary,
+        flate2::FlushDecompress::Sync,
+    );
+    assert!(result.is_err() || without_dictionary != auth);
+    sender.rekey(suite, material()).expect("rekey");
+    framing.rekey(suite, material()).expect("framing rekey");
+    let packet = sender.seal(2, &auth, &[0xa5; 8]).expect("seal after rekey");
+    assert_eq!(framing.open(2, &packet).expect("decrypt"), chunks[0]);
+}
+
+#[test]
 fn zlib_packets_share_an_independent_stream_and_rekey_resets_it() {
     use flate2::{Compression, Decompress, FlushDecompress, write::ZlibEncoder};
     use std::io::Write;

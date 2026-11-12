@@ -171,8 +171,9 @@ interoperability evidence:
   `ReverseListener` really binds an OS-selected port and replies with that port;
   protocol-only types in `tcpip_forward` still open no sockets.
 - `ResolvedConfig::to_kexinit()` applies implemented-only exact algorithm lists.
-  Unknown names, duplicates, and OpenSSH list modifiers error. Include remains
-  rejected and ProxyCommand remains inert text.
+  Unknown names, duplicates, and OpenSSH list modifiers error. Plain parsing
+  does not read Include files; the explicit loader does. Default connect does
+  not execute ProxyCommand; explicit process-spawning helpers are available.
 - SCP's `RemoteShell::PowerShell` preserves Windows backslashes and doubles
   literal quotes. POSIX quoting remains the default; neither detects a shell.
   SCP directory records (`D`/`E`) support bounded in-memory directory transfers;
@@ -316,7 +317,10 @@ are outside this change.
   `zlib@openssh.com`. Merely overriding KEXINIT does not opt in. Authentication
   packets, including USERAUTH_SUCCESS, remain uncompressed; subsequent packets
   use one continuous zlib context per direction, reset at that direction's
-  NEWKEYS boundary. Legacy immediate `zlib` remains unsupported, even with opt-in.
+  NEWKEYS boundary. RFC 4253 immediate `zlib` has a separate explicit opt-in,
+  `with_immediate_compression`, and compresses authentication packets from
+  NEWKEYS using continuous per-direction streams, reset at rekey. Delayed
+  compression does not imply this opt-in; defaults still offer only `none`.
   The standalone `compress_payload` / `decompress_payload` helpers handle finished
   streams, not SSH packet streams. Live OpenSSH compression interoperability is
   not verified here.
@@ -368,3 +372,5 @@ SSH unit workflow is unchanged.
 ## SSH configuration side effects
 
 Plain configuration parsing remains filesystem-free. Include files are read only when the caller explicitly uses the supplied loader; the directory loader confines canonicalized paths to its caller-provided root and limits expansion to depth 8 and 16 files. Ordinary connect does not execute ProxyCommand. A caller may explicitly invoke `proxy::spawn_proxy_command` for an already-resolved command; it starts the executable directly, without a default shell path.
+
+`proxy::spawn_proxy_command_shell` is a separate explicit helper requiring a caller-supplied POSIX-compatible shell path. It passes the resolved command intact as one `-c` argument, preserving quoted spaces through one shell. Callers must trust the command and shell-quote substituted values. Neither parsing nor default connect invokes it.

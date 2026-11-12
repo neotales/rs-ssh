@@ -16,6 +16,8 @@ use crate::cipher::{AlignmentError, PacketAlignment};
 
 /// The SSH compression name that performs no compression.
 pub const COMPRESSION_NONE: &str = "none";
+/// The RFC 4253 immediate zlib compression name.
+pub const COMPRESSION_ZLIB: &str = "zlib";
 /// The OpenSSH zlib compression name.
 pub const COMPRESSION_ZLIB_OPENSSH: &str = "zlib@openssh.com";
 
@@ -52,6 +54,8 @@ pub enum CompressionAlgorithm {
     None,
     /// OpenSSH zlib compression.
     Zlib,
+    /// RFC 4253 zlib compression, active from NEWKEYS, including authentication.
+    ImmediateZlib,
 }
 
 impl CompressionAlgorithm {
@@ -61,6 +65,7 @@ impl CompressionAlgorithm {
         match name {
             COMPRESSION_NONE => Some(Self::None),
             COMPRESSION_ZLIB_OPENSSH => Some(Self::Zlib),
+            COMPRESSION_ZLIB => Some(Self::ImmediateZlib),
             _ => None,
         }
     }
@@ -71,6 +76,7 @@ impl CompressionAlgorithm {
         match self {
             Self::None => COMPRESSION_NONE,
             Self::Zlib => COMPRESSION_ZLIB_OPENSSH,
+            Self::ImmediateZlib => COMPRESSION_ZLIB,
         }
     }
 }

@@ -1,6 +1,6 @@
 //! SSH `ProxyJump` and caller-supplied `ProxyCommand` transport routing.
 //!
-//! This module never resolves names, opens a socket, or starts a process. The
+//! Routing never resolves names, opens a socket, or starts a process. The
 //! caller supplies every initial stream and every jump dial operation. Once a
 //! jump transport is established, later hops are carried by owned
 //! `direct-tcpip` channel streams.
@@ -261,6 +261,36 @@ pub fn spawn_proxy_command(command: &str) -> io::Result<std::process::Child> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped());
     process.spawn()
+}
+
+/// Explicitly starts a resolved command using the caller's POSIX-compatible shell.
+///
+/// `shell` is an executable path, not a command line; no shell is chosen by default.
+/// `command` is passed intact as one `-c` argument, preserving its quoting across
+/// exactly one shell. The caller must quote substituted values for that shell
+/// and trust the command: shell expansion, pipelines, and redirection execute.
+/// Parsing and connecting never call this helper. The returned child has piped
+/// stdin/stdout; the caller must drain/close pipes and wait for or kill the child.
+///
+/// # Errors
+/// Returns an I/O error for an empty, oversized, NUL-containing command or spawn failure.
+#[cfg(unix)]
+pub fn spawn_proxy_command_shell(
+    shell: impl AsRef<std::path::Path>,
+    command: &str,
+) -> io::Result<std::process::Child> {
+    if command.trim().is_empty() || command.len() > 4096 || command.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid proxy shell command",
+        ));
+    }
+    std::process::Command::new(shell.as_ref())
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
 }
 
 /// Parses a comma-separated `ProxyJump` list.

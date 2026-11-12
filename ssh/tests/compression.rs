@@ -22,7 +22,46 @@ fn names_and_algorithms_are_explicit() {
         CompressionAlgorithm::from_name(COMPRESSION_ZLIB_OPENSSH),
         Some(CompressionAlgorithm::Zlib)
     );
-    assert_eq!(CompressionAlgorithm::from_name("zlib"), None);
+    assert_eq!(
+        CompressionAlgorithm::from_name("zlib"),
+        Some(CompressionAlgorithm::ImmediateZlib)
+    );
+}
+
+#[test]
+fn immediate_and_delayed_compression_have_separate_opt_ins() {
+    use neotales_ssh::{ClientConfig, ServerConfig, hostkey::Ed25519Signer};
+    let server = || ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32]));
+    for proposal in [ClientConfig::new().kexinit(), server().kexinit()] {
+        assert_eq!(proposal.compression_algorithms_client_to_server, ["none"]);
+        assert_eq!(proposal.compression_algorithms_server_to_client, ["none"]);
+    }
+    for proposal in [
+        ClientConfig::new().with_delayed_compression().kexinit(),
+        server().with_delayed_compression().kexinit(),
+    ] {
+        assert_eq!(
+            proposal.compression_algorithms_client_to_server,
+            ["zlib@openssh.com", "none"]
+        );
+        assert_eq!(
+            proposal.compression_algorithms_server_to_client,
+            ["zlib@openssh.com", "none"]
+        );
+    }
+    for proposal in [
+        ClientConfig::new().with_immediate_compression().kexinit(),
+        server().with_immediate_compression().kexinit(),
+    ] {
+        assert_eq!(
+            proposal.compression_algorithms_client_to_server,
+            ["zlib", "none"]
+        );
+        assert_eq!(
+            proposal.compression_algorithms_server_to_client,
+            ["zlib", "none"]
+        );
+    }
 }
 
 #[test]

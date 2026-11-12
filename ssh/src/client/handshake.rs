@@ -159,6 +159,7 @@ pub struct ClientConfig {
     legacy_algorithms: bool,
     kexinit: KexInit,
     delayed_compression: bool,
+    immediate_compression: bool,
 }
 
 impl Default for ClientConfig {
@@ -176,6 +177,7 @@ impl ClientConfig {
             security_key_verifier: None,
             legacy_algorithms: false,
             delayed_compression: false,
+            immediate_compression: false,
         }
     }
 
@@ -192,6 +194,7 @@ impl ClientConfig {
             security_key_verifier: None,
             legacy_algorithms: false,
             delayed_compression: false,
+            immediate_compression: false,
         }
     }
 
@@ -251,12 +254,40 @@ impl ClientConfig {
     }
 
     /// Offers and permits `zlib@openssh.com`, activated only after authentication.
-    /// Default configurations offer only `none`. Legacy immediate `zlib` is unsupported.
+    /// Default configurations offer only `none`. Does not enable immediate `zlib`.
     #[must_use]
     pub fn with_delayed_compression(mut self) -> Self {
         self.delayed_compression = true;
-        self.kexinit.compression_algorithms_client_to_server =
-            vec!["zlib@openssh.com".to_owned(), COMPRESSION_NONE.to_owned()];
+        if !self
+            .kexinit
+            .compression_algorithms_client_to_server
+            .iter()
+            .any(|name| name == "zlib@openssh.com")
+        {
+            self.kexinit
+                .compression_algorithms_client_to_server
+                .insert(0, "zlib@openssh.com".to_owned());
+        }
+        self.kexinit.compression_algorithms_server_to_client =
+            self.kexinit.compression_algorithms_client_to_server.clone();
+        self
+    }
+
+    /// Offers and permits RFC 4253 `zlib` from NEWKEYS, including authentication.
+    /// Not enabled by default or by `with_delayed_compression`. Streams reset at rekey.
+    #[must_use]
+    pub fn with_immediate_compression(mut self) -> Self {
+        self.immediate_compression = true;
+        if !self
+            .kexinit
+            .compression_algorithms_client_to_server
+            .iter()
+            .any(|name| name == "zlib")
+        {
+            self.kexinit
+                .compression_algorithms_client_to_server
+                .insert(0, "zlib".to_owned());
+        }
         self.kexinit.compression_algorithms_server_to_client =
             self.kexinit.compression_algorithms_client_to_server.clone();
         self
@@ -352,7 +383,10 @@ impl ClientConfig {
             crate::transport::ExtensionState::Disabled
         };
         transport.configure_rekey_proposal(self.kexinit.clone());
-        transport.delayed_compression = self.delayed_compression;
+        transport.compression_policy = crate::transport::CompressionPolicy {
+            delayed: self.delayed_compression,
+            immediate: self.immediate_compression,
+        };
         let client_payload = client_kexinit.encode()?;
 
         transport.write_handshake_packet(&client_payload, SSH_MSG_KEXINIT)?;
@@ -365,7 +399,11 @@ impl ClientConfig {
         let server_guess_is_correct = !server_kexinit.first_kex_packet_follows
             || kex_guess_matches(&server_kexinit, &algorithms);
         transport.configure_initial_algorithm(algorithms.kex.clone());
-        let protection = ProtectionPlan::from_algorithms(&algorithms, self.delayed_compression)?;
+        let protection = ProtectionPlan::from_algorithms(
+            &algorithms,
+            self.delayed_compression,
+            self.immediate_compression,
+        )?;
         let strict_kex = client_kexinit.strict_kex_enabled(&server_kexinit);
         transport.configure_strict_kex(strict_kex)?;
         transport.accept_handshake_packet(
@@ -971,7 +1009,8 @@ where
         }
         let protection = rekey_protection(ProtectionPlan::from_algorithms(
             &algorithms,
-            self.delayed_compression,
+            self.compression_policy.delayed,
+            self.compression_policy.immediate,
         )?);
         self.accept_rekey_kexinit(sequence)?;
         if crate::kex::modern::is_gex(&algorithms.kex) {
@@ -1398,6 +1437,7 @@ impl ProtectionPlan {
     fn from_algorithms(
         algorithms: &crate::msg::kexinit::NegotiatedAlgorithms,
         delayed_compression: bool,
+        immediate_compression: bool,
     ) -> Result<Self, HandshakeError> {
         if !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&algorithms.host_key.as_str())
             && algorithms.host_key != "ssh-rsa"
@@ -1405,10 +1445,17 @@ impl ProtectionPlan {
         {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
-        if !delayed_compression
-            && (algorithms.compression_client_to_server != COMPRESSION_NONE
-                || algorithms.compression_server_to_client != COMPRESSION_NONE)
-        {
+        if [
+            &algorithms.compression_client_to_server,
+            &algorithms.compression_server_to_client,
+        ]
+        .iter()
+        .any(|name| match name.as_str() {
+            "none" => false,
+            "zlib@openssh.com" => !delayed_compression,
+            "zlib" => !immediate_compression,
+            _ => true,
+        }) {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
         let write_compression =

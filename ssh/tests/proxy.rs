@@ -371,6 +371,23 @@ fn explicit_proxy_command_spawn_round_trips_one_byte() -> Result<(), Box<dyn std
 
 type Driver<'a> = Rc<RefCell<dyn FnMut() + 'a>>;
 
+#[cfg(unix)]
+#[test]
+fn explicit_proxy_shell_preserves_quoted_spaces_and_metacharacters()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !std::path::Path::new("/bin/sh").is_file() {
+        eprintln!("skipping: /bin/sh is unavailable");
+        return Ok(());
+    }
+    let command = "printf '%s' 'two words; $(not executed)'";
+    let child = proxy::spawn_proxy_command_shell("/bin/sh", command)?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"two words; $(not executed)");
+    assert!(proxy::spawn_proxy_command_shell("/bin/sh", " ").is_err());
+    Ok(())
+}
+
 #[derive(Default)]
 struct Queues {
     client_to_server: Rc<RefCell<VecDeque<u8>>>,
