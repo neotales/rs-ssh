@@ -9,6 +9,10 @@
 #[allow(dead_code)]
 mod hostkey;
 
+#[path = "../src/security_key.rs"]
+#[allow(dead_code)]
+mod security_key;
+
 use std::cell::Cell;
 use std::convert::Infallible;
 use std::panic::catch_unwind;

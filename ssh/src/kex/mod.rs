@@ -26,6 +26,7 @@ mod ecdh_p256;
 #[allow(dead_code)]
 #[path = "mlkem768_x25519.rs"]
 pub(crate) mod mlkem768_x25519;
+pub(crate) mod sntrup;
 // Legacy codec harnesses include this file without the transport dispatchers.
 // Their unused modern entry points are exercised through both public transports
 // by tests/kex_breadth.rs, not dead production code.

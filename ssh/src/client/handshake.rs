@@ -155,6 +155,7 @@ impl From<NegotiationError> for HandshakeError {
 /// callback contract and rejects other key types.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    security_key_verifier: Option<crate::security_key::SecurityKeyVerifier>,
     legacy_algorithms: bool,
     kexinit: KexInit,
     delayed_compression: bool,
@@ -172,6 +173,7 @@ impl ClientConfig {
     pub fn new() -> Self {
         Self {
             kexinit: supported_client_kexinit([0; 16]),
+            security_key_verifier: None,
             legacy_algorithms: false,
             delayed_compression: false,
         }
@@ -187,9 +189,35 @@ impl ClientConfig {
     pub fn with_kexinit(kexinit: KexInit) -> Self {
         Self {
             kexinit,
+            security_key_verifier: None,
             legacy_algorithms: false,
             delayed_compression: false,
         }
+    }
+
+    /// Offers security-key host algorithms only with explicit verification.
+    /// The callback owns cryptographic verification and presence/counter policy;
+    /// the separate host trust callback still must approve the resulting key.
+    /// No device access or hardware-provenance claim is made.
+    #[must_use]
+    pub fn with_security_key_verifier(
+        mut self,
+        verifier: crate::security_key::SecurityKeyVerifier,
+    ) -> Self {
+        self.security_key_verifier = Some(verifier);
+        for name in [crate::security_key::ED25519, crate::security_key::ECDSA] {
+            if !self
+                .kexinit
+                .server_host_key_algorithms
+                .iter()
+                .any(|offered| offered == name)
+            {
+                self.kexinit
+                    .server_host_key_algorithms
+                    .push(name.to_owned());
+            }
+        }
+        self
     }
 
     /// Enables deprecated SHA-1, CBC, 3DES, RC4, and group1 algorithms.
@@ -280,6 +308,14 @@ impl ClientConfig {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
         let mut client_kexinit = self.kexinit.clone();
+        if self.security_key_verifier.is_none()
+            && client_kexinit
+                .server_host_key_algorithms
+                .iter()
+                .any(|name| crate::security_key::supported(name))
+        {
+            return Err(HandshakeError::UnsupportedAlgorithm);
+        }
         if client_kexinit.reserved != 0 || client_kexinit.first_kex_packet_follows {
             return Err(HandshakeError::Kex(KexError::InvalidProposal));
         }
@@ -351,6 +387,7 @@ impl ClientConfig {
                 &completion.host,
                 &completion.signature,
                 &completion.hash,
+                self.security_key_verifier.as_ref(),
                 trust_callback,
             )?;
             transport.accept_handshake_packet(&pending, if gex { 33 } else { 31 }, None)?;
@@ -398,6 +435,7 @@ impl ClientConfig {
                     .signature_blob()
                     .ok_or(KexError::InvalidFieldLength)?,
                 completion.exchange_hash(),
+                self.security_key_verifier.as_ref(),
                 trust_callback,
             )?;
             transport.accept_handshake_packet(&pending_reply, SSH_MSG_KEX_ECDH_REPLY, None)?;
@@ -448,6 +486,7 @@ impl ClientConfig {
                 &completion.host_key_blob,
                 &completion.signature_blob,
                 &completion.exchange_hash,
+                self.security_key_verifier.as_ref(),
                 trust_callback,
             )?;
             transport.accept_handshake_packet(&pending_reply, SSH_MSG_KEX_ECDH_REPLY, None)?;
@@ -511,6 +550,7 @@ impl ClientConfig {
             reply.host_key_blob(),
             reply.signature_blob(),
             &exchange_hash,
+            self.security_key_verifier.as_ref(),
             trust_callback,
         )?;
         transport.accept_handshake_packet(&pending_reply, SSH_MSG_KEX_ECDH_REPLY, None)?;
@@ -1252,6 +1292,7 @@ where
             host_key_blob,
             signature_blob,
             exchange_hash,
+            trusted.security_key_verifier.as_ref(),
             |_| Ok::<(), ()>(()),
         )?;
         Ok(())
@@ -1340,6 +1381,7 @@ impl ProtectionPlan {
     ) -> Result<Self, HandshakeError> {
         if !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&algorithms.host_key.as_str())
             && algorithms.host_key != "ssh-rsa"
+            && !crate::security_key::supported(&algorithms.host_key)
         {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }

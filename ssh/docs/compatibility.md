@@ -38,6 +38,32 @@ and on Unix, real `ssh-agent` authentication.
 
 ## Protocol coverage that is not a live OpenSSH claim
 
+### Callback security keys and sntrup (2026-11-12)
+
+`ClientConfig::with_security_key_verifier(SecurityKeyVerifier::new(...))` opts
+into `sk-ssh-ed25519@openssh.com` and
+`sk-ecdsa-sha2-nistp256@openssh.com` host verification. Without it neither is
+advertised, and explicit proposals and peer signatures are rejected. The
+separate host-trust callback remains mandatory. `security_key::Verification`
+contains the public key, application, SSH signature blob, flags, counter, and
+PROTOCOL.u2f preimage `SHA256(application) || flags || counter || SHA256(message)`.
+The verifier must perform cryptographic verification and application/presence/
+counter policy; false or panic denies. Unknown flags/extensions and trailing or
+truncated framing fail before callback invocation. Rekey pins the public blob
+and retains this verifier. Tests use a fake callback; no hardware provenance,
+resident key, signing device, userauth integration, or USB access is claimed.
+
+Both handshakes support `sntrup761x25519-sha512@openssh.com` through explicit
+KEXINIT selection, with unchanged default proposals. Strict/non-strict loopback
+tests cover 1190-byte client values, 1071-byte server values, a 64-byte session
+identifier and protected traffic. SHA-512 hashes the concatenated KEM and raw
+X25519 secrets, encoded as an SSH string (not mpint); transcript and key expansion
+also use SHA-512. The exact pure-Rust `sntrup-kem =0.1.0-rc.0` dependency uses
+`force-scalar`; no C, assembly or cc build script was added. Length/low-order/
+tamper tests also run offline. This is not a live OpenSSH interoperability claim.
+ML-DSA remains unimplemented/unadvertised: exact SSH identifiers were not
+confirmed in the crate docs or existing repo comments; see `reviews/unaccounted.md`.
+
 Both handshakes support `ssh-ed25519`, `rsa-sha2-256`, `rsa-sha2-512`, and
 ECDSA P-256/P-384/P-521 host keys. SHA-1 `ssh-rsa` is not offered by default.
 `ServerConfig::with_rsa_host_key` and the ECDSA host-key builders add signing

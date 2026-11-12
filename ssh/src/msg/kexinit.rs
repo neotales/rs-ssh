@@ -325,6 +325,7 @@ pub(crate) const MAC_SHA2_512_ETM_OPENSSH: &str = MAC_HMAC_SHA2_512_ETM_OPENSSH;
 /// The list is a proposal, not a ranking: preference order lives in
 /// [`DEFAULT_KEX_ALGORITHMS`].
 pub(crate) const SUPPORTED_KEX_ALGORITHMS: &[&str] = &[
+    "sntrup761x25519-sha512@openssh.com",
     KEX_MLKEM768X25519_SHA256,
     KEX_CURVE25519_SHA256,
     KEX_CURVE25519_SHA256_LIBCSSH,
@@ -366,6 +367,7 @@ pub(crate) const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[
 /// crate has to understand, and because it is what makes the gap between
 /// "recognised" and "accepted" visible instead of invisible.
 pub(crate) const KNOWN_KEX_ALGORITHMS: &[&str] = &[
+    "sntrup761x25519-sha512@openssh.com",
     KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256,
     KEX_CURVE25519_SHA256,
     KEX_CURVE25519_SHA256_LIBCSSH,
@@ -439,6 +441,7 @@ pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// [`KNOWN_KEX_ALGORITHMS`] and [`KNOWN_HOST_KEY_ALGORITHMS`].
 pub(crate) const SUPPORTED_ALGORITHMS: &[&str] = &[
     // SUPPORTED_KEX_ALGORITHMS
+    "sntrup761x25519-sha512@openssh.com",
     KEX_ECDH_SHA2_NISTP384,
     KEX_ECDH_SHA2_NISTP521,
     KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256,

@@ -17,6 +17,8 @@ use zeroize::Zeroize;
 /// A validated public key selected by the transport's host-key negotiation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostPublicKey {
+    /// Callback-verified OpenSSH security-key blob; no hardware provenance claim.
+    SecurityKey(Vec<u8>),
     /// Structurally parsed Ed25519 certificate with verified proof of subject
     /// possession. CA/principal/time trust still belongs to the callback;
     /// prefer `ClientConfig::connect_with_known_hosts` for certificate trust.
@@ -40,7 +42,7 @@ impl HostPublicKey {
     /// Returns a bounded host-key error if encoding fails.
     pub fn to_blob(&self) -> Result<Vec<u8>, HostKeyError> {
         match self {
-            Self::Certificate(blob) => Ok(blob.clone()),
+            Self::Certificate(blob) | Self::SecurityKey(blob) => Ok(blob.clone()),
             Self::Ed25519(key) => key.to_blob(),
             Self::Rsa(key) => key.to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
             Self::Ecdsa(key) => key.to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
@@ -54,6 +56,7 @@ pub(crate) struct VerifiedServerHostKey {
     pub(crate) key: HostPublicKey,
     pub(crate) algorithm: String,
     pub(crate) legacy: Option<VerifiedHostKey>,
+    pub(crate) security_key_verifier: Option<crate::security_key::SecurityKeyVerifier>,
 }
 
 pub(crate) fn verify_algorithm_host_key<F, E>(
@@ -61,6 +64,7 @@ pub(crate) fn verify_algorithm_host_key<F, E>(
     blob: &[u8],
     signature: &[u8],
     hash: &[u8],
+    security_key_verifier: Option<&crate::security_key::SecurityKeyVerifier>,
     trust: F,
 ) -> Result<VerifiedServerHostKey, HostKeyError>
 where
@@ -77,6 +81,12 @@ where
         return Err(HostKeyError::UnsupportedAlgorithm);
     }
     let (key, legacy) = match algorithm {
+        crate::security_key::ED25519 | crate::security_key::ECDSA => {
+            security_key_verifier
+                .ok_or(HostKeyError::UnsupportedAlgorithm)?
+                .verify(algorithm, blob, signature, hash)?;
+            (HostPublicKey::SecurityKey(blob.to_vec()), None)
+        }
         neotales_ssh::cert::SSH_ED25519_CERT_V01 => {
             let certificate = neotales_ssh::cert::parse_certificate(blob)
                 .map_err(|_| HostKeyError::InvalidPublicKey)?;
@@ -137,6 +147,7 @@ where
             key,
             algorithm: algorithm.to_owned(),
             legacy,
+            security_key_verifier: security_key_verifier.cloned(),
         }),
         Ok(Err(_)) => Err(HostKeyError::TrustRejected),
         Err(_) => Err(HostKeyError::VerifierPanicked),
@@ -584,4 +595,26 @@ fn decode_signature_blob(blob: &[u8]) -> Result<Signature, HostKeyError> {
         .try_into()
         .map_err(|_| HostKeyError::InvalidFieldLength)?;
     Ok(Signature::from_bytes(&signature))
+}
+
+#[cfg(test)]
+mod security_key_tests {
+    use super::*;
+
+    #[test]
+    fn security_key_peer_signature_requires_verifier_before_trust() {
+        for algorithm in [crate::security_key::ED25519, crate::security_key::ECDSA] {
+            let mut signature = Writer::new();
+            signature.write_string(algorithm).unwrap();
+            let result = verify_algorithm_host_key(
+                algorithm,
+                &[],
+                signature.as_bytes(),
+                b"hash",
+                None,
+                |_| -> Result<(), ()> { panic!("trust must not be reached without verification") },
+            );
+            assert!(matches!(result, Err(HostKeyError::UnsupportedAlgorithm)));
+        }
+    }
 }

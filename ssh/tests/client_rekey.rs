@@ -23,6 +23,10 @@ mod sequence;
 #[path = "../src/hostkey.rs"]
 mod hostkey;
 
+#[path = "../src/security_key.rs"]
+#[allow(dead_code)]
+mod security_key;
+
 #[path = "../src/transport.rs"]
 mod transport;
 

@@ -13,7 +13,7 @@ categories = ["cryptography", "network-programming"]
 [dependencies]
 aes = { workspace = true, features = ["zeroize"] }
 aes-gcm = { workspace = true, features = ["zeroize"] }
-chacha20.workspace = true
+chacha20 = { workspace = true, features = ["zeroize"] }
 ctr = { workspace = true, features = ["zeroize"] }
 des.workspace = true
 ed25519-dalek.workspace = true
@@ -29,6 +29,7 @@ poly1305.workspace = true
 rsa = { workspace = true, features = ["sha2"] }
 sha1.workspace = true
 sha2 = "0.11"
+sntrup-kem = { version = "=0.1.0-rc.0", features = ["force-scalar"] }
 subtle.workspace = true
 x25519-dalek.workspace = true
 # A direct dependency because a public type carries `zeroize::Zeroizing`.

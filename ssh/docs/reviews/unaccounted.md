@@ -1,5 +1,52 @@
 # SSH remediation handoff
 
+## 2026-11-12: callback security keys and sntrup; ML-DSA blocked
+
+1. Added callback-only security-key host verification and opt-in client proposals.
+   PROTOCOL.u2f public application and signature flags/counter are parsed exactly;
+   callbacks receive the constructed signed preimage and own cryptographic and
+   authenticator policy. Fake-callback tests are not a hardware claim. Absent
+   callbacks reject explicit proposals and peer signatures. Rekey retains the
+   verifier and pins the original public blob. No security-key signer, userauth
+   integration, resident-key enrollment, USB access or credential access is added.
+2. Both handshakes completed sntrup761x25519-sha512@openssh.com in strict and
+   non-strict tests with protected traffic before adding it to supported catalogs.
+   Default proposals are unchanged; select it with explicit KEXINIT. The exact
+   dependency is sntrup-kem =0.1.0-rc.0, force-scalar: build=false, Rust sources,
+   no C/assembly/cc build script. Its newly locked rand_chacha 0.10.0 dependency
+   is Rust-only too. sntrup761 0.4.0 was rejected because its manifest enables
+   sha2 0.10's asm feature on x86/ARM. The selected crate was fetched successfully;
+   tests contain no fetch. OpenSSH kexsntrup761x25519.c confirms string-encoded
+   SHA512(KEM-secret || raw-X25519-secret); transcript and KDF use SHA-512.
+3. **ML-DSA blocked on wire-name confirmation under the supplied source rule.**
+   No ML-DSA crate was already in Cargo.lock. `cargo info ml-dsa` fetched
+   RustCrypto ml-dsa 0.1.2, whose README and crate docs specify FIPS 204 and the
+   44/65/87 parameter sets, but no SSH algorithm identifiers or SSH wire format.
+   Existing repo comments contain no Go-compatible ML-DSA wire names; review
+   prose only links draft-sfluhrer-ssh-mldsa-08 and mentions Go's build guard.
+   No guessed identifier, dependency, stub signer, or supported-catalog entry was
+   added. Implementing ML-DSA needs confirmed exact Go/draft identifiers and
+   draft framing/context rules, followed by a real crate sign/verify test.
+
+No existing KEX name was removed. No commit, push, atlas edit or E2E gate.
+
+Final verification from `rs/lib` (offline after the dependency fetch):
+
+- `cargo test -p neotales-ssh --lib --test security_key --test kex_breadth --offline`
+  — 34 passed, zero failures. Includes fake-callback framing/default-denial,
+  peer denial without a verifier, both sntrup handshakes, malformed/low-order/
+  tampered values, and independent Python SHA-512 transcript/KDF fixtures.
+- `cargo test -p neotales-ssh --all-targets --all-features --offline`
+  — 641 passed, 19 ignored, zero failures across 58 test binaries.
+- `cargo clippy -p neotales-ssh --all-targets --all-features --offline -- -D warnings`
+  — passed without warnings.
+
+The first all-target clippy run exposed integration tests compiling source
+modules by path without the new security-key sibling. All nine such harnesses
+now include that sibling with their local HostKeyError type; no production
+type or error conversion was weakened. Edited Rust files were formatted with
+`rustfmt --edition 2024`. The pre-existing `des` lockfile correction is retained.
+
 ## Latest continuation: agent server, explicit pipe, GSSAPI MIC
 
 All four requested task files were read. Completed in this continuation:

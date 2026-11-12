@@ -84,6 +84,7 @@ pub(crate) mod msg {
         // mirror and the real module would only show up as a doctest that
         // documents a proposal this crate would refuse.
         pub const SUPPORTED_KEX_ALGORITHMS: &[&str] = &[
+            "sntrup761x25519-sha512@openssh.com",
             KEX_MLKEM768X25519_SHA256,
             CURVE25519_SHA256,
             CURVE25519_SHA256_LIBSSH,
@@ -293,6 +294,7 @@ pub mod proxy;
 #[allow(clippy::missing_errors_doc)]
 pub mod rsa_hostkey;
 pub mod scp;
+pub mod security_key;
 pub mod server_policy;
 pub mod sftp;
 pub mod ssh_config;

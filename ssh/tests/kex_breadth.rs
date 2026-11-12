@@ -56,6 +56,7 @@ fn new_and_baseline_exchanges_complete_with_correct_session_widths_and_stages()
         ("ecdh-sha2-nistp256", 32),
         ("diffie-hellman-group16-sha512", 64),
         ("mlkem768x25519-sha256", 32),
+        ("sntrup761x25519-sha512@openssh.com", 64),
         ("ecdh-sha2-nistp384", 48),
         ("ecdh-sha2-nistp521", 64),
         ("diffie-hellman-group-exchange-sha256", 32),

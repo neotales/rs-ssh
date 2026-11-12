@@ -23,7 +23,10 @@ const GROUP_BITS: u32 = 4096;
 const REQUEST: [u32; 3] = [4096, 4096, 4096];
 
 pub(crate) fn supported(name: &str) -> bool {
-    matches!(name, P384 | P521 | GEX | GEX_SHA1 | GROUP1)
+    matches!(
+        name,
+        P384 | P521 | GEX | GEX_SHA1 | GROUP1 | super::sntrup::NAME
+    )
 }
 
 #[derive(Debug)]
@@ -91,6 +94,7 @@ impl Context {
 }
 
 enum Secret {
+    Sntrup(super::sntrup::Client),
     P384(p384::SecretKey),
     P521(p521::SecretKey),
     Dh(EphemeralKey),
@@ -98,6 +102,9 @@ enum Secret {
 }
 impl Secret {
     fn generate(algorithm: &str) -> Result<Self, KexError> {
+        if algorithm == super::sntrup::NAME {
+            return super::sntrup::Client::new().map(Self::Sntrup);
+        }
         if algorithm == GROUP1 {
             return DhGroup16::new().generate_private().map(Self::Group1);
         }
@@ -124,6 +131,7 @@ impl Secret {
     }
     fn public(&self) -> Result<Vec<u8>, KexError> {
         match self {
+            Self::Sntrup(client) => Ok(client.public.clone()),
             Self::P384(key) => Ok(key.public_key().to_sec1_point(false).to_bytes().to_vec()),
             Self::P521(key) => Ok(key.public_key().to_sec1_point(false).to_bytes().to_vec()),
             Self::Dh(key) => DhGroup16::new().public_key(key),
@@ -150,6 +158,7 @@ impl Secret {
             }};
         }
         match self {
+            Self::Sntrup(client) => client.complete(peer),
             Self::P384(key) => curve!(key, p384, 97),
             Self::P521(key) => curve!(key, p521, 133),
             Self::Dh(key) => DhGroup16::new().agree(key, peer),
@@ -244,7 +253,11 @@ impl Client {
         let peer = if expected == 33 || self.context.algorithm == GROUP1 {
             magnitude(&mut reader)?
         } else {
-            reader.read_string_with_limit(133)?
+            reader.read_string_with_limit(if self.context.algorithm == super::sntrup::NAME {
+                super::sntrup::SERVER_LEN
+            } else {
+                133
+            })?
         };
         let signature = reader.read_string()?.to_vec();
         if !reader.is_empty() {
@@ -341,14 +354,22 @@ impl Server {
         let client = if gex || self.context.algorithm == GROUP1 {
             magnitude(&mut reader)?
         } else {
-            reader.read_string_with_limit(133)?
+            reader.read_string_with_limit(if self.context.algorithm == super::sntrup::NAME {
+                super::sntrup::CLIENT_LEN
+            } else {
+                133
+            })?
         };
         if !reader.is_empty() {
             return Err(KexError::TrailingData);
         }
-        let secret = Secret::generate(&self.context.algorithm)?;
-        let public = secret.public()?;
-        let shared = secret.agree(client)?;
+        let (public, shared) = if self.context.algorithm == super::sntrup::NAME {
+            super::sntrup::respond(client)?
+        } else {
+            let secret = Secret::generate(&self.context.algorithm)?;
+            let public = secret.public()?;
+            (public, secret.agree(client)?)
+        };
         let hash = self
             .context
             .exchange_hash(&self.host, client, &public, &shared, self.bounds)?;
@@ -411,7 +432,7 @@ fn hash(algorithm: &str, input: &[u8]) -> Vec<u8> {
     match algorithm {
         GROUP1 | GEX_SHA1 => sha1::Sha1::digest(input).to_vec(),
         P384 => Sha384::digest(input).to_vec(),
-        P521 => Sha512::digest(input).to_vec(),
+        P521 | super::sntrup::NAME => Sha512::digest(input).to_vec(),
         _ => Sha256::digest(input).to_vec(),
     }
 }
@@ -424,7 +445,7 @@ pub(crate) fn derive(
 ) -> Result<DerivedKeys, KexError> {
     let width = match algorithm {
         P384 => 48,
-        P521 => 64,
+        P521 | super::sntrup::NAME => 64,
         GEX => 32,
         GROUP1 | GEX_SHA1 => 20,
         _ => return Err(KexError::AlgorithmMismatch),
@@ -486,6 +507,44 @@ mod tests {
             algorithm: algorithm.to_owned(),
             prefix: b"\0\0\0\x02vc\0\0\0\x02vs\0\0\0\x02\x14c\0\0\0\x02\x14s".to_vec(),
         }
+    }
+    #[test]
+    fn sntrup_string_secret_transcript_and_expansion_match_python_sha512() {
+        // Independent Python hashlib/struct fixture: SHA512(bytes(range(64))),
+        // then SSH strings vc/vs/IC/IS/host/client/server/K. The high bit of K
+        // is set deliberately: an mpint encoding would add a zero and fail.
+        let material: Vec<u8> = (0..64).collect();
+        let shared = SharedSecret::from_raw_string(&Sha512::digest(&material)).unwrap();
+        assert_eq!(
+            shared.as_bytes(),
+            decode_hex(
+                "00000040ee4320ebaf3fdb4f2c832b137200c08e235e0fa7bbd0eb1740c7063ba8a0d151da77e003398e1714a955d475b05e3e950b639503b452ec185de4229bc4873949"
+            )
+        );
+        let h = context(super::super::sntrup::NAME)
+            .exchange_hash(b"host", b"client", b"server", &shared, None)
+            .unwrap();
+        assert_eq!(
+            h,
+            decode_hex(
+                "838475f3a920d5c9177c92efdf5b74efbd925381225f583b345f7c73f1f961137296b2074f09062c5990f2a5563bb9942176c80527ae1310cf8f80a5d6064d2a"
+            )
+        );
+        let lengths = DerivationLengths {
+            a: 100,
+            b: 0,
+            c: 0,
+            d: 0,
+            e: 0,
+            f: 0,
+        };
+        let keys = derive(super::super::sntrup::NAME, &shared, &h, &h, lengths).unwrap();
+        assert_eq!(
+            *keys.iv_client_to_server,
+            decode_hex(
+                "62dcbe92406dc4ee8ee65ee790c407be730e7768d2de4ea7951cb6218dae8a738a89e4562f423815110df32897105df38bafb4cfdf8ef21e1d122957337184996ca6cc36fb763fb836674962440efebfce60cfdedabb380356fa4427079da29a1b4f5857"
+            )
+        );
     }
     #[test]
     fn rfc_hash_and_multiblock_expansion_match_independent_fixtures() {
