@@ -1,89 +1,222 @@
 # neotales-ssh
 
-`neotales-ssh` is an SSH-2 protocol library for developers who want full control
-and may need to fork and patch it. It is not a sealed SSH client. Low-level
-protocol hooks stay public so callers can choose policy and build their own
-integration. The library does not read `~/.ssh`, shell out, or provide default
-peer trust.
+SSH-2 building blocks meant to be forked and patched. `recipes` covers common
+paths; every low-level API and policy hook remains public. Helpers do not read
+`~/.ssh`, execute local commands, or accept a host key by default.
 
-See [`docs/compatibility.md`](docs/compatibility.md) for verified
-interoperability claims and exclusions. This crate does not start an SSH server,
-host shell, or background service.
+## Command and script
 
-## Client transport and trust
-
-The callback is mandatory: there is no accept-any default. `connect` handles
-Ed25519 host keys; the callback runs only after the key's signature has been
-verified. Use `connect_with_host_keys` to decide trust for other host-key types.
-The callback is where the application supplies its trust policy.
+`recipes::run_command` opens a session, sends the exact `request_exec` bytes,
+and pumps `ClientSessions::dispatch_one` until exit-status. `run_script` uses
+the same path: the script **is** the command, with no interpreter selected.
+Both return `(stdout_bytes, status)`, discard stderr, and buffer stdout without
+a size limit. Use a dedicated endpoint; drain EOF/CLOSE afterward through the
+low-level API. Set socket deadlines in the application.
 
 ```rust,no_run
-use neotales_ssh::ClientConfig;
+use neotales_ssh::{ClientConfig, ClientSessions, ClientAuthMethod, authenticate_client};
+use neotales_ssh::{hostkey::Ed25519PublicKey, recipes};
 use std::net::TcpStream;
 
-let stream = TcpStream::connect(("example.org", 22))?;
-let transport = ClientConfig::new().connect(stream, |key| {
-    // Check the verified key against application policy.
-    trust_ed25519_key(key)
-})?;
-# Ok::<(), Box<dyn std::error::Error>>(())
+fn execute(expected: Ed25519PublicKey, methods: &[ClientAuthMethod])
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    let stream = TcpStream::connect(("example.org", 22))?;
+    let mut transport = ClientConfig::new().connect(stream, move |key| {
+        if key == &expected { Ok(()) } else { Err("host key mismatch") }
+    })?;
+    authenticate_client(&mut transport, "user", methods, 3)?;
+    let mut sessions = ClientSessions::new(transport);
+    let (stdout, status) = recipes::run_command(&mut sessions, b"printf hello")?;
+    assert_eq!(status, 0);
+    assert_eq!(stdout, b"hello");
+    // On a separate endpoint, or after draining the previous channel:
+    // recipes::run_script(&mut sessions, b"printf one\nprintf two\n")?;
+    Ok(())
+}
 ```
 
-The network example is illustrative; `trust_ed25519_key` represents the
-caller's own policy, not a crate helper. The crate does not speak TLS. SSH's
-equivalent peer-trust decision is the required host-key callback, called after
-signature verification; there is no TLS API here.
+```rust,no_run
+use neotales_ssh::{ClientSessions, channel::ChannelTransport, recipes};
+fn script<T: ChannelTransport>(sessions: &mut ClientSessions<T>)
+    -> Result<(), neotales_ssh::session::SessionError>
+{
+    let (stdout, status) = recipes::run_script(sessions, b"printf one\nprintf two\n")?;
+    assert_eq!((stdout.as_slice(), status), (b"onetwo".as_slice(), 0));
+    Ok(())
+}
+```
 
-## Server and sessions
+`ClientConfig::connect` verifies Ed25519 signatures before asking the required
+trust callback. `connect_with_host_keys` supplies trust for other host-key types.
+Pins and authentication methods above are application inputs, not loaded files.
 
-`ServerConfig::connect(stream)` builds a server protocol endpoint. Install
-session policy with `ServerSessions::with_policy`; the library does not launch
-a host shell or `sshd` for you. Client-side channels are managed through
-`ClientSessions` or the `session` module: open a session, then request exec,
-shell, subsystem, or SFTP as appropriate. `request_exec` takes command bytes;
-a script is an exec request containing the script bytes, not an implicit
-interpreter invocation.
+## One extra hop
 
-## Proxies and forwarding
+`recipes::jump` wraps `proxy::connect`, requiring exactly one `ProxyJump` entry.
+The trust callback is cloned per hop, including the destination. Supply explicit
+authentication for both. No `ProxyCommand` is accepted or executed by this helper.
 
-`proxy::connect` takes a `ClientConfig`, `ProxyTarget`, dial callback, separate
-jump-host and destination authentication, and a host-key trust callback cloned
-for each hop. `ProxyCommand` is not executed unless the caller explicitly uses
-`spawn_proxy_command` as the opener; that function starts an executable, not a
-shell.
+```rust,no_run
+use neotales_ssh::{ClientConfig, ClientAuthMethod, hostkey::Ed25519PublicKey, recipes};
+use neotales_ssh::proxy::{ProxyClient, ProxyTarget};
+use std::net::TcpStream;
 
-`tunnel::ReverseListener::bind(address, port)` binds only the numeric address
-provided by the caller. `TcpTunnel` is caller-driven through `poll_tcp` and
-`handle_event`; `direct_tcpip` describes local-forward metadata. These are
-building blocks, not a multi-connection forwarding product or background
-thread.
+fn through_jump(pins: Vec<Ed25519PublicKey>, methods: &[ClientAuthMethod],
+    hop_methods: Vec<ClientAuthMethod>) -> Result<ProxyClient<'static>, Box<dyn std::error::Error>>
+{
+    let target = ProxyTarget::new("destination.example", 22, "user", None, None);
+    let mut hop_methods = Some(hop_methods);
+    Ok(recipes::jump(&ClientConfig::new(), &target, "user@jump.example:22", methods,
+        |host, port| TcpStream::connect((host, port)),
+        move |_| hop_methods.take(),
+        move |key| if pins.contains(key) { Ok(()) } else { Err("host key mismatch") },
+    )?)
+}
+```
 
-## File transfer
+The lower-level `proxy::connect` also supports multiple hops and an explicit
+caller-supplied `ProxyCommand` byte-stream opener. It does not execute a command
+implicitly. `spawn_proxy_command` is a separate, explicit process-launch hook.
 
-SCP provides `scp::upload`, `scp::download`, and `ScpClient`; the directory
-helpers `upload_directory` and `download_directory` operate on an in-memory
-tree. Progress is not a library type: count bytes in the caller around the
-transfer, for example by wrapping the input/output stream.
+## Reverse tunnel bind
 
-SFTP uses `SftpClient::connect` over a byte stream supplied by the caller, then
-`write` and `read` operations. The in-process SFTP server is memory-backed; it
-does not expose the host filesystem.
+```rust,no_run
+use neotales_ssh::tunnel::ReverseListener;
+let mut listener = ReverseListener::bind("127.0.0.1", 0)?;
+let bound = listener.local_addr()?;
+assert_ne!(bound.port(), 0);
+// Application handles requests and accepts through handle_request/poll_accept.
+listener.cancel();
+# Ok::<(), std::io::Error>(())
+```
 
-## Algorithms and security keys
+This binds only the numeric address supplied. It is not a background forwarding
+service: drive `ReverseListener::handle_request` / `poll_accept` and
+`TcpTunnel::poll_tcp` / `handle_event` yourself. See `tcpip_forward` for SSH
+forward requests and `direct_tcpip` for local-forward channel metadata.
 
-`KexInit` is public, and `with_legacy_algorithms` is an explicit opt-in.
-RC4/arcfour is rejected even with that option. Security-key support currently
-means callback-based verification; signer and USB-device support are not
-provided.
+## One-file SCP upload and download
 
-## Build and test
+`recipes::copy_up` calls `scp::upload`; `copy_down` calls `scp::download`.
+Both operate on an **already established SCP byte stream**, not raw SSH packets.
+Open a channel and send `ClientSessions::request_scp_upload` or
+`request_scp_download`, check acceptance, and bridge its `Data`/`send_data` path to
+the byte stream. The caller owns that adapter and channel cleanup.
 
-From the repository root:
+The required `Fn(u64)` callback gets payload bytes, not headers. The existing
+SCP functions transfer the whole in-memory body, so these helpers report the
+full length once, after success. There is no hidden progress type.
+
+```rust,no_run
+use neotales_ssh::recipes;
+use std::io::{Read, Write};
+
+fn transfer<S: Read + Write>(upload_stream: &mut S, download_stream: &mut S)
+    -> Result<(), neotales_ssh::scp::ScpError>
+{
+    recipes::copy_up(upload_stream, "report.txt", b"report", |bytes| {
+        println!("uploaded {bytes} bytes");
+    })?;
+    let file = recipes::copy_down(download_stream, |bytes| {
+        println!("downloaded {bytes} bytes");
+    })?;
+    assert_eq!(file.data, b"report");
+    Ok(())
+}
+```
+
+For explicit modes, timestamps or reusable endpoints use `ScpClient`,
+`scp::upload_with_mode`, and `scp::upload_with_time`. Directory transfers use
+`scp::upload_directory` / `download_directory` with an in-memory tree.
+
+## SFTP session
+
+`recipes::sftp_session` opens a channel and sends `request_sftp`. It returns a
+channel ID, **not** an `SftpClient`: there is no built-in session-channel byte
+adapter/multiplexer. The caller still drives the channel, checks request
+success, returns window credit, and closes it. `SftpClient::connect` needs the
+adapted subsystem byte stream; never pass it the raw SSH transport.
+
+```rust,no_run
+use neotales_ssh::{ClientSessions, channel::ChannelTransport, recipes};
+use neotales_ssh::session::SessionEvent;
+fn subsystem<T: ChannelTransport>(sessions: &mut ClientSessions<T>)
+    -> Result<(), neotales_ssh::session::SessionError>
+{
+    let channel = recipes::sftp_session(sessions)?;
+    match sessions.dispatch_one()? {
+        SessionEvent::RequestSucceeded { session } if session == channel => {
+            // Now bridge this channel's Data/send_data to SftpClient::connect.
+            Ok(())
+        }
+        _ => Err(neotales_ssh::session::SessionError::RequestRejected),
+    }
+}
+```
+
+The low-level names are `ClientSessions::open_session`, `request_subsystem`,
+`request_sftp`, `dispatch_one`, `send_data`, and `increase_local_window`.
+The in-process SFTP server is memory-backed, not a host-filesystem server.
+
+## Server
+
+`recipes::serve` is `ServerConfig::connect` plus
+`ServerSessions::with_policy`. Policy is required; no shell, child process or
+`sshd` starts. User authentication remains explicit before channel dispatch.
+
+```rust,no_run
+use neotales_ssh::{ServerConfig, ServerAuthPolicy, authenticate_server, recipes};
+use neotales_ssh::hostkey::Ed25519Signer;
+use neotales_ssh::session::SessionDecision;
+use std::net::TcpListener;
+
+fn server(signer: Ed25519Signer, auth_policy: &ServerAuthPolicy)
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    let listener = TcpListener::bind(("127.0.0.1", 2222))?;
+    let (stream, _) = listener.accept()?;
+    let config = ServerConfig::new(signer);
+    let mut sessions = recipes::serve(&config, stream, |_request| {
+        SessionDecision::reject() // Replace with application policy, never a host shell.
+    })?;
+    authenticate_server(sessions.connection_mut().transport_mut(), auth_policy)?;
+    let event = sessions.dispatch_one()?;
+    // Application interprets events and sends data/status/EOF/CLOSE explicitly.
+    drop(event);
+    Ok(())
+}
+```
+
+## TLS, algorithms, and security keys
+
+This crate does **not speak TLS**. For an expired or untrusted TLS server
+certificate in the Docker library, see
+`neotales_docker::TlsServerTrust::AllowExpiredOrUntrusted` and
+`DockerClient::connect_https_with_trust`. That override is explicit and is not
+the default; it is unrelated to SSH host-key trust.
+
+`KexInit` and `with_legacy_algorithms` remain public. RC4/arcfour is rejected,
+including with legacy opt-in. Security keys sign and verify **only through
+caller callbacks** (`security_key`); callback-based signers are provided, but
+there is no USB/device access.
+
+## Fork, patch, verify
+
+Start at `src/recipes.rs` for orchestration, `session.rs` / `channel.rs` for
+dispatch, `client/` and `server/` for handshakes, `auth.rs` for authentication,
+and `scp.rs` / `sftp.rs` for transfer codecs. Keep low-level hooks public and
+test trust and wire behavior, not only paired codec round-trips. See
+[`docs/compatibility.md`](docs/compatibility.md) for verified interoperability
+and exclusions. README Rust examples are included in the crate's doctests.
+
+From the Cargo workspace `rs/lib`:
 
 ```sh
-cargo test -p neotales-ssh
+cargo test -p neotales-ssh --lib recipes --offline
+cargo test -p neotales-ssh --doc --offline
+cargo clippy -p neotales-ssh --all-targets --all-features --offline -- -D warnings
 ```
 
-Long-running interoperability tests require `NEOTALES_SSH_E2E=1` and are not
-part of `cargo test -p neotales-ssh`. The crate uses Rust and the dependencies
-declared in its `Cargo.toml`.
+Opt-in interoperability tests require `NEOTALES_SSH_E2E=1`; the checks above
+do not require or enable them.

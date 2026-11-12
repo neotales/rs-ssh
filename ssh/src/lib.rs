@@ -22,6 +22,7 @@
 //!
 //! [`KexInit`], [`NegotiatedAlgorithms`], and [`NegotiationError`] are public
 //! so callers can construct and narrow proposals for either handshake.
+#![doc = include_str!("../README.md")]
 
 extern crate self as neotales_ssh;
 
@@ -295,6 +296,7 @@ pub mod mldsa_hostkey;
 pub mod openssh_key;
 pub mod private_key;
 pub mod proxy;
+pub mod recipes;
 #[allow(clippy::missing_errors_doc)]
 pub mod rsa_hostkey;
 pub mod scp;
