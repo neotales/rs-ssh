@@ -6,6 +6,11 @@ to be public but is not.
 
 ## The measurement, and why the first one was wrong
 
+Update: task 0013 exports `KexInit`, `NegotiatedAlgorithms`, and
+`NegotiationError` from the crate root. The doctest mirror exposes the same
+three names. The historical unnameable-type measurement below describes the
+state before that fix. The internal catalogs remain private.
+
 Count it with:
 
 ```sh

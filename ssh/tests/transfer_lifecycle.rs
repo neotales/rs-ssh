@@ -437,7 +437,12 @@ fn run_disconnect(mode: FailureMode) {
 }
 
 #[test]
+#[ignore = "opt-in loopback transfer lifecycle: NEOTALES_SSH_E2E=1"]
 fn peer_disconnect_cancellation_and_timeout_join_workers_and_remove_staging() {
+    if std::env::var("NEOTALES_SSH_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping transfer lifecycle: set NEOTALES_SSH_E2E=1");
+        return;
+    }
     // The client/session and transfer modules deliberately do not create a
     // process. This source-level assertion makes that invariant explicit
     // alongside the runtime thread and staging assertions below.

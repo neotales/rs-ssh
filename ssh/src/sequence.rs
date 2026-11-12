@@ -489,6 +489,8 @@ pub(crate) type KexNegotiationError = SequenceError;
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InitialKexPolicy {
+    method_remaining: [u8; 2],
+    group_exchange: bool,
     strict_kex: bool,
     inbound_phase: KexPhase,
     outbound_phase: KexPhase,
@@ -516,6 +518,8 @@ impl InitialKexPolicy {
     pub(crate) fn with_strict_kex(strict_kex: bool) -> Self {
         Self {
             strict_kex,
+            method_remaining: [1, 1],
+            group_exchange: false,
             inbound_phase: KexPhase::KexInit,
             outbound_phase: KexPhase::KexInit,
             inbound_newkeys: false,
@@ -523,6 +527,20 @@ impl InitialKexPolicy {
             terminal: false,
             established: false,
         }
+    }
+
+    /// Enables RFC 4419's two method packets per direction, before any method
+    /// packet. The method-specific parser still enforces the 34/31/32/33 order.
+    pub(crate) fn configure_group_exchange(&mut self) -> Result<(), SequenceError> {
+        if self.group_exchange
+            || self.inbound_phase != KexPhase::KexMethod
+            || self.outbound_phase != KexPhase::KexMethod
+        {
+            return Err(SequenceError::InvalidState);
+        }
+        self.method_remaining = [2, 2];
+        self.group_exchange = true;
+        Ok(())
     }
 
     /// Creates a policy from two KEX name-lists.
@@ -840,7 +858,11 @@ impl InitialKexPolicy {
                 self.set_direction_phase(direction, KexPhase::KexMethod);
             }
             PacketDisposition::KexMethod => {
-                self.set_direction_phase(direction, KexPhase::NewKeys);
+                let index = usize::from(direction != Direction::Inbound);
+                self.method_remaining[index] -= 1;
+                if self.method_remaining[index] == 0 {
+                    self.set_direction_phase(direction, KexPhase::NewKeys);
+                }
             }
             PacketDisposition::NewKeys => {
                 self.mark_newkeys(direction);
@@ -1729,6 +1751,10 @@ impl Default for SequenceState {
 }
 
 impl SequenceState {
+    /// Configures the initial RFC 4419 packet budget before method processing.
+    pub(crate) fn configure_group_exchange(&mut self) -> Result<(), SequenceError> {
+        self.policy.configure_group_exchange()
+    }
     /// Creates a fresh non-strict connection state with both counters at zero.
     #[must_use]
     pub(crate) fn new() -> Self {

@@ -39,6 +39,8 @@ pub enum SshConfigError {
     InvalidToken,
     /// `Include` is deliberately unsupported by this text-only module.
     Include,
+    /// An algorithm list was empty, duplicated, modified, or contained an unimplemented name.
+    InvalidAlgorithm,
 }
 
 impl fmt::Display for SshConfigError {
@@ -68,6 +70,9 @@ impl fmt::Display for SshConfigError {
             }
             Self::Include => {
                 formatter.write_str("SSH configuration Include directives are unsupported")
+            }
+            Self::InvalidAlgorithm => {
+                formatter.write_str("SSH configuration algorithm list is unsupported")
             }
         }
     }
@@ -231,6 +236,56 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
+    /// Builds an implemented-only client proposal from algorithm keywords.
+    ///
+    /// Explicit comma-separated lists preserve their order. OpenSSH list
+    /// modifiers (`+`, `-`, `^`) and wildcard names are not accepted by this
+    /// bounded subset. No file, environment, or proxy command is consulted.
+    /// `SendEnv` and `SetEnv` remain the responsibility of [`Self::environment_plan`].
+    ///
+    /// # Errors
+    /// Rejects every unknown/refused name, duplicate, or empty algorithm list.
+    pub fn to_kexinit(&self) -> Result<neotales_ssh::KexInit, SshConfigError> {
+        let mut proposal = neotales_ssh::ClientConfig::new().kexinit().clone();
+        if let Some(value) = &self.kex_algorithms {
+            let mechanisms = proposal
+                .kex_algorithms
+                .iter()
+                .filter(|name| !name.starts_with("kex-strict-") && !name.starts_with("ext-info-"))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut selected = select_algorithms(value, &mechanisms)?;
+            selected.extend(
+                proposal
+                    .kex_algorithms
+                    .iter()
+                    .filter(|name| name.starts_with("kex-strict-"))
+                    .cloned(),
+            );
+            proposal.kex_algorithms = selected;
+        }
+        if let Some(value) = &self.ciphers {
+            let selected =
+                select_algorithms(value, &proposal.encryption_algorithms_client_to_server)?;
+            proposal
+                .encryption_algorithms_client_to_server
+                .clone_from(&selected);
+            proposal.encryption_algorithms_server_to_client = selected;
+        }
+        if let Some(value) = &self.macs {
+            let selected = select_algorithms(value, &proposal.mac_algorithms_client_to_server)?;
+            proposal
+                .mac_algorithms_client_to_server
+                .clone_from(&selected);
+            proposal.mac_algorithms_server_to_client = selected;
+        }
+        if let Some(value) = &self.host_key_algorithms {
+            proposal.server_host_key_algorithms =
+                select_algorithms(value, &proposal.server_host_key_algorithms)?;
+        }
+        Ok(proposal)
+    }
+
     /// Returns the original command-line host.
     #[must_use]
     pub fn host(&self) -> &str {
@@ -266,6 +321,46 @@ impl ResolvedConfig {
     pub fn unknown(&self) -> &[(String, String)] {
         &self.unknown_keywords
     }
+
+    /// Builds the `env` requests implied by this config's `SendEnv` and `SetEnv`.
+    ///
+    /// `environment` is the caller's explicit environment. This method does not
+    /// read the process environment and does not send the requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`neotales_ssh::session::EnvironmentPlanError`] when a stored
+    /// directive or the supplied environment cannot form a bounded plan.
+    pub fn environment_plan<N, V>(
+        &self,
+        environment: impl IntoIterator<Item = (N, V)>,
+    ) -> Result<neotales_ssh::session::EnvironmentPlan, neotales_ssh::session::EnvironmentPlanError>
+    where
+        N: AsRef<str>,
+        V: AsRef<[u8]>,
+    {
+        neotales_ssh::session::EnvironmentPlan::from_send_and_set(
+            &self.send_env,
+            &self.set_env,
+            environment,
+        )
+    }
+}
+
+fn select_algorithms(value: &str, implemented: &[String]) -> Result<Vec<String>, SshConfigError> {
+    let mut selected = Vec::new();
+    for name in value.split(',') {
+        if !implemented.iter().any(|allowed| allowed == name)
+            || selected.iter().any(|selected| selected == name)
+        {
+            return Err(SshConfigError::InvalidAlgorithm);
+        }
+        selected.push(name.to_owned());
+    }
+    if selected.is_empty() {
+        return Err(SshConfigError::InvalidAlgorithm);
+    }
+    Ok(selected)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,6 +1,7 @@
-//! Ed25519 host-key blobs, signing, signature verification, and trust decisions.
+//! Host-key blobs, signing, signature verification, and trust decisions.
 //!
-//! This module implements the `ssh-ed25519` wire formats defined by RFC 8709.
+//! This module implements the `ssh-ed25519` wire formats defined by RFC 8709
+//! and the transport adapters for RSA SHA-2 and ECDSA P-256 host keys.
 //! Cryptographic signature verification and application trust policy are kept
 //! separate: [`verify_host_key_signature`] proves possession of a private key,
 //! while [`verify_and_trust_host_key`] additionally requires an explicit
@@ -13,7 +14,166 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use neotales_ssh::{Error as WireError, Reader, Writer};
 use zeroize::Zeroize;
 
-/// The only host-key and signature algorithm supported by this module.
+/// A validated public key selected by the transport's host-key negotiation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostPublicKey {
+    /// Structurally parsed Ed25519 certificate with verified proof of subject
+    /// possession. CA/principal/time trust still belongs to the callback;
+    /// prefer `ClientConfig::connect_with_known_hosts` for certificate trust.
+    Certificate(Vec<u8>),
+    /// Ed25519 host key.
+    Ed25519(Ed25519PublicKey),
+    /// RSA host key; the negotiated signature must use SHA-256 or SHA-512.
+    Rsa(neotales_ssh::rsa_hostkey::RsaPublicKey),
+    /// NIST P-256 host key.
+    Ecdsa(neotales_ssh::ecdsa_hostkey::EcdsaPublicKey),
+}
+
+impl HostPublicKey {
+    /// Encodes the public key as an SSH key blob.
+    ///
+    /// # Errors
+    /// Returns a bounded host-key error if encoding fails.
+    pub fn to_blob(&self) -> Result<Vec<u8>, HostKeyError> {
+        match self {
+            Self::Certificate(blob) => Ok(blob.clone()),
+            Self::Ed25519(key) => key.to_blob(),
+            Self::Rsa(key) => key.to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
+            Self::Ecdsa(key) => key.to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
+        }
+    }
+}
+
+pub(crate) struct VerifiedServerHostKey {
+    pub(crate) key: HostPublicKey,
+    pub(crate) algorithm: String,
+    pub(crate) legacy: Option<VerifiedHostKey>,
+}
+
+pub(crate) fn verify_algorithm_host_key<F, E>(
+    algorithm: &str,
+    blob: &[u8],
+    signature: &[u8],
+    hash: &[u8],
+    trust: F,
+) -> Result<VerifiedServerHostKey, HostKeyError>
+where
+    F: FnOnce(&HostPublicKey) -> Result<(), E>,
+{
+    // RSA's key blob name is ssh-rsa, but its signature MUST match the exact
+    // SHA-2 algorithm negotiated in KEXINIT. Never infer it from the blob.
+    let signature_algorithm = if algorithm == neotales_ssh::cert::SSH_ED25519_CERT_V01 {
+        SSH_ED25519
+    } else {
+        algorithm
+    };
+    if Reader::new(signature).read_string()? != signature_algorithm.as_bytes() {
+        return Err(HostKeyError::UnsupportedAlgorithm);
+    }
+    let (key, legacy) = match algorithm {
+        neotales_ssh::cert::SSH_ED25519_CERT_V01 => {
+            let certificate = neotales_ssh::cert::parse_certificate(blob)
+                .map_err(|_| HostKeyError::InvalidPublicKey)?;
+            if certificate.algorithm() != algorithm
+                || certificate.certificate_type() != neotales_ssh::cert::CertificateType::Host
+                || !certificate.critical_options().is_empty()
+            {
+                return Err(HostKeyError::TrustRejected);
+            }
+            let subject = Ed25519PublicKey::from_blob(certificate.subject_public_key_blob())?;
+            verify_host_key_signature(&subject, signature, hash)?;
+            (HostPublicKey::Certificate(blob.to_vec()), None)
+        }
+        SSH_ED25519 => {
+            let verified = verify_and_trust_host_key(blob, signature, hash, |_| Ok::<(), ()>(()))?;
+            (
+                HostPublicKey::Ed25519(*verified.public_key()),
+                Some(verified),
+            )
+        }
+        "rsa-sha2-256" | "rsa-sha2-512" => {
+            let key = neotales_ssh::rsa_hostkey::RsaPublicKey::from_blob(blob)
+                .map_err(|_| HostKeyError::InvalidPublicKey)?;
+            neotales_ssh::rsa_hostkey::verify_host_key_signature(&key, signature, hash)
+                .map_err(|_| HostKeyError::InvalidSignature)?;
+            (HostPublicKey::Rsa(key), None)
+        }
+        "ecdsa-sha2-nistp256" => {
+            let key = neotales_ssh::ecdsa_hostkey::EcdsaPublicKey::from_blob(blob)
+                .map_err(|_| HostKeyError::InvalidPublicKey)?;
+            neotales_ssh::ecdsa_hostkey::verify_host_key_signature(&key, signature, hash)
+                .map_err(|_| HostKeyError::InvalidSignature)?;
+            (HostPublicKey::Ecdsa(key), None)
+        }
+        _ => return Err(HostKeyError::UnsupportedAlgorithm),
+    };
+    match catch_unwind(AssertUnwindSafe(|| trust(&key))) {
+        Ok(Ok(())) => Ok(VerifiedServerHostKey {
+            key,
+            algorithm: algorithm.to_owned(),
+            legacy,
+        }),
+        Ok(Err(_)) => Err(HostKeyError::TrustRejected),
+        Err(_) => Err(HostKeyError::VerifierPanicked),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum HostSigner {
+    Certificate {
+        signer: std::sync::Arc<Ed25519Signer>,
+        blob: Vec<u8>,
+    },
+    Ed25519(std::sync::Arc<Ed25519Signer>),
+    Rsa(Box<neotales_ssh::rsa_hostkey::RsaHostSigner>),
+    Ecdsa(Box<neotales_ssh::ecdsa_hostkey::EcdsaSigner>),
+}
+
+impl HostSigner {
+    pub(crate) fn supports(&self, algorithm: &str) -> bool {
+        matches!(
+            (self, algorithm),
+            (
+                Self::Certificate { .. },
+                neotales_ssh::cert::SSH_ED25519_CERT_V01
+            ) | (Self::Ed25519(_), SSH_ED25519)
+                | (Self::Rsa(_), "rsa-sha2-256" | "rsa-sha2-512")
+                | (Self::Ecdsa(_), "ecdsa-sha2-nistp256")
+        )
+    }
+
+    pub(crate) fn public_key_blob(&self) -> Result<Vec<u8>, HostKeyError> {
+        match self {
+            Self::Certificate { blob, .. } => Ok(blob.clone()),
+            Self::Ed25519(signer) => signer.public_key_blob(),
+            Self::Rsa(signer) => signer
+                .public_key_blob()
+                .map_err(|_| HostKeyError::InvalidPublicKey),
+            Self::Ecdsa(signer) => signer
+                .public_key_blob()
+                .map_err(|_| HostKeyError::InvalidPublicKey),
+        }
+    }
+
+    pub(crate) fn sign(&self, hash: &[u8], algorithm: &str) -> Result<Vec<u8>, HostKeyError> {
+        if !self.supports(algorithm) {
+            return Err(HostKeyError::UnsupportedAlgorithm);
+        }
+        match self {
+            Self::Certificate { signer, .. } | Self::Ed25519(signer) => {
+                signer.sign_exchange_hash(hash)
+            }
+            Self::Rsa(signer) => signer
+                .sign_with_algorithm(hash, algorithm)
+                .map_err(|_| HostKeyError::SigningFailed),
+            Self::Ecdsa(signer) => signer
+                .sign_exchange_hash(hash)
+                .map_err(|_| HostKeyError::SigningFailed),
+        }
+    }
+}
+
+/// The Ed25519 host-key and signature algorithm.
 pub const SSH_ED25519: &str = "ssh-ed25519";
 
 /// The length of an Ed25519 seed accepted by [`Ed25519Signer::from_seed`].
@@ -33,17 +193,17 @@ pub const ED25519_SIGNATURE_LENGTH: usize = 64;
 pub enum HostKeyError {
     /// An RFC 4251 primitive was malformed, truncated, or oversized.
     Wire(WireError),
-    /// A host-key or signature algorithm was not `ssh-ed25519`.
+    /// A host-key or signature algorithm was unsupported in its context.
     UnsupportedAlgorithm,
     /// A public-point or signature field did not have its exact required length.
     InvalidFieldLength,
     /// A host-key or signature blob contained bytes after its defined fields.
     TrailingData,
-    /// A 32-byte value was not a usable compressed Ed25519 public point.
+    /// A public key was invalid for its selected algorithm.
     InvalidPublicKey,
     /// A 64-byte signature was malformed or did not authenticate the exchange hash.
     InvalidSignature,
-    /// The local Ed25519 signing operation failed.
+    /// The local host-key signing operation failed.
     SigningFailed,
     /// The application trust callback explicitly rejected the verified key.
     TrustRejected,
@@ -58,9 +218,9 @@ impl fmt::Display for HostKeyError {
             Self::UnsupportedAlgorithm => "SSH host-key algorithm is unsupported",
             Self::InvalidFieldLength => "SSH host-key field has an invalid length",
             Self::TrailingData => "SSH host-key blob contains trailing data",
-            Self::InvalidPublicKey => "SSH Ed25519 public key is invalid",
+            Self::InvalidPublicKey => "SSH host public key is invalid",
             Self::InvalidSignature => "SSH Ed25519 signature is invalid",
-            Self::SigningFailed => "SSH Ed25519 signing failed",
+            Self::SigningFailed => "SSH host-key signing failed",
             Self::TrustRejected => "SSH host key was rejected by application trust policy",
             Self::VerifierPanicked => "SSH host-key trust callback panicked",
         })

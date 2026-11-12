@@ -17,6 +17,25 @@ use neotales_ssh::MAX_PACKET_CONTENT;
 const SEQUENCE: u32 = 7;
 const BODY: &[u8] = b"neotales-ssh";
 
+#[test]
+fn in_place_seal_preserves_the_allocation_and_wipes_failed_input() -> Result<(), ChaChaCipherError>
+{
+    let cipher = ChaChaCipher::new(test_key())?;
+    for (sequence, length) in [(1, 1), (2, MAX_PACKET_CONTENT + 1)] {
+        let mut packet = clear_packet(&vec![0x45; length]);
+        packet.reserve(chacha_cipher::CHACHA_TAG_SIZE);
+        let address = packet.as_ptr();
+        cipher.seal_in_place(sequence, &mut packet)?;
+        assert_eq!(packet.as_ptr(), address);
+        let clear = cipher.open(sequence, &packet)?;
+        assert_eq!(&clear[4..], &vec![0x45; length]);
+    }
+    let mut invalid = vec![0x77; 3];
+    assert!(cipher.seal_in_place(3, &mut invalid).is_err());
+    assert!(invalid.is_empty());
+    Ok(())
+}
+
 fn test_key() -> Vec<u8> {
     (0..CHACHA_KEY_SIZE)
         .map(|value| u8::try_from(value).expect("test key byte fits"))

@@ -169,6 +169,45 @@ fn channel_close(recipient: ChannelId) -> Vec<u8> {
     writer.into_bytes()
 }
 
+#[test]
+fn server_sessions_acknowledge_peer_close_and_reuse_capacity()
+-> Result<(), Box<dyn std::error::Error>> {
+    use neotales_ssh::session::{ServerSessions, SessionDecision, SessionEvent};
+    let end = End::new();
+    let mut server = ServerSessions::with_policy(
+        End {
+            inner: Rc::clone(&end.inner),
+        },
+        |_| SessionDecision::accept(0),
+    );
+    for accepted in [false, true] {
+        // More than the channel ceiling: a retained channel makes this fail.
+        for _ in 0..1025 {
+            end.feed(&channel_open(7));
+            let SessionEvent::Opened { session } = server.dispatch_one()? else {
+                return Err("expected open".into());
+            };
+            if accepted {
+                let mut request = Writer::new();
+                request.write_byte(neotales_ssh::channel::SSH_MSG_CHANNEL_REQUEST);
+                request.write_uint32(session);
+                request.write_string("shell")?;
+                request.write_boolean(false);
+                end.feed(request.as_bytes());
+                server.dispatch_one()?;
+            }
+            end.inner.sent.borrow_mut().clear();
+            end.feed(&channel_close(session));
+            assert!(
+                matches!(server.dispatch_one()?, SessionEvent::Close { session: id } if id == session)
+            );
+            assert_eq!(&*end.inner.sent.borrow(), &[channel_close(7)]);
+            assert!(server.connection().channel(session).is_none());
+        }
+    }
+    Ok(())
+}
+
 /// Opens local channel 0 and confirms it with remote identifier 7.
 fn open_and_confirm(pair: &mut Pair) -> Result<ChannelId, Box<dyn std::error::Error>> {
     pair.client.open_channel(0, b"session", &[])?;

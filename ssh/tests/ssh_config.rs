@@ -13,6 +13,48 @@ use std::error::Error;
 use ssh_config::{SshConfigError, parse};
 
 #[test]
+fn resolved_algorithm_keywords_build_a_narrowed_implemented_only_proposal()
+-> Result<(), Box<dyn Error>> {
+    let config = parse("Host *\n KexAlgorithms curve25519-sha256\n Ciphers aes128-ctr\n MACs hmac-sha2-256\n HostKeyAlgorithms rsa-sha2-512\n ProxyCommand never-execute-this %h\n SendEnv LANG\n SetEnv MODE=test\n")?.resolve("peer", "user")?;
+    let proposal = config.to_kexinit()?;
+    assert_eq!(
+        proposal.encryption_algorithms_client_to_server,
+        ["aes128-ctr"]
+    );
+    assert_eq!(
+        proposal.encryption_algorithms_server_to_client,
+        ["aes128-ctr"]
+    );
+    assert_eq!(proposal.mac_algorithms_client_to_server, ["hmac-sha2-256"]);
+    assert_eq!(proposal.server_host_key_algorithms, ["rsa-sha2-512"]);
+    assert_eq!(
+        proposal.kex_algorithms,
+        ["curve25519-sha256", "kex-strict-c-v00@openssh.com"]
+    );
+    assert_eq!(
+        config.environment_plan([("LANG", b"C".as_slice())])?.len(),
+        2
+    );
+    for keyword in [
+        "Ciphers aes192-ctr",
+        "HostKeyAlgorithms ssh-rsa",
+        "KexAlgorithms unknown",
+        "MACs hmac-sha1",
+        "Ciphers +aes128-ctr",
+        "Ciphers aes128-ctr,aes128-ctr",
+    ] {
+        assert_eq!(
+            parse(&format!("Host *\n {keyword}\n"))?
+                .resolve("peer", "user")?
+                .to_kexinit(),
+            Err(SshConfigError::InvalidAlgorithm)
+        );
+    }
+    assert_eq!(parse("Include anything"), Err(SshConfigError::Include));
+    Ok(())
+}
+
+#[test]
 fn host_wildcards_and_negation_apply_only_to_the_original_host() -> Result<(), Box<dyn Error>> {
     let config = parse("Host api?.example,!skip.example\n  User deploy\n")?;
     let selected = config.resolve("api1.example", "default")?;

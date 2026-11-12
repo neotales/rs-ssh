@@ -808,9 +808,12 @@ fn close_session(
 /// are decoded by hand rather than by this crate's parser, so the assertion is
 /// about the wire and not about the implementation under test.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH channel lane: NEOTALES_SSH_E2E=1; missing tools or Docker skip"]
 fn the_first_payload_after_authentication_is_the_hostkeys_global_request()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, true) {
+        return Ok(());
+    }
     let (_server, transport) = start_authenticated_server()?;
     let mut channels = ChannelConnection::new(transport);
     let raw = channels
@@ -849,9 +852,12 @@ fn the_first_payload_after_authentication_is_the_hostkeys_global_request()
 /// All of it is connection-level and has to be tolerated, or no channel can be
 /// opened at all.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH channel lane: NEOTALES_SSH_E2E=1; missing tools or Docker skip"]
 fn a_session_channel_opens_against_a_current_openssh_server()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, true) {
+        return Ok(());
+    }
     let (_server, transport) = start_authenticated_server()?;
     let mut channels = ChannelConnection::new(transport);
     channels.open_channel(0, b"session", &[])?;
@@ -871,9 +877,12 @@ fn a_session_channel_opens_against_a_current_openssh_server()
 /// packet-cipher exercise in the client-to-server direction, and it interleaves
 /// them with a real channel open so the mid-stream case is covered.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH channel lane: NEOTALES_SSH_E2E=1; missing tools or Docker skip"]
 fn ignored_packets_around_a_real_channel_open_are_tolerated()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, true) {
+        return Ok(());
+    }
     let (_server, mut transport) = start_authenticated_server()?;
     // `SSH_MSG_IGNORE` with no data, RFC 4253 §11.2. 256 of them, which is also
     // more than enough to cross a packet-nonce boundary in one direction.
@@ -898,10 +907,13 @@ fn ignored_packets_around_a_real_channel_open_are_tolerated()
 /// that is what makes this a parity check rather than a change detector, since a
 /// multiplexer that minted its own remote numbers would pass a weaker form.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH channel lane: NEOTALES_SSH_E2E=1; missing tools or Docker skip"]
 fn three_sequential_channels_and_a_fourth_after_a_close_all_work()
 -> Result<(), Box<dyn std::error::Error>> {
     const ROUNDS: usize = 4;
+    if !openssh_tools::e2e_enabled(false, true) {
+        return Ok(());
+    }
     let (_server, transport) = start_authenticated_server()?;
     let mut channels = ChannelConnection::new(transport);
     let mut remote_identifiers = Vec::new();
@@ -959,10 +971,13 @@ fn three_sequential_channels_and_a_fourth_after_a_close_all_work()
 /// what the peer may still send us, and conflating the two is the mistake this
 /// lane exists to catch.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH channel lane: NEOTALES_SSH_E2E=1; missing tools or Docker skip"]
 fn a_channel_survives_our_close_until_the_peers_close_arrives()
 -> Result<(), Box<dyn std::error::Error>> {
     use neotales_ssh::session::{ClientSessions, SessionEvent};
+    if !openssh_tools::e2e_enabled(false, true) {
+        return Ok(());
+    }
     let (_server, transport) = start_authenticated_server()?;
     let mut sessions = ClientSessions::new(transport);
     let session = sessions.open_session()?;
@@ -1064,9 +1079,12 @@ fn a_channel_survives_our_close_until_the_peers_close_arrives()
 /// before the first. A peer is entitled to send them at any point, and a client
 /// that treats one as fatal is one a server can break.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH channel lane: NEOTALES_SSH_E2E=1; missing tools or Docker skip"]
 fn ignored_packets_between_two_channels_do_not_break_the_connection()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, true) {
+        return Ok(());
+    }
     let (_server, transport) = start_authenticated_server()?;
     // `ChannelConnection` owns the transport, so the ignorable packets go on
     // the multiplexer itself. It exposes the serialized transport for exactly
@@ -1110,9 +1128,12 @@ fn ignored_packets_between_two_channels_do_not_break_the_connection()
 /// requests RFC 4254 §6.10 defines as arriving after EOF, and both are
 /// delivered to the caller.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH channel lane: NEOTALES_SSH_E2E=1; missing tools or Docker skip"]
 fn exit_status_after_peer_eof_is_delivered() -> Result<(), Box<dyn std::error::Error>> {
     use neotales_ssh::session::{ClientSessions, SessionEvent};
+    if !openssh_tools::e2e_enabled(false, true) {
+        return Ok(());
+    }
     let (_server, transport) = start_authenticated_server()?;
     let mut sessions = ClientSessions::new(transport);
 

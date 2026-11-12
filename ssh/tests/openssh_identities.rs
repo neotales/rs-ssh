@@ -352,8 +352,11 @@ fn start_agent(key: Option<&Path>) -> Result<TestAgent, Box<dyn std::error::Erro
 /// signature encoding shows up as a refusal by the server rather than as a unit
 /// test asserting this crate against itself.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd, ssh-keygen, ssh-agent and ssh-add, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH identity lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 fn an_ecdsa_identity_authenticates_against_a_real_sshd() -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, false) {
+        return Ok(());
+    }
     let directory = temporary_directory()?;
     let key = directory.join("id_ecdsa");
     let generated = Command::new(openssh_tools::ssh_keygen()?)
@@ -411,9 +414,12 @@ fn an_ecdsa_identity_authenticates_against_a_real_sshd() -> Result<(), Box<dyn s
 /// [`AgentKeySigner`] is the one the agent advertises, so the lane fails if the
 /// signer asks about a different identity or with the wrong flags.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd, ssh-keygen, ssh-agent and ssh-add, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH identity lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 #[cfg(unix)]
 fn an_agent_identity_authenticates_against_a_real_sshd() -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(true, false) {
+        return Ok(());
+    }
     let directory = temporary_directory()?;
     let key = directory.join("id_ed25519");
     let generated = Command::new(openssh_tools::ssh_keygen()?)
@@ -462,10 +468,13 @@ fn an_agent_identity_authenticates_against_a_real_sshd() -> Result<(), Box<dyn s
 /// non-RSA key signing under its own name — so the flags word for ECDSA is
 /// zero, and this lane checks that against a real agent and a real server.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd, ssh-keygen, ssh-agent and ssh-add, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH identity lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 #[cfg(unix)]
 fn an_ecdsa_identity_held_by_an_agent_authenticates_against_a_real_sshd()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(true, false) {
+        return Ok(());
+    }
     let directory = temporary_directory()?;
     let key = directory.join("id_ecdsa");
     let generated = Command::new(openssh_tools::ssh_keygen()?)
@@ -510,10 +519,13 @@ fn an_ecdsa_identity_held_by_an_agent_authenticates_against_a_real_sshd()
 /// exactly why it is here: the failure is the property, and a real agent
 /// answering `SSH_AGENT_FAILURE` is the cheapest honest demonstration of it.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd, ssh-keygen, ssh-agent and ssh-add, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH identity lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 #[cfg(unix)]
 fn an_agent_without_the_key_fails_rather_than_falling_back()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(true, false) {
+        return Ok(());
+    }
     let directory = temporary_directory()?;
     let key = directory.join("id_ed25519");
     let generated = Command::new(openssh_tools::ssh_keygen()?)

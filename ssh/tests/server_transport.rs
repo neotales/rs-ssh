@@ -53,7 +53,7 @@ use kex::mlkem768_x25519::ClientKex as MlKemClientKex;
 use kex::{Curve25519, DerivationLengths, DerivedKeys, KexContext, KeyExchange, derive_keys};
 use msg::kexinit::{
     AES128_CTR, AES128_GCM_OPENSSH, AES256_CTR, AES256_GCM_OPENSSH, COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH, CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
+    CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
     ENCRYPTION_CHACHA20_POLY1305_OPENSSH, HMAC_SHA2_256, HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512,
     HMAC_SHA2_512_ETM_OPENSSH, HOST_KEY_SSH_ED25519, KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
     KEX_MLKEM768X25519_SHA256, KEX_STRICT_C_V00_OPENSSH, KexInit,
@@ -337,6 +337,10 @@ fn default_server_proposal_matches_the_supported_client_lists() {
             CURVE25519_SHA256_LIBSSH,
             ECDH_SHA2_NISTP256,
             KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+            // Task 0007 adds these only after both handshakes complete them.
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
             "kex-strict-s-v00@openssh.com",
         ]
         .map(str::to_owned)
@@ -379,17 +383,11 @@ fn default_server_proposal_matches_the_supported_client_lists() {
     }
     assert_eq!(
         proposal.compression_algorithms_client_to_server,
-        [
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned()
-        ]
+        [COMPRESSION_NONE.to_owned(),]
     );
     assert_eq!(
         proposal.compression_algorithms_server_to_client,
-        [
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned()
-        ]
+        [COMPRESSION_NONE.to_owned(),]
     );
 }
 
@@ -526,6 +524,8 @@ fn all_supported_kex_and_packet_suites_round_trip_through_the_server()
         (ENCRYPTION_CHACHA20_POLY1305_OPENSSH, HMAC_SHA2_256),
         (AES128_CTR, HMAC_SHA2_256),
         (AES256_CTR, HMAC_SHA2_512),
+        (AES128_CTR, HMAC_SHA2_256_ETM_OPENSSH),
+        (AES256_CTR, HMAC_SHA2_512_ETM_OPENSSH),
         (AES128_GCM_OPENSSH, HMAC_SHA2_256),
         (AES256_GCM_OPENSSH, HMAC_SHA2_512),
     ];
@@ -580,7 +580,27 @@ fn run_echo(
     expected_key: &Ed25519PublicKey,
     expected_strict: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    for corrupt_length in [false, true] {
+        run_echo_then_corrupt(
+            config,
+            client_config,
+            expected_key,
+            expected_strict,
+            corrupt_length,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_echo_then_corrupt(
+    config: &ServerConfig,
+    client_config: &ClientConfig,
+    expected_key: &Ed25519PublicKey,
+    expected_strict: bool,
+    corrupt_length: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (mut client_stream, server_stream, client_to_server) = duplex_pair();
+    let server_to_client = Rc::clone(&server_stream.output);
     let server_handshake = Rc::new(RefCell::new(None));
     let server_error = Rc::new(RefCell::new(None));
     let driver = {
@@ -627,6 +647,34 @@ fn run_echo(
     if let Some(error) = server_error.borrow_mut().take() {
         return Err(Box::new(error));
     }
+
+    // Both directions have a valid packet followed by a corrupted tag/MAC.
+    // This helper runs for every packet suite, including both CTR MAC modes.
+    client.write_payload(CLIENT_PAYLOAD)?;
+    server.write_payload(SERVER_PAYLOAD)?;
+    for queue in [&client_to_server, &server_to_client] {
+        let mut queue = queue.borrow_mut();
+        let byte = if corrupt_length {
+            queue.front_mut()
+        } else {
+            queue.back_mut()
+        };
+        *byte.ok_or("missing frame")? ^= if corrupt_length { 0x80 } else { 1 };
+    }
+    assert!(server.read_auth_packet().is_err());
+    assert!(client.read_payload().is_err());
+    client_to_server.borrow_mut().extend([1, 2, 3, 4]);
+    server_to_client.borrow_mut().extend([1, 2, 3, 4]);
+    let inbound_server = client_to_server.borrow().clone();
+    let inbound_client = server_to_client.borrow().clone();
+    assert!(!server.is_established());
+    assert!(!client.is_established());
+    assert!(server.read_auth_packet().is_err());
+    assert!(client.read_payload().is_err());
+    assert!(server.write_payload(SERVER_PAYLOAD).is_err());
+    assert!(client.write_payload(CLIENT_PAYLOAD).is_err());
+    assert_eq!(*client_to_server.borrow(), inbound_server);
+    assert_eq!(*server_to_client.borrow(), inbound_client);
     Ok(())
 }
 

@@ -28,6 +28,26 @@ fn wire_extensions(extensions: &[(&[u8], &[u8])]) -> Result<Vec<u8>, Error> {
 }
 
 #[test]
+fn rfc8308_signature_list_is_raw_comma_separated_bytes() -> Result<(), Error> {
+    // RFC 8308 section 3.1: the extension-value string directly contains the
+    // comma-separated list. It does not contain a second string length.
+    let wire = wire_extensions(&[(b"server-sig-algs", b"rsa-sha2-512,rsa-sha2-256")])?;
+    assert_eq!(
+        ExtInfo::decode(&wire)?.preferred_rsa_signature(),
+        Some(RSA_SHA2_512)
+    );
+    assert_eq!(
+        ExtInfo::new(vec![Extension::from_server_sig_algs([
+            RSA_SHA2_512,
+            RSA_SHA2_256
+        ])?])?
+        .encode()?,
+        wire
+    );
+    Ok(())
+}
+
+#[test]
 fn server_sig_algs_round_trips_in_order_and_selects_sha2_512() -> Result<(), Error> {
     let names = vec![RSA_SHA2_512.to_owned(), RSA_SHA2_256.to_owned()];
     let message = ExtInfo::new(vec![Extension::from_server_sig_algs(&names)?])?;
@@ -39,7 +59,7 @@ fn server_sig_algs_round_trips_in_order_and_selects_sha2_512() -> Result<(), Err
     assert_eq!(decoded.server_sig_algs(), Some(names.as_slice()));
     assert_eq!(
         decoded.extension(SERVER_SIG_ALGS).map(Extension::value),
-        Some(encode_name_list(&names)?.as_slice())
+        Some(b"rsa-sha2-512,rsa-sha2-256".as_slice())
     );
     assert_eq!(decoded.preferred_rsa_signature(), Some(RSA_SHA2_512));
     assert_eq!(preferred_rsa_signature(&names), Some(RSA_SHA2_512));

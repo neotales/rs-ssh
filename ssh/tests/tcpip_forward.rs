@@ -263,6 +263,46 @@ fn port_zero_and_callback_panic_are_denials() -> Result<(), Box<dyn StdError>> {
 }
 
 #[test]
+fn allocated_port_is_returned_only_for_an_explicitly_allowed_zero_request()
+-> Result<(), Box<dyn StdError>> {
+    let (client_transport, server_transport) = MemoryTransport::pair();
+    let mut client = ClientTcpipForward::new(client_transport);
+    let mut server = ServerTcpipForward::new(server_transport);
+    server.set_port_allocator(|_| Some(42000));
+    client.request_tcpip_forward(b"127.0.0.1", 0, true)?;
+    assert!(!server.dispatch_global_request()?.accepted());
+    assert_eq!(
+        client.read_global_response()?,
+        TcpipForwardResponse::Failure
+    );
+    server.set_allow_callback(|_, port| port != 0);
+    client.request_tcpip_forward(b"127.0.0.1", 0, true)?;
+    assert!(!server.dispatch_global_request()?.accepted());
+    assert_eq!(
+        client.read_global_response()?,
+        TcpipForwardResponse::Failure
+    );
+    server.set_allow_callback(|_, _| true);
+    client.request_tcpip_forward(b"127.0.0.1", 0, true)?;
+    let event = server.dispatch_global_request()?;
+    assert!(event.accepted());
+    assert_eq!(event.allocated_port, Some(42000));
+    assert!(server.has_binding(b"127.0.0.1", 42000));
+    assert_eq!(client.read_global_response()?.allocated_port(), Some(42000));
+    client.request_tcpip_forward(b"127.0.0.1", 8080, true)?;
+    assert_eq!(server.dispatch_global_request()?.allocated_port, None);
+    let response = client.read_global_response()?;
+    assert_eq!(response, TcpipForwardResponse::Success);
+    assert_eq!(response.allocated_port(), None);
+    assert_eq!(response.encode()?, [81]);
+    assert_eq!(
+        TcpipForwardResponse::AllocatedPort(42000).encode()?,
+        [81, 0, 0, 164, 16]
+    );
+    Ok(())
+}
+
+#[test]
 fn forwarded_open_requires_an_exact_live_binding() -> Result<(), Box<dyn StdError>> {
     let (client_transport, server_transport) = MemoryTransport::pair();
     let mut client = ClientTcpipForward::new(client_transport);

@@ -1,13 +1,71 @@
-//! OpenSSH global ping and keepalive requests.
+//! OpenSSH transport ping/pong and connection-level keepalive requests.
 //!
-//! This module encodes and decodes the `SSH_MSG_GLOBAL_REQUEST` messages used
-//! for `ping@openssh.com` and `keepalive@openssh.com`.  It deliberately does
-//! not schedule a keepalive or send anything on a transport: callers choose
-//! when to encode a request and when to write a returned response.
+//! `TransportPing` encodes messages 192/193; authenticated transports answer
+//! received pings. The legacy named `ping@openssh.com` global request is a
+//! different wire message, not OpenSSH transport ping. `keepalive@openssh.com`
+//! may request a reply. No scheduler or timer is created.
 
 #![allow(clippy::module_name_repetitions)]
 
 use neotales_ssh::{Error, MAX_PACKET_CONTENT, Reader, StringBytes, Writer};
+
+/// OpenSSH transport ping message number (not a global request).
+pub const SSH_MSG_PING: u8 = 192;
+/// OpenSSH transport pong message number.
+pub const SSH_MSG_PONG: u8 = 193;
+
+/// OpenSSH transport liveness messages. No timer or socket is owned here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransportPing {
+    /// Requests a pong with the same opaque bytes.
+    Ping(Vec<u8>),
+    /// Echoes the bytes in a received ping.
+    Pong(Vec<u8>),
+}
+
+impl TransportPing {
+    /// Encodes a bounded transport ping or pong payload.
+    ///
+    /// # Errors
+    /// Returns a limit error before allocating an oversized packet.
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let (message, data) = match self {
+            Self::Ping(data) => (SSH_MSG_PING, data),
+            Self::Pong(data) => (SSH_MSG_PONG, data),
+        };
+        if data.len() > MAX_PACKET_CONTENT - 5 {
+            return Err(Error::LimitExceeded);
+        }
+        let mut writer = Writer::with_capacity(data.len() + 5);
+        writer.write_byte(message);
+        writer.write_string_with_limit(data, MAX_PACKET_CONTENT)?;
+        Ok(writer.into_bytes())
+    }
+
+    /// Decodes exactly one transport message, never a named global request.
+    ///
+    /// # Errors
+    /// Rejects other message numbers, trailing bytes, truncation, and oversize.
+    pub fn decode(input: &[u8]) -> Result<Self, Error> {
+        if input.len() > MAX_PACKET_CONTENT {
+            return Err(Error::LimitExceeded);
+        }
+        let mut reader = Reader::new(input);
+        let message = reader.read_byte()?;
+        if !matches!(message, SSH_MSG_PING | SSH_MSG_PONG) {
+            return Err(Error::InvalidPacket);
+        }
+        let data = reader.read_string_with_limit(MAX_PACKET_CONTENT)?;
+        if !reader.is_empty() {
+            return Err(Error::InvalidPacket);
+        }
+        Ok(if message == SSH_MSG_PING {
+            Self::Ping(data.to_vec())
+        } else {
+            Self::Pong(data.to_vec())
+        })
+    }
+}
 
 /// SSH message number for a connection-level global request.
 pub const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
@@ -86,7 +144,14 @@ impl GlobalRequest {
         Self::Keepalive { want_reply: false }
     }
 
-    /// Creates a canonical ping request with `want_reply` set to true.
+    /// Creates a keepalive requesting a success/failure response, without a timer.
+    #[must_use]
+    pub fn keepalive_with_reply() -> Self {
+        Self::Keepalive { want_reply: true }
+    }
+
+    /// Creates the legacy named global request, not OpenSSH transport ping.
+    /// Use [`TransportPing`] for messages 192 and 193.
     #[must_use]
     pub fn ping<P>(payload: P) -> Self
     where

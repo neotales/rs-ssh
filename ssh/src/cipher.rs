@@ -18,7 +18,7 @@ use neotales_ssh::compression::{
     padding_for_payload,
 };
 
-use aes::cipher::{KeyIvInit, StreamCipher};
+use aes::cipher::{InnerIvInit, KeyInit, StreamCipher, StreamCipherSeek};
 use aes_gcm::aead::AeadInOut;
 use hmac::Mac;
 
@@ -547,17 +547,15 @@ impl PacketKeyMaterial {
 }
 
 struct CtrState {
-    cipher: CipherAlgorithm,
+    key: CtrKey,
     integrity: IntegrityAlgorithm,
-    encryption_key: Zeroizing<Vec<u8>>,
     integrity_key: Zeroizing<Vec<u8>>,
     iv: Zeroizing<[u8; AES_BLOCK_SIZE]>,
     position: u128,
 }
 
 struct GcmState {
-    cipher: CipherAlgorithm,
-    encryption_key: Zeroizing<Vec<u8>>,
+    cipher: GcmCipher,
     iv: Zeroizing<[u8; GCM_IV_SIZE]>,
     packets_processed: Option<u64>,
 }
@@ -600,8 +598,7 @@ impl ProtectorState {
                 .try_into()
                 .map_err(|_error| PacketProtectionError::InvalidKeyMaterial)?;
             Ok(Self::Gcm(GcmState {
-                cipher: suite.cipher,
-                encryption_key: material.encryption_key,
+                cipher: GcmCipher::new(suite.cipher, &material.encryption_key)?,
                 iv: Zeroizing::new(iv),
                 packets_processed: Some(0),
             }))
@@ -621,9 +618,8 @@ impl ProtectorState {
                 .try_into()
                 .map_err(|_error| PacketProtectionError::InvalidKeyMaterial)?;
             Ok(Self::Ctr(CtrState {
-                cipher: suite.cipher,
+                key: CtrKey::new(suite.cipher, &material.encryption_key)?,
                 integrity,
-                encryption_key: material.encryption_key,
                 integrity_key,
                 iv: Zeroizing::new(iv),
                 position: 0,
@@ -643,11 +639,15 @@ impl ProtectorState {
 /// Constructing a new protector intentionally starts a fresh key context. Use
 /// [`Self::rekey`] to replace an existing context's suite, keys, and IV. The
 /// caller must keep AES-GCM sequence numbers unique within a key context; this
-/// type intentionally does not retain or enforce sequence policy.
+/// type does not enforce AES-GCM sequence policy. For `ChaCha` it rejects a seal
+/// sequence at or below the last successful seal in this context. Rekey must
+/// install fresh keys before resetting that check.
 pub(crate) struct PacketProtector {
+    seal_input: PlaintextBytes,
     suite: PacketSuite,
     compression: CompressionAlgorithm,
     state: ProtectorState,
+    last_chacha_seal: Option<u32>,
 }
 
 impl fmt::Debug for PacketProtector {
@@ -694,9 +694,11 @@ impl PacketProtector {
         compression: CompressionAlgorithm,
     ) -> Result<Self, PacketProtectionError> {
         Ok(Self {
+            seal_input: PlaintextBytes::new(PlaintextSlot::SealInput, Vec::new()),
             state: ProtectorState::new(suite, key_material)?,
             suite,
             compression,
+            last_chacha_seal: None,
         })
     }
 
@@ -704,6 +706,18 @@ impl PacketProtector {
     #[must_use]
     pub(crate) const fn compression(&self) -> CompressionAlgorithm {
         self.compression
+    }
+
+    /// Test-only allocation identity, retained capacity, and live length. No
+    /// plaintext is exposed: the wipe witness reads bytes before clearing.
+    #[cfg(test)]
+    #[allow(dead_code)] // Legacy source harnesses do not all inspect this slot.
+    pub(crate) fn seal_input_allocation(&self) -> (*const u8, usize, usize) {
+        (
+            self.seal_input.bytes.as_ptr(),
+            self.seal_input.bytes.capacity(),
+            self.seal_input.bytes.len(),
+        )
     }
 
     /// Returns this protector's current packet-protection suite.
@@ -741,13 +755,8 @@ impl PacketProtector {
                 }
                 let mut clear = Zeroizing::new([0_u8; 4]);
                 clear.copy_from_slice(input);
-                let _next_position = apply_ctr(
-                    state.cipher,
-                    &state.encryption_key,
-                    &state.iv,
-                    state.position,
-                    clear.as_mut_slice(),
-                )?;
+                let _next_position =
+                    apply_ctr(&state.key, &state.iv, state.position, clear.as_mut_slice())?;
                 Ok(u32::from_be_bytes(*clear))
             }
             ProtectorState::Gcm(_) => Err(PacketProtectionError::UnsupportedSuite),
@@ -788,6 +797,9 @@ impl PacketProtector {
         self.suite = suite;
         self.compression = compression;
         self.state = state;
+        self.last_chacha_seal = None;
+        self.seal_input.bytes.clear();
+        self.seal_input.bytes.shrink_to(0);
         Ok(())
     }
 
@@ -817,41 +829,67 @@ impl PacketProtector {
         payload: &[u8],
         padding: &[u8],
     ) -> Result<Vec<u8>, PacketProtectionError> {
-        // The caller's bytes are copied so this function can hand a different
-        // payload to the cipher when compression is on, and the copy is in the
-        // clear, so it is a buffer that wipes itself. The padding copy is not
-        // one: it is drawn from the random source rather than from the payload,
-        // so it discloses nothing, and it is sealed along with the rest of the
-        // packet.
+        if self.suite.is_chacha()
+            && self
+                .last_chacha_seal
+                .is_some_and(|last| sequence_number <= last)
+        {
+            return Err(PacketProtectionError::InvalidPacket);
+        }
         let (payload, padding) = match self.compression {
-            CompressionAlgorithm::None => (
-                PlaintextBytes::new(PlaintextSlot::SealInput, payload.to_vec()),
-                padding.to_vec(),
-            ),
+            CompressionAlgorithm::None => (self.stage_seal_input(payload), padding.to_vec()),
             CompressionAlgorithm::Zlib => {
-                // Wrapped before the fallible call below, not after it: a `?`
-                // that fires there would otherwise release the compressed
-                // payload — which is this caller's bytes, in the clear — as a
-                // plain `Vec`.
-                let compressed = PlaintextBytes::new(
-                    PlaintextSlot::SealInput,
-                    compress_payload(payload).map_err(map_compression_error)?,
-                );
+                let mut compressed = compress_payload(payload).map_err(map_compression_error)?;
+                let staged = self.stage_seal_input(&compressed);
+                compressed.zeroize();
                 // Compression changes the payload length after the transport
                 // chose the padding, so the length has to be re-derived from
                 // the same rule while keeping the random bytes already drawn.
                 let alignment = PacketAlignment::for_suite(self.suite);
-                let padding = padding_for_payload(
-                    compressed.as_slice().len(),
+                let padding = match padding_for_payload(
+                    staged.as_slice().len(),
                     padding,
                     alignment.block_size(),
                     alignment.header_length(),
-                )
-                .map_err(map_compression_error)?;
-                (compressed, padding)
+                ) {
+                    Ok(padding) => padding,
+                    Err(error) => {
+                        self.recycle_seal_input(staged);
+                        return Err(map_compression_error(error));
+                    }
+                };
+                (staged, padding)
             }
         };
-        self.seal_payload(sequence_number, payload.as_slice(), &padding)
+        let packet = match self.seal_payload(sequence_number, payload.as_slice(), &padding) {
+            Ok(packet) => packet,
+            Err(error) => {
+                self.recycle_seal_input(payload);
+                return Err(error);
+            }
+        };
+        self.recycle_seal_input(payload);
+        if self.suite.is_chacha() {
+            self.last_chacha_seal = Some(sequence_number);
+        }
+        Ok(packet)
+    }
+
+    /// Copies `payload` into the protector-owned scratch and stages that
+    /// allocation. The next call reuses the capacity returned by
+    /// [`Self::recycle_seal_input`].
+    fn stage_seal_input(&mut self, payload: &[u8]) -> PlaintextBytes {
+        self.seal_input.bytes.clear();
+        self.seal_input.bytes.extend_from_slice(payload);
+        std::mem::replace(
+            &mut self.seal_input,
+            PlaintextBytes::new(PlaintextSlot::SealInput, Vec::new()),
+        )
+    }
+
+    /// Wipes the staged plaintext, records the wipe, and keeps the allocation.
+    fn recycle_seal_input(&mut self, input: PlaintextBytes) {
+        self.seal_input = PlaintextBytes::new(PlaintextSlot::SealInput, input.into_recycled());
     }
 
     fn seal_payload(
@@ -866,26 +904,17 @@ impl PacketProtector {
             build_clear_packet(payload, padding, alignment)?,
         );
         if let ProtectorState::Chacha(state) = &self.state {
-            // The ChaCha suite seals into a buffer of its own, so this one is
-            // dropped with the whole clear packet still in it. It is the one
-            // *successful* path where a plain `Vec` would have released the
-            // plaintext, and it is why the buffer is a type rather than a local.
-            return state
+            state
                 .cipher
-                .seal(sequence_number, clear_packet.as_slice())
-                .map_err(map_chacha_error);
+                .seal_in_place(sequence_number, &mut clear_packet.bytes)
+                .map_err(map_chacha_error)?;
+            return Ok(clear_packet.into_ciphertext());
         }
         match &mut self.state {
             ProtectorState::Ctr(state) => {
                 if state.integrity.encrypt_then_mac() {
                     let (length, body) = clear_packet.as_mut_slice().split_at_mut(4);
-                    let next_position = apply_ctr(
-                        state.cipher,
-                        &state.encryption_key,
-                        &state.iv,
-                        state.position,
-                        body,
-                    )?;
+                    let next_position = apply_ctr(&state.key, &state.iv, state.position, body)?;
                     let tag = calculate_mac(
                         state.integrity,
                         &state.integrity_key,
@@ -902,8 +931,7 @@ impl PacketProtector {
                         &[clear_packet.as_slice()],
                     )?;
                     let next_position = apply_ctr(
-                        state.cipher,
-                        &state.encryption_key,
+                        &state.key,
                         &state.iv,
                         state.position,
                         clear_packet.as_mut_slice(),
@@ -917,14 +945,7 @@ impl PacketProtector {
                 let packets_processed = state
                     .packets_processed
                     .ok_or(PacketProtectionError::CounterExhausted)?;
-                let tag = encrypt_gcm(
-                    state.cipher,
-                    &state.encryption_key,
-                    &state.iv,
-                    packets_processed,
-                    length,
-                    body,
-                )?;
+                let tag = encrypt_gcm(&state.cipher, &state.iv, packets_processed, length, body)?;
                 clear_packet.extend(tag.as_slice());
                 state.packets_processed = packets_processed.checked_add(1);
             }
@@ -996,9 +1017,10 @@ const MAX_AUTH_TAG_SIZE: usize = SHA512_KEY_SIZE;
 /// A seal that encrypts in place turns the buffer into the ciphertext it
 /// returns, and [`Self::into_ciphertext`] hands that allocation on without
 /// wiping it. Every other path drops the buffer with the plaintext still in it
-/// and the [`Drop`] below wipes it. That includes a *successful* seal over
-/// `chacha20-poly1305`, which encrypts into a buffer of its own and would
-/// otherwise release the whole clear packet in the clear on the way out.
+/// and the [`Drop`] below wipes it. All sealing suites now encrypt the clear
+/// packet in place and hand on its ciphertext allocation. An opened `ChaCha`
+/// packet is different: its discarded framing/body buffer still holds
+/// plaintext and is wiped after extracting the caller-owned payload.
 ///
 /// # What this does not cover
 ///
@@ -1032,6 +1054,22 @@ impl PlaintextBytes {
     /// Appends bytes, for the authentication tag a seal computes last.
     pub(crate) fn extend(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
+    }
+
+    /// Wipes the plaintext, records that wipe, and returns the allocation with
+    /// its capacity intact so the protector can reuse it.
+    pub(crate) fn into_recycled(mut self) -> Vec<u8> {
+        #[cfg(test)]
+        let held_bytes = self.bytes.iter().any(|byte| *byte != 0);
+        self.bytes.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if held_bytes {
+            record_plaintext_drop(self.slot, PlaintextDrop::Wiped);
+        }
+        let mut bytes = std::mem::take(&mut self.bytes);
+        bytes.clear();
+        std::mem::forget(self);
+        bytes
     }
 
     /// Hands the allocation on, because a seal has overwritten it with the
@@ -1244,13 +1282,16 @@ fn open_chacha(
     compression: CompressionAlgorithm,
     alignment: PacketAlignment,
 ) -> Result<Vec<u8>, PacketProtectionError> {
-    let clear = state
-        .cipher
-        .open(sequence_number, input)
-        .map_err(map_chacha_error)?;
+    let clear = PlaintextBytes::new(
+        PlaintextSlot::ClearPacket,
+        state
+            .cipher
+            .open(sequence_number, input)
+            .map_err(map_chacha_error)?,
+    );
     // The ChaCha layer has already consumed and verified the Poly1305 tag, so
     // what is left is exactly the clear packet with no trailing tag.
-    let packet = parse_clear_packet(&clear, 0, alignment)?;
+    let packet = parse_clear_packet(clear.as_slice(), 0, alignment)?;
     let payload = extract_body_payload(packet.body, packet.content_size)?;
     decompress_if_selected(payload, compression)
 }
@@ -1261,7 +1302,10 @@ fn decompress_if_selected(
 ) -> Result<Vec<u8>, PacketProtectionError> {
     match compression {
         CompressionAlgorithm::None => Ok(payload),
-        CompressionAlgorithm::Zlib => decompress_payload(&payload).map_err(map_compression_error),
+        CompressionAlgorithm::Zlib => {
+            let payload = Zeroizing::new(payload);
+            decompress_payload(&payload).map_err(map_compression_error)
+        }
     }
 }
 
@@ -1323,13 +1367,7 @@ fn open_eam(
 
     let mut clear_packet = Zeroizing::new(Vec::with_capacity(encrypted_size));
     clear_packet.extend_from_slice(encrypted);
-    let next_position = apply_ctr(
-        state.cipher,
-        &state.encryption_key,
-        &state.iv,
-        state.position,
-        &mut clear_packet,
-    )?;
+    let next_position = apply_ctr(&state.key, &state.iv, state.position, &mut clear_packet)?;
     verify_mac(
         state.integrity,
         &state.integrity_key,
@@ -1360,13 +1398,7 @@ fn open_etm(
     )?;
 
     let mut body = Zeroizing::new(Vec::from(packet.body));
-    let next_position = apply_ctr(
-        state.cipher,
-        &state.encryption_key,
-        &state.iv,
-        state.position,
-        &mut body,
-    )?;
+    let next_position = apply_ctr(&state.key, &state.iv, state.position, &mut body)?;
     let content_size = body
         .len()
         .checked_sub(1)
@@ -1389,8 +1421,7 @@ fn open_gcm(
         .ok_or(PacketProtectionError::CounterExhausted)?;
     let mut body = Zeroizing::new(Vec::from(packet.body));
     decrypt_gcm(
-        state.cipher,
-        &state.encryption_key,
+        &state.cipher,
         &state.iv,
         packets_processed,
         packet.length,
@@ -1528,8 +1559,7 @@ fn extract_body_payload(
 }
 
 fn apply_ctr(
-    cipher: CipherAlgorithm,
-    key: &[u8],
+    key: &CtrKey,
     iv: &[u8; AES_BLOCK_SIZE],
     position: u128,
     data: &mut [u8],
@@ -1544,41 +1574,17 @@ fn apply_ctr(
         return Ok(next_position);
     }
 
-    let first_block = position / AES_BLOCK_SIZE as u128;
-    let byte_offset = usize::try_from(position % AES_BLOCK_SIZE as u128)
-        .map_err(|_error| PacketProtectionError::CounterExhausted)?;
-    let base_counter = u128::from_be_bytes(*iv);
-    let counter = base_counter
-        .checked_add(first_block)
-        .ok_or(PacketProtectionError::CounterExhausted)?;
-    let mut stream = new_ctr_stream(cipher, key, &counter.to_be_bytes())?;
-
-    if byte_offset == 0 {
-        stream
-            .try_apply_keystream(data)
-            .map_err(|_error| PacketProtectionError::CounterExhausted)?;
-        return Ok(next_position);
+    // Borrow the expanded key and seek a speculative cursor. Length probes and
+    // failed authentication must never advance the committed stream position.
+    // No key schedule or heap allocation is built here.
+    let mut stream = new_ctr_stream(key, iv);
+    match &mut stream {
+        CtrStream::Aes128(stream) => stream.try_seek(position),
+        CtrStream::Aes256(stream) => stream.try_seek(position),
     }
-
-    let mut block = Zeroizing::new([0_u8; AES_BLOCK_SIZE]);
+    .map_err(|_| PacketProtectionError::CounterExhausted)?;
     stream
-        .try_apply_keystream(block.as_mut_slice())
-        .map_err(|_error| PacketProtectionError::CounterExhausted)?;
-    let available = AES_BLOCK_SIZE
-        .checked_sub(byte_offset)
-        .ok_or(PacketProtectionError::CounterExhausted)?;
-    let consumed = available.min(data.len());
-    let target = data
-        .get_mut(..consumed)
-        .ok_or(PacketProtectionError::CounterExhausted)?;
-    let keystream = block
-        .get(byte_offset..byte_offset.saturating_add(consumed))
-        .ok_or(PacketProtectionError::CounterExhausted)?;
-    for (byte, mask) in target.iter_mut().zip(keystream) {
-        *byte ^= *mask;
-    }
-    stream
-        .try_apply_keystream(&mut data[consumed..])
+        .try_apply_keystream(data)
         .map_err(|_error| PacketProtectionError::CounterExhausted)?;
     Ok(next_position)
 }
@@ -1608,33 +1614,39 @@ fn validate_ctr_range(
     Ok(())
 }
 
-fn new_ctr_stream(
-    cipher: CipherAlgorithm,
-    key: &[u8],
-    iv: &[u8; AES_BLOCK_SIZE],
-) -> Result<CtrStream, PacketProtectionError> {
-    match cipher {
-        CipherAlgorithm::Aes128Ctr => Aes128Ctr::new_from_slices(key, iv)
-            .map(|stream| CtrStream::Aes128(Box::new(stream)))
-            .map_err(|_error| PacketProtectionError::InvalidKeyMaterial),
-        CipherAlgorithm::Aes256Ctr => Aes256Ctr::new_from_slices(key, iv)
-            .map(|stream| CtrStream::Aes256(Box::new(stream)))
-            .map_err(|_error| PacketProtectionError::InvalidKeyMaterial),
-        CipherAlgorithm::Aes128Gcm
-        | CipherAlgorithm::Aes256Gcm
-        | CipherAlgorithm::Chacha20Poly1305 => Err(PacketProtectionError::InvalidKeyMaterial),
+enum CtrKey {
+    Aes128(aes::Aes128),
+    Aes256(aes::Aes256),
+}
+
+impl CtrKey {
+    fn new(algorithm: CipherAlgorithm, key: &[u8]) -> Result<Self, PacketProtectionError> {
+        match algorithm {
+            CipherAlgorithm::Aes128Ctr => aes::Aes128::new_from_slice(key).map(Self::Aes128),
+            CipherAlgorithm::Aes256Ctr => aes::Aes256::new_from_slice(key).map(Self::Aes256),
+            _ => return Err(PacketProtectionError::InvalidKeyMaterial),
+        }
+        .map_err(|_| PacketProtectionError::InvalidKeyMaterial)
     }
 }
 
-type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
-type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
-
-enum CtrStream {
-    Aes128(Box<Aes128Ctr>),
-    Aes256(Box<Aes256Ctr>),
+fn new_ctr_stream<'a>(key: &'a CtrKey, iv: &[u8; AES_BLOCK_SIZE]) -> CtrStream<'a> {
+    match key {
+        CtrKey::Aes128(cipher) => CtrStream::Aes128(ctr::Ctr128BE::from_core(
+            ctr::CtrCore::inner_iv_init(cipher, iv.into()),
+        )),
+        CtrKey::Aes256(cipher) => CtrStream::Aes256(ctr::Ctr128BE::from_core(
+            ctr::CtrCore::inner_iv_init(cipher, iv.into()),
+        )),
+    }
 }
 
-impl StreamCipher for CtrStream {
+enum CtrStream<'a> {
+    Aes128(ctr::Ctr128BE<&'a aes::Aes128>),
+    Aes256(ctr::Ctr128BE<&'a aes::Aes256>),
+}
+
+impl StreamCipher for CtrStream<'_> {
     fn check_remaining(&self, data_len: usize) -> Result<(), aes::cipher::StreamCipherError> {
         match self {
             Self::Aes128(stream) => stream.check_remaining(data_len),
@@ -1742,9 +1754,28 @@ fn verify_mac(
     }
 }
 
+enum GcmCipher {
+    Aes128(aes_gcm::Aes128Gcm),
+    Aes256(aes_gcm::Aes256Gcm),
+}
+
+impl GcmCipher {
+    fn new(algorithm: CipherAlgorithm, key: &[u8]) -> Result<Self, PacketProtectionError> {
+        match algorithm {
+            CipherAlgorithm::Aes128Gcm => {
+                <aes_gcm::Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(key).map(Self::Aes128)
+            }
+            CipherAlgorithm::Aes256Gcm => {
+                <aes_gcm::Aes256Gcm as aes_gcm::KeyInit>::new_from_slice(key).map(Self::Aes256)
+            }
+            _ => return Err(PacketProtectionError::InvalidKeyMaterial),
+        }
+        .map_err(|_| PacketProtectionError::InvalidKeyMaterial)
+    }
+}
+
 fn encrypt_gcm(
-    cipher: CipherAlgorithm,
-    key: &[u8],
+    cipher: &GcmCipher,
     iv: &[u8; GCM_IV_SIZE],
     packets_processed: u64,
     length: &[u8],
@@ -1753,9 +1784,7 @@ fn encrypt_gcm(
     let nonce_bytes = gcm_nonce(iv, packets_processed)?;
     let nonce: &GcmNonce = (&*nonce_bytes).into();
     match cipher {
-        CipherAlgorithm::Aes128Gcm => {
-            let cipher = <aes_gcm::Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(key)
-                .map_err(|_error| PacketProtectionError::InvalidKeyMaterial)?;
+        GcmCipher::Aes128(cipher) => {
             let mut generated = cipher
                 .encrypt_inout_detached(nonce, length, (&mut *body).into())
                 .map_err(|_error| PacketProtectionError::EncryptionFailed)?;
@@ -1764,9 +1793,7 @@ fn encrypt_gcm(
             generated.as_mut_slice().zeroize();
             Ok(tag)
         }
-        CipherAlgorithm::Aes256Gcm => {
-            let cipher = <aes_gcm::Aes256Gcm as aes_gcm::KeyInit>::new_from_slice(key)
-                .map_err(|_error| PacketProtectionError::InvalidKeyMaterial)?;
+        GcmCipher::Aes256(cipher) => {
             let mut generated = cipher
                 .encrypt_inout_detached(nonce, length, (&mut *body).into())
                 .map_err(|_error| PacketProtectionError::EncryptionFailed)?;
@@ -1775,15 +1802,11 @@ fn encrypt_gcm(
             generated.as_mut_slice().zeroize();
             Ok(tag)
         }
-        CipherAlgorithm::Aes128Ctr
-        | CipherAlgorithm::Aes256Ctr
-        | CipherAlgorithm::Chacha20Poly1305 => Err(PacketProtectionError::InvalidKeyMaterial),
     }
 }
 
 fn decrypt_gcm(
-    cipher: CipherAlgorithm,
-    key: &[u8],
+    cipher: &GcmCipher,
     iv: &[u8; GCM_IV_SIZE],
     packets_processed: u64,
     length: &[u8],
@@ -1799,23 +1822,12 @@ fn decrypt_gcm(
     let nonce_bytes = gcm_nonce(iv, packets_processed)?;
     let nonce: &GcmNonce = (&*nonce_bytes).into();
     match cipher {
-        CipherAlgorithm::Aes128Gcm => {
-            let cipher = <aes_gcm::Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(key)
-                .map_err(|_error| PacketProtectionError::InvalidKeyMaterial)?;
-            cipher
-                .decrypt_inout_detached(nonce, length, (&mut *body).into(), tag)
-                .map_err(|_error| PacketProtectionError::AuthenticationFailed)
-        }
-        CipherAlgorithm::Aes256Gcm => {
-            let cipher = <aes_gcm::Aes256Gcm as aes_gcm::KeyInit>::new_from_slice(key)
-                .map_err(|_error| PacketProtectionError::InvalidKeyMaterial)?;
-            cipher
-                .decrypt_inout_detached(nonce, length, (&mut *body).into(), tag)
-                .map_err(|_error| PacketProtectionError::AuthenticationFailed)
-        }
-        CipherAlgorithm::Aes128Ctr
-        | CipherAlgorithm::Aes256Ctr
-        | CipherAlgorithm::Chacha20Poly1305 => Err(PacketProtectionError::InvalidKeyMaterial),
+        GcmCipher::Aes128(cipher) => cipher
+            .decrypt_inout_detached(nonce, length, (&mut *body).into(), tag)
+            .map_err(|_error| PacketProtectionError::AuthenticationFailed),
+        GcmCipher::Aes256(cipher) => cipher
+            .decrypt_inout_detached(nonce, length, (&mut *body).into(), tag)
+            .map_err(|_error| PacketProtectionError::AuthenticationFailed),
     }
 }
 

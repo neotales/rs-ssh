@@ -123,6 +123,17 @@ impl ChaChaKeyMaterial {
 /// a sequence number: every [`Self::seal`] and [`Self::open`] call receives the
 /// sequence number explicitly.  Consequently, the same protector can be used
 /// for either packet direction's independent key context.
+///
+/// # Nonce uniqueness
+///
+/// The caller owns sequence uniqueness: never seal two packets with the same
+/// sequence and direction key, including through a clone or a newly constructed
+/// value with the same key. Cloning does not create an independent key context.
+/// Retry a blocked write by retaining its ciphertext, not by sealing again.
+/// Do not wrap a sequence under the same key; rekey with fresh direction keys
+/// first. `open` must receive the sequence of the authenticated packet; callers
+/// must reject replayed packets and treat authentication failure as terminal.
+/// A failed open does not authorize reuse of a seal nonce.
 #[derive(Clone)]
 pub struct ChaChaCipher {
     material: ChaChaKeyMaterial,
@@ -167,6 +178,8 @@ impl ChaChaCipher {
     /// `packet` must contain a four-byte big-endian SSH length field followed
     /// by at least one body byte.  The returned bytes contain the encrypted
     /// length, encrypted body, and 16-byte tag.
+    /// The caller must enforce the type's nonce-uniqueness contract, including
+    /// across clones and retries. This raw codec does not track sequences.
     ///
     /// # Errors
     ///
@@ -176,6 +189,42 @@ impl ChaChaCipher {
     /// empty body or an inconsistent length field.  Local stream failures are
     /// reported as [`ChaChaCipherError::EncryptionFailed`].
     pub fn seal(&self, sequence_number: u32, packet: &[u8]) -> Result<Vec<u8>, ChaChaCipherError> {
+        if packet.len() > MAX_CLEAR_PACKET_SIZE {
+            return Err(ChaChaCipherError::LimitExceeded);
+        }
+        let mut encrypted = Zeroizing::new(Vec::with_capacity(packet.len() + CHACHA_TAG_SIZE));
+        encrypted.extend_from_slice(packet);
+        self.seal_in_place(sequence_number, &mut encrypted)?;
+        Ok(std::mem::take(&mut *encrypted))
+    }
+
+    /// Encrypts the packet in its allocation and appends the authentication tag.
+    ///
+    /// Reserve [`CHACHA_TAG_SIZE`] extra bytes to avoid growth. If growth is
+    /// required, the replaced plaintext allocation is wiped before release.
+    /// On any error this method wipes and clears `packet`. The caller owns nonce
+    /// uniqueness, exactly as for [`Self::seal`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same framing and encryption errors as [`Self::seal`].
+    pub fn seal_in_place(
+        &self,
+        sequence_number: u32,
+        packet: &mut Vec<u8>,
+    ) -> Result<(), ChaChaCipherError> {
+        let result = self.seal_in_place_inner(sequence_number, packet);
+        if result.is_err() {
+            packet.zeroize();
+        }
+        result
+    }
+
+    fn seal_in_place_inner(
+        &self,
+        sequence_number: u32,
+        packet: &mut Vec<u8>,
+    ) -> Result<(), ChaChaCipherError> {
         if packet.len() > MAX_CLEAR_PACKET_SIZE {
             return Err(ChaChaCipherError::LimitExceeded);
         }
@@ -207,22 +256,26 @@ impl ChaChaCipher {
             .len()
             .checked_add(CHACHA_TAG_SIZE)
             .ok_or(ChaChaCipherError::LimitExceeded)?;
-        let mut encrypted = Zeroizing::new(Vec::with_capacity(output_size));
-        encrypted.extend_from_slice(packet);
+        if packet.capacity() < output_size {
+            let mut replacement = Vec::with_capacity(output_size);
+            replacement.extend_from_slice(packet);
+            packet.zeroize();
+            *packet = replacement;
+        }
 
-        let body = encrypted
+        let body = packet
             .get_mut(LENGTH_SIZE..)
             .ok_or(ChaChaCipherError::InvalidPacket)?;
         apply_payload_stream(payload_key, sequence_number, body)?;
 
-        let length = encrypted
+        let length = packet
             .get_mut(..LENGTH_SIZE)
             .ok_or(ChaChaCipherError::InvalidPacket)?;
         apply_length_stream(length_key, sequence_number, length)?;
 
-        let tag = compute_tag(poly_key.as_ref(), encrypted.as_slice())?;
-        encrypted.extend_from_slice(tag.as_slice());
-        Ok(encrypted.as_slice().to_vec())
+        let tag = compute_tag(poly_key.as_ref(), packet.as_slice())?;
+        packet.extend_from_slice(tag.as_slice());
+        Ok(())
     }
 
     /// Decrypts only the four-byte OpenSSH packet length.
@@ -267,6 +320,8 @@ impl ChaChaCipher {
     /// The Poly1305 tag is checked over the encrypted length and body before
     /// either value is decrypted.  On authentication failure no plaintext is
     /// returned, and all temporary decrypted storage is zeroized.
+    /// The returned plaintext belongs to the caller, who must wipe it when it
+    /// is no longer needed. The caller owns replay rejection and sequence order.
     ///
     /// # Errors
     ///
@@ -352,7 +407,7 @@ impl ChaChaCipher {
             .get(..LENGTH_SIZE)
             .ok_or(ChaChaCipherError::InvalidPacket)?;
         validate_length(clear_length, body_size)?;
-        Ok(clear.as_slice().to_vec())
+        Ok(std::mem::take(&mut *clear))
     }
 }
 

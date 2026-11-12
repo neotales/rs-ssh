@@ -6,6 +6,7 @@
 #![allow(missing_docs, unreachable_pub)]
 
 #[path = "../src/hostkey.rs"]
+#[allow(dead_code)]
 mod hostkey;
 
 use std::cell::Cell;

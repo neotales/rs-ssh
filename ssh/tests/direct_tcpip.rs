@@ -98,7 +98,7 @@ use hostkey::{Ed25519PublicKey, Ed25519Signer};
 use kex::{Curve25519, KeyExchange};
 use msg::kexinit::{
     AES128_CTR, AES128_GCM_OPENSSH, AES256_CTR, AES256_GCM_OPENSSH, COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH, CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
+    CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
     ENCRYPTION_CHACHA20_POLY1305_OPENSSH, HMAC_SHA2_256, HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512,
     HMAC_SHA2_512_ETM_OPENSSH, HOST_KEY_SSH_ED25519, KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
     KEX_STRICT_C_V00_OPENSSH, KexInit,
@@ -261,6 +261,10 @@ fn default_server_proposal_matches_the_supported_client_lists() {
             CURVE25519_SHA256_LIBSSH,
             ECDH_SHA2_NISTP256,
             KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+            // Task 0007 adds these only after both handshakes complete them.
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
             "kex-strict-s-v00@openssh.com",
         ]
         .map(str::to_owned)
@@ -303,17 +307,11 @@ fn default_server_proposal_matches_the_supported_client_lists() {
     }
     assert_eq!(
         proposal.compression_algorithms_client_to_server,
-        [
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned()
-        ]
+        [COMPRESSION_NONE.to_owned(),]
     );
     assert_eq!(
         proposal.compression_algorithms_server_to_client,
-        [
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned()
-        ]
+        [COMPRESSION_NONE.to_owned(),]
     );
 }
 
@@ -1310,6 +1308,7 @@ fn authenticated_pair(
 enum SeenRequest {
     Exec(Vec<u8>),
     Shell,
+    Subsystem(Vec<u8>),
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1325,6 +1324,7 @@ fn exec_uses_exact_command_bytes_and_delivers_status_eof_close_in_order()
         let observed = match request {
             SessionRequest::Exec { command } => SeenRequest::Exec(command.to_vec()),
             SessionRequest::Shell => SeenRequest::Shell,
+            SessionRequest::Subsystem { name } => SeenRequest::Subsystem(name.to_vec()),
         };
         seen_by_policy.borrow_mut().push(observed);
         SessionDecision::accept(23)
@@ -1411,6 +1411,7 @@ fn shell_accepts_pty_without_interpreting_modes_or_fabricating_a_command()
         seen_by_policy.borrow_mut().push(match request {
             SessionRequest::Exec { command } => SeenRequest::Exec(command.to_vec()),
             SessionRequest::Shell => SeenRequest::Shell,
+            SessionRequest::Subsystem { name } => SeenRequest::Subsystem(name.to_vec()),
         });
         SessionDecision::accept(0)
     });

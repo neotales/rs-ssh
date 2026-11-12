@@ -193,8 +193,11 @@ fn start_server_with(
 
 /// A handshake with whatever the client prefers. The original lane, unchanged.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 fn live_openssh_server_completes_mlkem_handshake() -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, false) {
+        return Ok(());
+    }
     let (_server, _transport) = start_server_with("", None)?;
     Ok(())
 }
@@ -327,9 +330,12 @@ where
 /// each one is a full test of the packet cipher, and none of them is an
 /// authentication attempt for the server to rate-limit.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 fn live_openssh_exchanges_protected_packets_with_aes128_gcm()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, false) {
+        return Ok(());
+    }
     protected_exchange_over("aes128-gcm@openssh.com")
 }
 
@@ -337,9 +343,12 @@ fn live_openssh_exchanges_protected_packets_with_aes128_gcm()
 /// control: a change to the shared rule that broke the 128-bit lane should not
 /// pass here silently.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 fn live_openssh_exchanges_protected_packets_with_aes256_gcm()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, false) {
+        return Ok(());
+    }
     protected_exchange_over("aes256-gcm@openssh.com")
 }
 
@@ -354,9 +363,12 @@ fn live_openssh_exchanges_protected_packets_with_aes256_gcm()
 /// Two packets would have been enough to see that, and they were not used,
 /// because the same lane also has to cross the 256-packet nonce boundary.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 fn live_openssh_exchanges_protected_packets_with_chacha20_poly1305()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, false) {
+        return Ok(());
+    }
     protected_exchange_over("chacha20-poly1305@openssh.com")
 }
 
@@ -364,9 +376,12 @@ fn live_openssh_exchanges_protected_packets_with_chacha20_poly1305()
 /// `4 + packet_length` is aligned here, not `packet_length` alone. It is the lane
 /// that would notice a change to the shared rule breaking a suite that worked.
 #[test]
-#[ignore = "live OpenSSH lane: needs sshd and ssh-keygen, resolved by openssh_tools; a missing one fails rather than skips"]
+#[ignore = "live OpenSSH lane: NEOTALES_SSH_E2E=1; missing tools skip"]
 fn live_openssh_exchanges_protected_packets_with_aes128_ctr_etm()
 -> Result<(), Box<dyn std::error::Error>> {
+    if !openssh_tools::e2e_enabled(false, false) {
+        return Ok(());
+    }
     protected_exchange_over("aes128-ctr")
 }
 

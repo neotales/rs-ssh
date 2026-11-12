@@ -15,7 +15,7 @@ use crate::cipher::{
     AES_BLOCK_SIZE, AlignmentError, PacketAlignment, PacketProtectionError, PacketProtector,
     PacketSuite, PlaintextBytes, PlaintextSlot,
 };
-use crate::hostkey::VerifiedHostKey;
+use crate::hostkey::{HostPublicKey, VerifiedHostKey, VerifiedServerHostKey};
 use crate::kex::mlkem768_x25519::ClientKex as MlKemClientKex;
 use crate::kex::{DerivationLengths, DerivedKeys};
 use crate::msg::kexinit::KexInit;
@@ -469,7 +469,7 @@ impl ProtectedReadBuffer {
         Ok(())
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.bytes.clear();
         self.filled = 0;
         self.expected_length = None;
@@ -667,22 +667,36 @@ fn validate_eam_packet_length(
         .ok_or(PacketProtectionError::LimitExceeded.into())
 }
 
+pub(crate) enum ExtensionState {
+    Disabled,
+    Awaiting,
+    Complete,
+}
+
 /// A synchronous client transport with authenticated packet exchange.
 ///
 /// Values of this type are created only after identification, key exchange,
 /// mandatory host-key trust, NEWKEYS, and the initial-KEX sequence boundary
 /// have all succeeded. Every read and write requires mutable access, so one
 /// caller owns packet dispatch and stream mutation at a time.
+/// An integrity or unrecoverable protected-framing failure discards both key
+/// contexts and pending packets. Subsequent reads and writes fail without
+/// touching the stream. Short reads and `WouldBlock` preserve resumable state.
 pub struct ClientTransport<S> {
     pub(crate) stream: S,
     pub(crate) sequence: SequenceState,
     pub(crate) session_id: Vec<u8>,
     pub(crate) verified_host_key: Option<VerifiedHostKey>,
+    pub(crate) verified_server_host_key: Option<VerifiedServerHostKey>,
+    server_sig_algs: Option<Vec<String>>,
+    pub(crate) ext_info: ExtensionState,
+    pending_transport_reply: Option<Vec<u8>>,
     pub(crate) write_protector: Option<PacketProtector>,
     pub(crate) read_protector: Option<PacketProtector>,
     pub(crate) read_buffer: ProtectedReadBuffer,
     pub(crate) write_buffer: ProtectedWriteBuffer,
     pub(crate) established: bool,
+    pub(crate) authenticated: bool,
     pub(crate) client_version: String,
     pub(crate) peer_version: String,
     pub(crate) initial_algorithm: Option<String>,
@@ -699,7 +713,10 @@ impl<S> fmt::Debug for ClientTransport<S> {
             .field("inbound_sequence", &self.sequence.inbound_sequence())
             .field("outbound_sequence", &self.sequence.outbound_sequence())
             .field("established", &self.established)
-            .field("host_key_verified", &self.verified_host_key.is_some())
+            .field(
+                "host_key_verified",
+                &self.verified_server_host_key.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -721,11 +738,16 @@ where
                 sequence: SequenceState::new(),
                 session_id: Vec::new(),
                 verified_host_key: None,
+                verified_server_host_key: None,
+                server_sig_algs: None,
+                ext_info: ExtensionState::Disabled,
+                pending_transport_reply: None,
                 write_protector: None,
                 read_protector: None,
                 read_buffer: ProtectedReadBuffer::default(),
                 write_buffer: ProtectedWriteBuffer::default(),
                 established: false,
+                authenticated: false,
                 client_version: local_version.to_owned(),
                 peer_version: peer_version.clone(),
                 initial_algorithm: None,
@@ -746,6 +768,20 @@ where
     #[must_use]
     pub fn verified_host_key(&self) -> Option<&VerifiedHostKey> {
         self.verified_host_key.as_ref()
+    }
+
+    /// Returns the trusted negotiated host key, including RSA and ECDSA keys.
+    #[must_use]
+    pub fn host_public_key(&self) -> Option<&HostPublicKey> {
+        self.verified_server_host_key
+            .as_ref()
+            .map(|verified| &verified.key)
+    }
+
+    /// Returns the server's RFC 8308 signature list, or `None` when absent.
+    #[must_use]
+    pub fn server_signature_algorithms(&self) -> Option<&[String]> {
+        self.server_sig_algs.as_deref()
     }
 
     /// Returns whether protected payload exchange is available.
@@ -864,7 +900,45 @@ where
             return Err(TransportError::RekeyInProgress);
         }
         loop {
+            if let Some(reply) = self.pending_transport_reply.take()
+                && let Err(error) = self.write_payload(&reply)
+            {
+                if self.established {
+                    self.pending_transport_reply = Some(reply);
+                }
+                return Err(error);
+            }
             let (payload, sequence) = self.read_protected_packet()?;
+            if payload.first() == Some(&neotales_ssh::keepalive::SSH_MSG_PING) {
+                let ping = match neotales_ssh::keepalive::TransportPing::decode(&payload) {
+                    Ok(ping) => ping,
+                    Err(error) => return Err(self.fail_protected_write(error.into())),
+                };
+                let neotales_ssh::keepalive::TransportPing::Ping(data) = ping else {
+                    return Err(self.fail_protected_write(TransportError::InvalidMessage));
+                };
+                self.sequence.commit_inbound()?;
+                self.ext_info = ExtensionState::Complete;
+                if self.authenticated {
+                    self.pending_transport_reply =
+                        Some(neotales_ssh::keepalive::TransportPing::Pong(data).encode()?);
+                }
+                continue;
+            }
+            if payload.first() == Some(&neotales_ssh::ext_info::SSH_MSG_EXT_INFO) {
+                if !matches!(self.ext_info, ExtensionState::Awaiting) {
+                    return Err(self.fail_protected_write(TransportError::UnexpectedMessage));
+                }
+                let info = match neotales_ssh::ext_info::ExtInfo::decode(&payload) {
+                    Ok(info) => info,
+                    Err(error) => return Err(self.fail_protected_write(error.into())),
+                };
+                self.server_sig_algs = info.server_sig_algs().map(<[String]>::to_vec);
+                self.ext_info = ExtensionState::Complete;
+                self.sequence.commit_inbound()?;
+                continue;
+            }
+            self.ext_info = ExtensionState::Complete;
             if payload.first() == Some(&crate::msg::kexinit::SSH_MSG_KEXINIT) {
                 self.dispatch_peer_rekey(&payload, sequence)?;
                 while self.rekey.is_some() {
@@ -939,12 +1013,19 @@ where
         if sequence == u32::MAX {
             return Err(SequenceError::CounterExhausted.into());
         }
-        let payload = read_protected_packet_buffered(
+        let result = read_protected_packet_buffered(
             &mut self.stream,
             &mut self.read_buffer,
             protector,
             sequence,
-        )?;
+        );
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(error) if matches!(error, TransportError::Io(_) | TransportError::Truncated) => {
+                return Err(error);
+            }
+            Err(error) => return Err(self.fail_protected_write(error)),
+        };
         Ok((payload, sequence))
     }
 
@@ -956,6 +1037,19 @@ where
     pub fn exchange_payload(&mut self, payload: &[u8]) -> Result<Vec<u8>, TransportError> {
         self.write_payload(payload)?;
         self.read_payload()
+    }
+
+    /// Sends an OpenSSH transport ping. No timer or automatic disconnect is started.
+    ///
+    /// # Errors
+    /// Returns a payload bound, transport, or protection error.
+    pub fn send_ping(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+        if payload.len() > MAX_PACKET_CONTENT - 5 {
+            return Err(Error::LimitExceeded.into());
+        }
+        self.write_payload(
+            &neotales_ssh::keepalive::TransportPing::Ping(payload.to_vec()).encode()?,
+        )
     }
 
     /// Consumes the transport and returns its underlying byte stream.
@@ -1062,13 +1156,14 @@ where
     pub(crate) fn finish_handshake(
         &mut self,
         session_id: Vec<u8>,
-        verified_host_key: VerifiedHostKey,
+        verified_host_key: VerifiedServerHostKey,
         write_protector: PacketProtector,
         read_protector: PacketProtector,
     ) -> Result<(), TransportError> {
         self.sequence.complete_initial_kex()?;
         self.session_id = session_id;
-        self.verified_host_key = Some(verified_host_key);
+        self.verified_host_key = verified_host_key.legacy;
+        self.verified_server_host_key = Some(verified_host_key);
         self.write_protector = Some(write_protector);
         self.read_protector = Some(read_protector);
         self.established = true;
@@ -1076,7 +1171,12 @@ where
     }
 
     fn fail_protected_write(&mut self, error: TransportError) -> TransportError {
+        self.pending_transport_reply = None;
         self.write_buffer.abort();
+        self.read_buffer.clear();
+        self.read_protector = None;
+        self.write_protector = None;
+        self.rekey = None;
         self.established = false;
         error
     }

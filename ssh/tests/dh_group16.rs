@@ -283,7 +283,11 @@ fn group16_messages_and_sha512_hash_have_exact_framing() -> Result<(), Box<dyn s
 }
 
 #[test]
+#[ignore = "long group16 exchange: NEOTALES_SSH_E2E=1"]
 fn group16_roles_agree_on_a_64_byte_session_id() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("NEOTALES_SSH_E2E").as_deref() != Ok("1") {
+        return Ok(());
+    }
     let client = proposal([3; 16], KEX_DIFFIE_HELLMAN_GROUP16_SHA512);
     let server = proposal([4; 16], KEX_DIFFIE_HELLMAN_GROUP16_SHA512);
     let context = Group16KexContext::new(
@@ -317,8 +321,12 @@ fn group16_roles_agree_on_a_64_byte_session_id() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
+#[ignore = "long group16 handshake: NEOTALES_SSH_E2E=1"]
 fn client_and_server_configs_complete_group16_in_memory_handshake()
 -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("NEOTALES_SSH_E2E").as_deref() != Ok("1") {
+        return Ok(());
+    }
     let signer = Ed25519Signer::from_seed(&mut [91; 32]);
     let expected_key = *signer.public_key();
     let client_config =

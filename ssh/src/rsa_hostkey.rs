@@ -515,13 +515,17 @@ impl RsaHostSigner {
         let raw_signature = match algorithm {
             RsaHostKeyAlgorithm::Sha256 => {
                 let digest = sha2::Sha256::digest(exchange_hash);
-                self.key
-                    .sign(rsa::Pkcs1v15Sign::new_unprefixed(), digest.as_slice())
+                self.key.sign(
+                    rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                    digest.as_slice(),
+                )
             }
             RsaHostKeyAlgorithm::Sha512 => {
                 let digest = sha2::Sha512::digest(exchange_hash);
-                self.key
-                    .sign(rsa::Pkcs1v15Sign::new_unprefixed(), digest.as_slice())
+                self.key.sign(
+                    rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha512>(),
+                    digest.as_slice(),
+                )
             }
         }
         .map_err(|_error| RsaHostKeyError::SigningFailed)?;
@@ -581,7 +585,7 @@ pub fn verify_host_key_signature(
             public_key
                 .public_key()
                 .verify(
-                    rsa::Pkcs1v15Sign::new_unprefixed(),
+                    rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
                     digest.as_slice(),
                     signature,
                 )
@@ -592,7 +596,7 @@ pub fn verify_host_key_signature(
             public_key
                 .public_key()
                 .verify(
-                    rsa::Pkcs1v15Sign::new_unprefixed(),
+                    rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha512>(),
                     digest.as_slice(),
                     signature,
                 )

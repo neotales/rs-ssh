@@ -55,6 +55,9 @@ pub(crate) const KEX_ECDH_SHA2_NISTP521: &str = "ecdh-sha2-nistp521";
 
 /// The 2048-bit Diffie-Hellman group 14 SHA-256 algorithm name.
 pub(crate) const KEX_DIFFIE_HELLMAN_GROUP14_SHA256: &str = "diffie-hellman-group14-sha256";
+/// RFC 4419 SHA-256 group exchange with an implementation-bounded group policy.
+pub(crate) const KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256: &str =
+    "diffie-hellman-group-exchange-sha256";
 
 /// The 4096-bit Diffie-Hellman group 16 SHA-512 algorithm name.
 pub(crate) const KEX_DIFFIE_HELLMAN_GROUP16_SHA512: &str = "diffie-hellman-group16-sha512";
@@ -272,6 +275,9 @@ pub(crate) const SUPPORTED_KEX_ALGORITHMS: &[&str] = &[
     KEX_CURVE25519_SHA256_LIBCSSH,
     KEX_ECDH_SHA2_NISTP256,
     KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+    KEX_ECDH_SHA2_NISTP384,
+    KEX_ECDH_SHA2_NISTP521,
+    KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256,
 ];
 
 /// The host-key names a handshake in this crate will accept.
@@ -281,17 +287,15 @@ pub(crate) const SUPPORTED_KEX_ALGORITHMS: &[&str] = &[
 /// `ProtectionPlan::from_algorithms`, rather than comparing against one
 /// hard-coded name.
 ///
-/// `ssh-ed25519` is the only entry, and that is a deliberate statement rather
-/// than an omission. `rsa_hostkey.rs` and `ecdsa_hostkey.rs` are complete,
-/// tested RSA and ECDSA P-256 implementations, and
-/// [`KNOWN_HOST_KEY_ALGORITHMS`] records that they exist. Neither handshake can
-/// reach them, because both are hard-wired to Ed25519 for host-key signing and
-/// verification. Adding RSA or ECDSA to this list would advertise a mechanism
-/// that is then refused, which is the exact failure this list was corrected to
-/// stop; widening what a handshake accepts is a security-posture decision that
-/// belongs with the host-key work, not with this correction. See the `ssh`
-/// host-key reachability ticket.
-pub(crate) const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[HOST_KEY_SSH_ED25519];
+/// Ed25519, RSA SHA-2, and NIST P-256 are wired into both handshakes. A server
+/// advertises only names for which it has a configured signing key.
+pub(crate) const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[
+    "ssh-ed25519-cert-v01@openssh.com",
+    HOST_KEY_SSH_ED25519,
+    HOST_KEY_RSA_SHA2_512,
+    HOST_KEY_RSA_SHA2_256,
+    HOST_KEY_ECDSA_SHA2_NISTP256,
+];
 
 /// Every key-exchange name this crate recognises.
 ///
@@ -299,13 +303,13 @@ pub(crate) const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[HOST_KEY_SSH_ED25519
 /// SSH algorithm series that the KEXINIT codec can encode, decode and negotiate;
 /// proposing one of them does not mean a handshake can complete with it.
 ///
-/// `ecdh-sha2-nistp384`, `ecdh-sha2-nistp521` and
-/// `diffie-hellman-group14-sha256` have no mechanism in `kex/` at all, and the
-/// hybrid `mlkem768x25519-sha256` mechanism is driven by a codec of its own.
+/// `diffie-hellman-group14-sha256` remains recognized but unimplemented. The
+/// hybrid and variable-hash mechanisms use dedicated contexts/codecs.
 /// The list is kept because the RFC names are part of the wire vocabulary this
 /// crate has to understand, and because it is what makes the gap between
 /// "recognised" and "accepted" visible instead of invisible.
 pub(crate) const KNOWN_KEX_ALGORITHMS: &[&str] = &[
+    KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256,
     KEX_CURVE25519_SHA256,
     KEX_CURVE25519_SHA256_LIBCSSH,
     KEX_ECDH_SHA2_NISTP256,
@@ -318,16 +322,14 @@ pub(crate) const KNOWN_KEX_ALGORITHMS: &[&str] = &[
 
 /// Every host-key name this crate recognises and can sign with or verify.
 ///
-/// A strict superset of [`SUPPORTED_HOST_KEY_ALGORITHMS`], and unlike
-/// [`KNOWN_KEX_ALGORITHMS`] every entry here has a complete implementation
-/// behind it: `rsa-sha2-512` and `rsa-sha2-256` in `rsa_hostkey.rs`, and
-/// `ecdsa-sha2-nistp256` in `ecdsa_hostkey.rs`. What none of them has is a
-/// handshake that can select it — see [`SUPPORTED_HOST_KEY_ALGORITHMS`].
+/// This currently equals [`SUPPORTED_HOST_KEY_ALGORITHMS`]. Unlike the broader
+/// key-exchange catalog, every listed host key has a complete handshake path.
 ///
 /// The P-384 and P-521 ECDSA curves are *not* here: they are recognised by name
 /// in [`KNOWN_KEX_ALGORITHMS`]'s sibling `ecdsa_hostkey.rs` type surface but are
 /// outside the host-key algorithm names this crate advertises or accepts.
 pub(crate) const KNOWN_HOST_KEY_ALGORITHMS: &[&str] = &[
+    "ssh-ed25519-cert-v01@openssh.com",
     HOST_KEY_SSH_ED25519,
     HOST_KEY_RSA_SHA2_512,
     HOST_KEY_RSA_SHA2_256,
@@ -354,8 +356,7 @@ pub(crate) const SUPPORTED_MAC_ALGORITHMS: &[&str] = &[
 ];
 
 /// The complete compression catalog supported by the SSH algorithm series.
-pub(crate) const SUPPORTED_COMPRESSION_ALGORITHMS: &[&str] =
-    &[COMPRESSION_NONE, COMPRESSION_ZLIB_OPENSSH];
+pub(crate) const SUPPORTED_COMPRESSION_ALGORITHMS: &[&str] = &[COMPRESSION_NONE];
 
 /// The OpenSSH extension and strict-KEX marker catalog.
 pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &[
@@ -380,13 +381,20 @@ pub(crate) const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// [`KNOWN_KEX_ALGORITHMS`] and [`KNOWN_HOST_KEY_ALGORITHMS`].
 pub(crate) const SUPPORTED_ALGORITHMS: &[&str] = &[
     // SUPPORTED_KEX_ALGORITHMS
+    KEX_ECDH_SHA2_NISTP384,
+    KEX_ECDH_SHA2_NISTP521,
+    KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256,
     KEX_MLKEM768X25519_SHA256,
     KEX_CURVE25519_SHA256,
     KEX_CURVE25519_SHA256_LIBCSSH,
     KEX_ECDH_SHA2_NISTP256,
     KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
     // SUPPORTED_HOST_KEY_ALGORITHMS
+    "ssh-ed25519-cert-v01@openssh.com",
     HOST_KEY_SSH_ED25519,
+    HOST_KEY_RSA_SHA2_512,
+    HOST_KEY_RSA_SHA2_256,
+    HOST_KEY_ECDSA_SHA2_NISTP256,
     // SUPPORTED_ENCRYPTION_ALGORITHMS
     ENCRYPTION_CHACHA20_POLY1305_OPENSSH,
     ENCRYPTION_AES128_GCM_OPENSSH,
@@ -400,7 +408,6 @@ pub(crate) const SUPPORTED_ALGORITHMS: &[&str] = &[
     MAC_HMAC_SHA2_512_ETM_OPENSSH,
     // SUPPORTED_COMPRESSION_ALGORITHMS
     COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH,
     // SUPPORTED_EXTENSIONS
     EXT_INFO_C,
     EXT_INFO_S,
@@ -425,13 +432,21 @@ pub(crate) const DEFAULT_KEX_ALGORITHMS: &[&str] = &[
     KEX_CURVE25519_SHA256_LIBCSSH,
     KEX_ECDH_SHA2_NISTP256,
     KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+    KEX_ECDH_SHA2_NISTP384,
+    KEX_ECDH_SHA2_NISTP521,
+    KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256,
 ];
 
 /// The default host-key proposal, ordered by preference.
 ///
-/// Every entry is in [`SUPPORTED_HOST_KEY_ALGORITHMS`], so there is exactly one
-/// and it is the one both handshakes will accept.
-pub(crate) const DEFAULT_HOST_KEY_ALGORITHMS: &[&str] = SUPPORTED_HOST_KEY_ALGORITHMS;
+/// Every entry is in [`SUPPORTED_HOST_KEY_ALGORITHMS`]. Server configurations
+/// further restrict the proposal to the keys they actually hold.
+pub(crate) const DEFAULT_HOST_KEY_ALGORITHMS: &[&str] = &[
+    HOST_KEY_SSH_ED25519,
+    HOST_KEY_RSA_SHA2_512,
+    HOST_KEY_RSA_SHA2_256,
+    HOST_KEY_ECDSA_SHA2_NISTP256,
+];
 
 /// The default packet-encryption proposal, ordered by preference.
 pub(crate) const DEFAULT_ENCRYPTION_ALGORITHMS: &[&str] = &[
@@ -451,8 +466,7 @@ pub(crate) const DEFAULT_MAC_ALGORITHMS: &[&str] = &[
 ];
 
 /// The default compression algorithms, ordered by preference.
-pub(crate) const DEFAULT_COMPRESSION_ALGORITHMS: &[&str] =
-    &[COMPRESSION_NONE, COMPRESSION_ZLIB_OPENSSH];
+pub(crate) const DEFAULT_COMPRESSION_ALGORITHMS: &[&str] = &[COMPRESSION_NONE];
 
 /// An alias for [`DEFAULT_COMPRESSION_ALGORITHMS`].
 pub(crate) const DEFAULT_COMPRESSION_PROPOSAL: &[&str] = DEFAULT_COMPRESSION_ALGORITHMS;
@@ -465,7 +479,7 @@ pub(crate) const DEFAULT_COMPRESSION: &[&str] = DEFAULT_COMPRESSION_ALGORITHMS;
 /// # Examples
 ///
 /// ```
-/// assert_eq!(default_compression_proposal(), ["none", "zlib@openssh.com"]);
+/// assert_eq!(default_compression_proposal(), ["none"]);
 /// ```
 #[must_use]
 pub(crate) fn default_compression_proposal() -> &'static [&'static str] {
@@ -485,6 +499,9 @@ pub(crate) const DEFAULT_CLIENT_KEX_ALGORITHMS: &[&str] = &[
     KEX_CURVE25519_SHA256_LIBCSSH,
     KEX_ECDH_SHA2_NISTP256,
     KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+    KEX_ECDH_SHA2_NISTP384,
+    KEX_ECDH_SHA2_NISTP521,
+    KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256,
     KEX_STRICT_C_V00_OPENSSH,
 ];
 
@@ -498,6 +515,9 @@ pub(crate) const DEFAULT_SERVER_KEX_ALGORITHMS: &[&str] = &[
     KEX_CURVE25519_SHA256_LIBCSSH,
     KEX_ECDH_SHA2_NISTP256,
     KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+    KEX_ECDH_SHA2_NISTP384,
+    KEX_ECDH_SHA2_NISTP521,
+    KEX_DIFFIE_HELLMAN_GROUP_EXCHANGE_SHA256,
     KEX_STRICT_S_V00_OPENSSH,
 ];
 

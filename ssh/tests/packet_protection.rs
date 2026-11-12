@@ -123,7 +123,13 @@ fn chacha_protector_emits_exactly_what_the_cipher_seals_over_hand_assembled_clea
     // length field is not part of the ciphertext, so `4 + clear_length` is
     // *not* on the boundary.
     assert_eq!((4 + clear_length) % 8, 4);
-    assert_eq!(receiver.open(SEQUENCE, &packet)?, PAYLOAD);
+    let _ = take_plaintext_drop(PlaintextSlot::ClearPacket);
+    let retained = receiver.open(SEQUENCE, &packet)?;
+    assert_eq!(
+        take_plaintext_drop(PlaintextSlot::ClearPacket),
+        Some(PlaintextDrop::Wiped)
+    );
+    assert_eq!(retained, PAYLOAD);
 
     let mut clear = Vec::new();
     clear.extend_from_slice(&u32::try_from(PAYLOAD.len() + padding.len() + 1)?.to_be_bytes());
@@ -181,6 +187,52 @@ fn every_ctr_and_etm_variant_round_trips_multiple_lengths() -> Result<(), Packet
             let packet = sender.seal(sequence, payload, &padding)?;
             assert_eq!(receiver.open(sequence, &packet)?, payload);
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn owned_seal_input_reuses_capacity_for_short_maximum_and_failed_packets() -> Result<(), Box<dyn std::error::Error>> {
+    for (cipher, integrity) in [
+        (AES128_CTR, Some(HMAC_SHA2_256)),
+        (AES256_CTR, Some(HMAC_SHA2_512_ETM_OPENSSH)),
+        (AES256_GCM_OPENSSH, None),
+        (ENCRYPTION_CHACHA20_POLY1305_OPENSSH, None),
+    ] {
+        let suite = PacketSuite::new(cipher, integrity)?;
+        let (mut sender, mut receiver) = if suite.is_chacha() {
+            let material = || PacketKeyMaterial::new(&[0_u8; 8], &[0x61_u8; 64], None);
+            (PacketProtector::new(suite, material())?, PacketProtector::new(suite, material())?)
+        } else { protectors(suite, 0x61)? };
+        // Largest legal payload for this suite, including mandatory padding.
+        let size = (MAX_PACKET_CONTENT - 255..MAX_PACKET_CONTENT).rev().find(|size| size + padding_length(suite, *size) <= MAX_PACKET_CONTENT).ok_or("no maximum packet")?;
+        let maximum = vec![0x73; size];
+        let _ = take_plaintext_drop(PlaintextSlot::SealInput);
+        let _ = take_plaintext_drop(PlaintextSlot::ClearPacket);
+        let short = b"short secret";
+        let packet = sender.seal(0, short, &padding_for(suite, short.len()))?;
+        assert_eq!(receiver.open(0, &packet)?, short);
+        assert!(sender.seal_input_allocation().1 >= short.len(), "seal must retain its input allocation, not allocate/discard a Vec per packet");
+        for (sequence, payload) in [(1, maximum.as_slice()), (2, short.as_slice()), (3, maximum.as_slice())] {
+            let before = sender.seal_input_allocation();
+            let packet = sender.seal(sequence, payload, &padding_for(suite, payload.len()))?;
+            assert_eq!(receiver.open(sequence, &packet)?, payload);
+            let after = sender.seal_input_allocation();
+            assert_eq!(after.2, 0, "no live plaintext remains between seals");
+            if before.1 >= payload.len() { assert_eq!(after, before, "capacity sufficient: allocation must be reused"); }
+            assert_eq!(take_plaintext_drop(PlaintextSlot::SealInput), Some(PlaintextDrop::Wiped));
+            let _ = take_plaintext_drop(PlaintextSlot::ClearPacket);
+        }
+        let allocation = sender.seal_input_allocation();
+        assert!(matches!(sender.seal(4, short, &[0; 3]), Err(PacketProtectionError::InvalidPadding)));
+        assert_eq!(take_plaintext_drop(PlaintextSlot::SealInput), Some(PlaintextDrop::Wiped), "failure must wipe the owned buffer before clearing it");
+        assert_eq!(sender.seal_input_allocation(), allocation);
+        // A failed seal must leave both the allocation and cipher state usable.
+        let packet = sender.seal(4, short, &padding_for(suite, short.len()))?;
+        assert_eq!(receiver.open(4, &packet)?, short);
+        assert_eq!(sender.seal_input_allocation(), allocation);
+        assert_eq!(take_plaintext_drop(PlaintextSlot::SealInput), Some(PlaintextDrop::Wiped));
+        let _ = take_plaintext_drop(PlaintextSlot::ClearPacket);
     }
     Ok(())
 }
@@ -901,15 +953,8 @@ fn raw_key_material_can_be_fed_from_the_completed_kex_type() -> Result<(), Packe
     Ok(())
 }
 
-/// Every plaintext buffer a seal makes wipes itself, and the one path where the
-/// bytes are still in the clear at the end of the call is `chacha20-poly1305`.
-///
-/// The CTR and GCM suites encrypt in place, so the clear packet they build
-/// becomes the sealed packet and is handed on rather than wiped. The
-/// `chacha20-poly1305` suite seals into a buffer of its own, which means its
-/// clear packet is still in the clear when the function returns: a plain
-/// `Vec<u8>` there would leave the whole packet, password and all, readable in
-/// freed memory on every successful send over that suite.
+/// All suites encrypt the clear packet in place and hand on its ciphertext.
+/// The intermediate payload copy must still be wiped before it is released.
 #[test]
 fn a_seal_wipes_every_plaintext_buffer_it_made() -> Result<(), Box<dyn std::error::Error>> {
     const SECRET: &[u8] = b"hunter2";
@@ -928,8 +973,8 @@ fn a_seal_wipes_every_plaintext_buffer_it_made() -> Result<(), Box<dyn std::erro
     let sealed = sender.seal(SEQUENCE, SECRET, &padding)?;
     assert_eq!(
         take_plaintext_drop(PlaintextSlot::ClearPacket),
-        Some(PlaintextDrop::Wiped),
-        "a ChaCha seal leaves its clear packet in the clear, so it must be wiped"
+        Some(PlaintextDrop::HandedOn),
+        "the in-place ChaCha seal hands on ciphertext, not discarded plaintext"
     );
     assert_eq!(
         take_plaintext_drop(PlaintextSlot::SealInput),

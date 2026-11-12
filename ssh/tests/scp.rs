@@ -5,6 +5,34 @@
 // still reported.
 #![allow(missing_docs, unreachable_pub)]
 
+#[test]
+fn remote_shell_policy_preserves_windows_paths_and_quotes_without_posix_escaping()
+-> Result<(), Box<dyn std::error::Error>> {
+    use neotales_ssh::scp::{
+        RemoteShell, download_command_with_shell, upload_command, upload_command_with_shell,
+    };
+    let path = br"C:\Program Files\O'Brien";
+    assert_eq!(
+        upload_command_with_shell(path, RemoteShell::PowerShell)?,
+        "scp -t -- 'C:\\Program Files\\O''Brien'"
+    );
+    assert_eq!(
+        download_command_with_shell(path, RemoteShell::PowerShell)?,
+        "scp -f -- 'C:\\Program Files\\O''Brien'"
+    );
+    assert_ne!(
+        upload_command(path)?,
+        upload_command_with_shell(path, RemoteShell::PowerShell)?
+    );
+    for invalid in [b"a\0b".as_slice(), b"a\rb", b"a\nb"] {
+        for shell in [RemoteShell::Posix, RemoteShell::PowerShell] {
+            assert!(upload_command_with_shell(invalid, shell).is_err());
+            assert!(download_command_with_shell(invalid, shell).is_err());
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 #[path = "../src/scp.rs"]
 mod scp;

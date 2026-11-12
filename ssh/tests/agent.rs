@@ -15,13 +15,33 @@ use std::io::{self, Cursor, Read, Write};
 use agent::{
     AgentClient, AgentError, MAX_FRAME_SIZE, SSH_AGENT_FAILURE, SSH_AGENT_IDENTITIES_ANSWER,
     SSH_AGENT_RSA_SHA2_256, SSH_AGENT_SIGN_RESPONSE, SSH_AGENTC_REQUEST_IDENTITIES,
-    SSH_AGENTC_SIGN_REQUEST,
+    SSH_AGENTC_SIGN_REQUEST, socket_path_from_env,
 };
 use neotales_ssh::{Reader, Writer};
 
 struct ScriptedAgent {
     input: Cursor<Vec<u8>>,
     output: Vec<u8>,
+}
+
+#[test]
+fn sign_request_cap_includes_all_framing_and_rejects_before_writing() -> Result<(), Box<dyn Error>>
+{
+    let key = b"key";
+    let data = vec![0_u8; MAX_FRAME_SIZE - 13 - key.len()];
+    let mut client = AgentClient::new(ScriptedAgent::new(sign_response(b"signature")?));
+    assert_eq!(client.sign_with_flags(key, &data, 0)?, b"signature");
+    assert_eq!(client.into_inner().output.len(), MAX_FRAME_SIZE + 4);
+    let mut client = AgentClient::new(ScriptedAgent::new(Vec::new()));
+    let oversized = vec![0_u8; data.len() + 1];
+    assert!(matches!(
+        client.sign_with_flags(key, &oversized, 0),
+        Err(AgentError::FrameTooLarge)
+    ));
+    let stream = client.into_inner();
+    assert!(stream.output.is_empty());
+    assert_eq!(stream.input.position(), 0);
+    Ok(())
 }
 
 impl ScriptedAgent {
@@ -239,4 +259,17 @@ fn next_request(encoded: &[u8], offset: &mut usize) -> Result<(u8, Vec<u8>), Box
 
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[test]
+fn socket_path_uses_the_last_explicit_auth_sock_and_ignores_the_process() {
+    let environment = [
+        ("SSH_AUTH_SOCK", "/tmp/first.sock"),
+        ("OTHER", "/tmp/ignore.sock"),
+        ("SSH_AUTH_SOCK", "/tmp/second.sock"),
+    ];
+    assert_eq!(socket_path_from_env(&environment), Some("/tmp/second.sock"));
+    let cleared = [("SSH_AUTH_SOCK", "/tmp/first.sock"), ("SSH_AUTH_SOCK", "")];
+    assert_eq!(socket_path_from_env(&cleared), None);
+    assert_eq!(socket_path_from_env(&[] as &[(&str, &str)]), None);
 }

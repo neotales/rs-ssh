@@ -91,7 +91,7 @@ use hostkey::{Ed25519PublicKey, Ed25519Signer};
 use kex::{Curve25519, KeyExchange};
 use msg::kexinit::{
     AES128_CTR, AES128_GCM_OPENSSH, AES256_CTR, AES256_GCM_OPENSSH, COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH, CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
+    CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
     ENCRYPTION_CHACHA20_POLY1305_OPENSSH, HMAC_SHA2_256, HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512,
     HMAC_SHA2_512_ETM_OPENSSH, HOST_KEY_SSH_ED25519, KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
     KEX_STRICT_C_V00_OPENSSH, KexInit,
@@ -102,8 +102,9 @@ use server::{
     ServerTransportError, TransportError,
 };
 use session::{
-    ClientSessions, EnvironmentRequest, OwnedSessionRequest, PtyModes, PtyModesError, PtyModesView,
-    PtyRequest, ServerSessions, SessionDecision, SessionError, SessionEvent, SessionRequest,
+    ClientSessions, EnvironmentPlan, EnvironmentRequest, OwnedSessionRequest, PtyModes,
+    PtyModesError, PtyModesView, PtyRequest, ServerSessions, SessionDecision, SessionError,
+    SessionEvent, SessionRequest,
 };
 use sha2::Digest;
 
@@ -254,6 +255,10 @@ fn default_server_proposal_matches_the_supported_client_lists() {
             CURVE25519_SHA256_LIBSSH,
             ECDH_SHA2_NISTP256,
             KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+            // Task 0007 adds these only after both handshakes complete them.
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
             "kex-strict-s-v00@openssh.com",
         ]
         .map(str::to_owned)
@@ -296,17 +301,11 @@ fn default_server_proposal_matches_the_supported_client_lists() {
     }
     assert_eq!(
         proposal.compression_algorithms_client_to_server,
-        [
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned()
-        ]
+        [COMPRESSION_NONE.to_owned(),]
     );
     assert_eq!(
         proposal.compression_algorithms_server_to_client,
-        [
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned()
-        ]
+        [COMPRESSION_NONE.to_owned(),]
     );
 }
 
@@ -1303,6 +1302,7 @@ fn authenticated_pair(
 enum SeenRequest {
     Exec(Vec<u8>),
     Shell,
+    Subsystem(Vec<u8>),
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1318,6 +1318,7 @@ fn exec_uses_exact_command_bytes_and_delivers_status_eof_close_in_order()
         let observed = match request {
             SessionRequest::Exec { command } => SeenRequest::Exec(command.to_vec()),
             SessionRequest::Shell => SeenRequest::Shell,
+            SessionRequest::Subsystem { name } => SeenRequest::Subsystem(name.to_vec()),
         };
         seen_by_policy.borrow_mut().push(observed);
         SessionDecision::accept(23)
@@ -1460,6 +1461,7 @@ fn shell_accepts_pty_without_interpreting_modes_or_fabricating_a_command()
         seen_by_policy.borrow_mut().push(match request {
             SessionRequest::Exec { command } => SeenRequest::Exec(command.to_vec()),
             SessionRequest::Shell => SeenRequest::Shell,
+            SessionRequest::Subsystem { name } => SeenRequest::Subsystem(name.to_vec()),
         });
         SessionDecision::accept(0)
     });
@@ -1822,6 +1824,7 @@ fn forced_command_turns_an_accepted_shell_into_an_effective_exec_request()
             seen_by_policy.borrow_mut().push(match request {
                 SessionRequest::Exec { command } => SeenRequest::Exec(command.to_vec()),
                 SessionRequest::Shell => SeenRequest::Shell,
+                SessionRequest::Subsystem { name } => SeenRequest::Subsystem(name.to_vec()),
             });
             SessionDecision::accept(0)
         },
@@ -2549,4 +2552,216 @@ fn extended_data_payload(recipient: u32, data_type_code: u32, data: &[u8]) -> Ve
     writer.write_uint32(data_type_code);
     writer.write_string(data).unwrap_or_default();
     writer.into_bytes()
+}
+
+#[test]
+fn send_env_and_setenv_are_sent_before_an_accepted_sftp_subsystem()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig::new(signer(60));
+    let (client, server) = authenticated_pair(&config, 61)?;
+    let mut policy = ServerPolicy::new();
+    policy.accept_env("LANG")?;
+    policy.accept_env("LC_TIME")?;
+    policy.accept_env("MODE")?;
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_by_policy = Rc::clone(&seen);
+    let mut client = ClientSessions::new(client);
+    let mut server = ServerSessions::with_policies(
+        server,
+        move |request| {
+            seen_by_policy.borrow_mut().push(match request {
+                SessionRequest::Exec { command } => SeenRequest::Exec(command.to_vec()),
+                SessionRequest::Shell => SeenRequest::Shell,
+                SessionRequest::Subsystem { name } => SeenRequest::Subsystem(name.to_vec()),
+            });
+            SessionDecision::accept(0)
+        },
+        policy,
+    );
+    let session = client.open_session()?;
+    let SessionEvent::Opened { .. } = server.dispatch_one()? else {
+        return Err("sftp session did not open".into());
+    };
+    assert!(matches!(
+        client.dispatch_one()?,
+        SessionEvent::Opened { .. }
+    ));
+
+    let plan = EnvironmentPlan::from_send_and_set(
+        ["LANG", "LC_*", "-LC_ALL"],
+        ["MODE=test"],
+        [
+            ("LANG", &b"en_US"[..]),
+            ("LC_ALL", &b"C"[..]),
+            ("LC_TIME", &b"C"[..]),
+            ("UNSELECTED", &b"no"[..]),
+        ],
+    )?;
+    client.request_environment(session, &plan, true)?;
+    for expected in [
+        (&b"LANG"[..], &b"en_US"[..]),
+        (&b"LC_TIME"[..], &b"C"[..]),
+        (&b"MODE"[..], &b"test"[..]),
+    ] {
+        let SessionEvent::EnvironmentRequested {
+            name,
+            value,
+            accepted: true,
+            ..
+        } = server.dispatch_one()?
+        else {
+            return Err("environment request was not accepted".into());
+        };
+        assert_eq!(name, expected.0);
+        assert_eq!(value, expected.1);
+        assert!(matches!(
+            client.dispatch_one()?,
+            SessionEvent::RequestSucceeded { .. }
+        ));
+    }
+
+    client.request_sftp(session, true)?;
+    let SessionEvent::Request {
+        request: OwnedSessionRequest::Subsystem(name),
+        accepted: true,
+        ..
+    } = server.dispatch_one()?
+    else {
+        return Err("sftp subsystem was not accepted".into());
+    };
+    assert_eq!(name, b"sftp");
+    assert_eq!(
+        seen.borrow().as_slice(),
+        [SeenRequest::Subsystem(b"sftp".to_vec())]
+    );
+    assert!(matches!(
+        client.dispatch_one()?,
+        SessionEvent::RequestSucceeded { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn subsystem_rejection_is_final_and_scp_upload_uses_the_quoted_command()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig::new(signer(62));
+    let (client, server) = authenticated_pair(&config, 63)?;
+    let mut client = ClientSessions::new(client);
+    let mut server = ServerSessions::with_policy(server, |request| match request {
+        SessionRequest::Exec { .. } => SessionDecision::accept(0),
+        SessionRequest::Shell | SessionRequest::Subsystem { .. } => SessionDecision::reject(),
+    });
+    let session = client.open_session()?;
+    let SessionEvent::Opened { .. } = server.dispatch_one()? else {
+        return Err("scp session did not open".into());
+    };
+    assert!(matches!(
+        client.dispatch_one()?,
+        SessionEvent::Opened { .. }
+    ));
+
+    client.request_subsystem(session, b"sftp", true)?;
+    let SessionEvent::Request {
+        request: OwnedSessionRequest::Subsystem(name),
+        accepted: false,
+        ..
+    } = server.dispatch_one()?
+    else {
+        return Err("rejected subsystem was not reported".into());
+    };
+    assert_eq!(name, b"sftp");
+    assert!(matches!(
+        client.dispatch_one()?,
+        SessionEvent::RequestFailed { .. }
+    ));
+
+    let upload = client.open_session()?;
+    let SessionEvent::Opened {
+        session: upload_session,
+    } = server.dispatch_one()?
+    else {
+        return Err("scp session did not open".into());
+    };
+    assert_eq!(upload_session, upload);
+    assert!(matches!(
+        client.dispatch_one()?,
+        SessionEvent::Opened { session: opened } if opened == upload
+    ));
+    client.request_scp_upload(upload, "a'b.bin", true)?;
+    let SessionEvent::Request {
+        request: OwnedSessionRequest::Exec(command),
+        accepted: true,
+        ..
+    } = server.dispatch_one()?
+    else {
+        return Err("scp upload command was not accepted".into());
+    };
+    assert_eq!(command, b"scp -t -- 'a'\\''b.bin'");
+    assert!(matches!(
+        client.dispatch_one()?,
+        SessionEvent::RequestSucceeded { .. }
+    ));
+
+    let download = client.open_session()?;
+    let SessionEvent::Opened {
+        session: download_session,
+    } = server.dispatch_one()?
+    else {
+        return Err("scp download session did not open".into());
+    };
+    assert_eq!(download_session, download);
+    assert!(matches!(
+        client.dispatch_one()?,
+        SessionEvent::Opened { session: opened } if opened == download
+    ));
+    client.request_scp_download(download, "file.bin", true)?;
+    let SessionEvent::Request {
+        request: OwnedSessionRequest::Exec(command),
+        accepted: true,
+        ..
+    } = server.dispatch_one()?
+    else {
+        return Err("scp download command was not accepted".into());
+    };
+    assert_eq!(command, b"scp -f -- 'file.bin'");
+    Ok(())
+}
+
+#[test]
+fn forced_command_replaces_an_accepted_subsystem() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig::new(signer(64));
+    let (client, server) = authenticated_pair(&config, 65)?;
+    let mut policy = ServerPolicy::new();
+    policy.force_command(Some(b"forced-subsystem"))?;
+    let mut client = ClientSessions::new(client);
+    let mut server = ServerSessions::with_policies(
+        server,
+        |request| {
+            assert!(matches!(
+                request,
+                SessionRequest::Subsystem { name } if name == b"internal-sftp"
+            ));
+            SessionDecision::accept(0)
+        },
+        policy,
+    );
+    let session = client.open_session()?;
+    let SessionEvent::Opened { .. } = server.dispatch_one()? else {
+        return Err("forced subsystem session did not open".into());
+    };
+    assert!(matches!(
+        client.dispatch_one()?,
+        SessionEvent::Opened { .. }
+    ));
+    client.request_subsystem(session, b"internal-sftp", true)?;
+    let SessionEvent::Request {
+        request: OwnedSessionRequest::Exec(command),
+        accepted: true,
+        ..
+    } = server.dispatch_one()?
+    else {
+        return Err("forced subsystem was not rewritten".into());
+    };
+    assert_eq!(command, b"forced-subsystem");
+    Ok(())
 }

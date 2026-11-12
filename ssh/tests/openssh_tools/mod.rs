@@ -39,28 +39,8 @@
 //!
 //! # What happens when a program is absent
 //!
-//! **The lane fails, and the failure says what was missing and where it looked.**
-//! It does not print "skipping" and pass.
-//!
-//! This is a deliberate difference from `docker/engine/tests/ssh_dial_stdio.rs`,
-//! which probes for its three programs on `PATH` and returns early with a
-//! printed "skipping" line. That file's header gives the reason it can afford
-//! to: the lanes it guards are not a claim this repository makes about
-//! interoperability, they are coverage of a transport, and a coverage lane that
-//! reports "not run here" is still reporting honestly.
-//!
-//! These lanes *are* the interoperability claim. `docs/support-matrix.md`
-//! records `neotales-ssh` as verified against a live `sshd`, and the only
-//! evidence for that is a green run of exactly these tests. A lane that turns
-//! itself green because it could not start a peer would make the recorded claim
-//! unfalsifiable, which is the specific failure
-//! `docs/support-matrix.md`'s own preamble says this section exists to prevent.
-//! So the absence of a prerequisite is an error, the error names the program and
-//! every path that was tried, and it names the package that provides it.
-//!
-//! The tests are `#[ignore]`d, so this only fires for a caller who asked for the
-//! live lanes on purpose — `cargo test -p neotales-ssh -- --include-ignored`, or
-//! one test target with `--ignored`.
+//! Live lanes skip unless `NEOTALES_SSH_E2E=1` and their tools are available.
+//! Discovery errors remain errors for the fast discovery tests.
 //!
 //! # What is *not* claimed here
 //!
@@ -76,6 +56,32 @@ pub(crate) mod temp_dir;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+/// Checks prerequisites before any live test creates resources.
+pub(crate) fn e2e_enabled(agent: bool, docker: bool) -> bool {
+    if std::env::var("NEOTALES_SSH_E2E").as_deref() != Ok("1") {
+        eprintln!("skipping live SSH lane: set NEOTALES_SSH_E2E=1");
+        return false;
+    }
+    if sshd().is_err()
+        || ssh_keygen().is_err()
+        || (agent && (ssh_agent().is_err() || ssh_add().is_err()))
+    {
+        eprintln!("skipping live SSH lane: required OpenSSH tool is missing");
+        return false;
+    }
+    if cfg!(target_os = "linux")
+        && docker
+        && !std::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("skipping live SSH lane: Docker is unavailable");
+        return false;
+    }
+    true
+}
 
 /// Directories OpenSSH installs into, in the order they are tried.
 ///

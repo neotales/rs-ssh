@@ -1,10 +1,14 @@
 //! A bounded client for the OpenSSH agent identity and signing protocol.
 //!
-//! This module implements only identity enumeration and signature requests. It
-//! does not select a socket from the environment, manage agent keys, or create
-//! a timeout thread. Unix socket connections created by [`connect_unix`] apply
-//! [`DEFAULT_TIMEOUT`] to the stream, while callers that supply another
-//! [`Read`] + [`Write`] transport remain responsible for its I/O policy.
+//! This module supports identity enumeration, signing and key-management
+//! requests. `agent_server::AgentServer` is the optional in-process keyring.
+//! No connector creates a timeout thread.
+//! [`socket_path_from_env`] reads an explicit environment map for
+//! `SSH_AUTH_SOCK`; nothing in this module reads the process environment.
+//! Unix socket connections created by [`connect_unix`] apply [`DEFAULT_TIMEOUT`]
+//! to the stream, while callers that supply another [`Read`] + [`Write`]
+//! transport remain responsible for its I/O policy. `connect_pipe` opens only
+//! a caller-supplied local Windows pipe path, without discovery or environment.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -34,6 +38,8 @@ pub const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 /// Signature flag requesting RSA with SHA-256.
 pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
+/// Signature flag requesting RSA with SHA-512.
+pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
 
 /// An identity advertised by an SSH agent.
 ///
@@ -82,7 +88,7 @@ pub enum AgentError {
     AgentFailure,
     /// The default signing path does not support the key's algorithm.
     UnsupportedKey,
-    /// Unix-domain agent sockets are unavailable on this platform.
+    /// The requested agent connector is unavailable on this platform.
     UnsupportedPlatform,
 }
 
@@ -99,7 +105,7 @@ impl fmt::Display for AgentError {
             Self::AgentFailure => formatter.write_str("SSH agent rejected the request"),
             Self::UnsupportedKey => formatter.write_str("SSH agent key algorithm is unsupported"),
             Self::UnsupportedPlatform => {
-                formatter.write_str("SSH agent Unix-domain sockets are unsupported")
+                formatter.write_str("SSH agent connector is unsupported on this platform")
             }
         }
     }
@@ -204,6 +210,83 @@ where
         self.identities()
     }
 
+    /// Adds an RFC 9987 private-identity record (algorithm, private fields,
+    /// comment), without a message byte. The caller owns and must wipe the
+    /// input. This client wipes its encoded request. No file is read.
+    ///
+    /// # Errors
+    /// Returns frame, transport, or generic agent rejection errors.
+    pub fn add_identity(&mut self, record: &[u8]) -> Result<(), AgentError> {
+        self.identity_command(17, record)
+    }
+
+    /// Sends a constrained-add record, including the caller's encoded
+    /// constraints. Unsupported constraints must be rejected by the agent.
+    ///
+    /// # Errors
+    /// Returns frame, transport, or generic agent rejection errors.
+    pub fn add_identity_constrained(&mut self, record: &[u8]) -> Result<(), AgentError> {
+        self.identity_command(25, record)
+    }
+
+    /// Removes the exact public-key identity.
+    ///
+    /// # Errors
+    /// Returns framing, transport, or agent rejection errors.
+    pub fn remove_identity(&mut self, blob: &[u8]) -> Result<(), AgentError> {
+        self.string_command(18, blob)
+    }
+
+    /// Removes all identities. A locked agent may refuse this request.
+    ///
+    /// # Errors
+    /// Returns framing, transport, or agent rejection errors.
+    pub fn remove_all(&mut self) -> Result<(), AgentError> {
+        self.identity_command(19, &[])
+    }
+
+    /// Locks the agent with a caller-supplied passphrase. The caller owns the
+    /// input; the encoded request copy is wiped. No environment is read.
+    ///
+    /// # Errors
+    /// Returns framing, transport, or generic agent rejection errors.
+    pub fn lock(&mut self, passphrase: &[u8]) -> Result<(), AgentError> {
+        self.string_command(22, passphrase)
+    }
+
+    /// Unlocks with an exact passphrase. Rejection never contains that value.
+    ///
+    /// # Errors
+    /// Returns framing, transport, or generic agent rejection errors.
+    pub fn unlock(&mut self, passphrase: &[u8]) -> Result<(), AgentError> {
+        self.string_command(23, passphrase)
+    }
+
+    fn string_command(&mut self, message: u8, value: &[u8]) -> Result<(), AgentError> {
+        if value.len() > MAX_FRAME_SIZE - 5 {
+            return Err(AgentError::FrameTooLarge);
+        }
+        let mut writer = Writer::new();
+        writer.write_string(value)?;
+        let body = zeroize::Zeroizing::new(writer.into_bytes());
+        self.identity_command(message, &body)
+    }
+
+    fn identity_command(&mut self, message: u8, record: &[u8]) -> Result<(), AgentError> {
+        if record.len() >= MAX_FRAME_SIZE {
+            return Err(AgentError::FrameTooLarge);
+        }
+        let mut request = zeroize::Zeroizing::new(Vec::with_capacity(record.len() + 1));
+        request.push(message);
+        request.extend_from_slice(record);
+        self.send_frame(&request)?;
+        match self.read_frame()?.as_slice() {
+            [6] => Ok(()),
+            [5] => Err(AgentError::AgentFailure),
+            _ => Err(AgentError::InvalidFrame),
+        }
+    }
+
     /// Requests a signature using the flags implied by the key blob type.
     ///
     /// The first SSH string in `key_blob` must be exactly `ssh-ed25519`,
@@ -245,6 +328,15 @@ where
         data: &[u8],
         flags: u32,
     ) -> Result<Vec<u8>, AgentError> {
+        // Message byte, two SSH string lengths, and flags. Check the complete
+        // payload before Writer owns any caller-supplied bytes.
+        let length = key_blob
+            .len()
+            .checked_add(data.len())
+            .and_then(|length| length.checked_add(13));
+        if length.is_none_or(|length| length > MAX_FRAME_SIZE) {
+            return Err(AgentError::FrameTooLarge);
+        }
         let mut request = Writer::new();
         request.write_byte(SSH_AGENTC_SIGN_REQUEST);
         request.write_string(&key_blob)?;
@@ -301,8 +393,9 @@ where
 
 /// Opens a Unix-domain SSH agent socket and applies the default I/O timeout.
 ///
-/// The caller supplies the socket path explicitly. This function never reads
-/// an environment-selected socket path and does not implement Windows named pipes.
+/// The caller supplies the socket path explicitly. Use
+/// [`socket_path_from_env`] when the path should come from an explicit
+/// `SSH_AUTH_SOCK` entry. This function does not implement Windows named pipes.
 ///
 /// # Errors
 ///
@@ -329,12 +422,76 @@ pub fn connect_unix(path: impl AsRef<Path>) -> Result<AgentClient<io::Empty>, Ag
     Err(AgentError::UnsupportedPlatform)
 }
 
+/// Opens a caller-supplied local Windows named pipe in synchronous byte mode.
+/// Accepts the explicit `\\.\pipe\` namespace only, with a nonempty name.
+/// No default pipe name or process environment is consulted. The caller owns
+/// blocking-I/O policy; unlike UnixStream, File has no portable timeout setter.
+///
+/// # Errors
+/// Returns a fixed invalid-frame error for non-pipe paths, or an I/O error
+/// when the pipe is absent, busy, or access is denied. No retries are hidden.
+#[cfg(windows)]
+pub fn connect_pipe(path: impl AsRef<Path>) -> Result<AgentClient<std::fs::File>, AgentError> {
+    let path = path.as_ref();
+    if !path
+        .to_str()
+        .is_some_and(|value| value.starts_with(r"\\.\pipe\") && value.len() > 9)
+    {
+        return Err(AgentError::InvalidFrame);
+    }
+    let stream = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    Ok(AgentClient::new(stream))
+}
+
+/// Reports that Windows named pipes are unavailable on this platform.
+/// Does not access the supplied path or pretend it is a regular file/socket.
+///
+/// # Errors
+/// Always returns `AgentError::UnsupportedPlatform`.
+#[cfg(not(windows))]
+pub fn connect_pipe(path: impl AsRef<Path>) -> Result<AgentClient<io::Empty>, AgentError> {
+    let _ = path;
+    Err(AgentError::UnsupportedPlatform)
+}
+
+/// The environment variable OpenSSH uses for the agent socket path.
+pub const SSH_AUTH_SOCK_VARIABLE: &str = "SSH_AUTH_SOCK";
+
+/// Returns the last non-empty `SSH_AUTH_SOCK` value in an explicit environment.
+///
+/// The input is a caller-supplied map. This function does not read the process
+/// environment, open the path, or accept a Windows named pipe. An empty value
+/// clears an earlier path, matching a later assignment that unsets the socket.
+#[must_use]
+pub fn socket_path_from_env<'a, I, K, V>(environment: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a (K, V)>,
+    K: AsRef<str> + 'a,
+    V: AsRef<str> + 'a,
+{
+    let mut selected = None;
+    for (name, value) in environment {
+        if name.as_ref() != SSH_AUTH_SOCK_VARIABLE {
+            continue;
+        }
+        let value = value.as_ref();
+        selected = if value.is_empty() { None } else { Some(value) };
+    }
+    selected
+}
+
 fn default_signing_flags(key_blob: &[u8]) -> Result<u32, AgentError> {
     let mut reader = Reader::new(key_blob);
     let algorithm = reader.read_string()?;
     match algorithm {
         // Zero flags: the agent signs under the key's own format identifier.
-        b"ssh-ed25519" | b"ecdsa-sha2-nistp256" => Ok(0),
+        b"ssh-ed25519"
+        | b"ecdsa-sha2-nistp256"
+        | b"ecdsa-sha2-nistp384"
+        | b"ecdsa-sha2-nistp521" => Ok(0),
         b"ssh-rsa" => Ok(SSH_AGENT_RSA_SHA2_256),
         _ => Err(AgentError::UnsupportedKey),
     }

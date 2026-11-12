@@ -4,7 +4,12 @@
 //! exchange, packet protection, host-key handling, client and server
 //! handshakes, user authentication, session channels, and direct-tcpip
 //! forwarding metadata. Client and server are modules of this single library
-//! and share the same transport boundary.
+//! and share the same transport boundary. Session channels carry `exec`,
+//! `shell`, and `subsystem` requests. [`EnvironmentPlan`] applies `SendEnv`
+//! and `SetEnv` to those channels. SCP and SFTP each have a byte codec and a
+//! session request that starts it. The agent client enumerates identities and
+//! requests signatures; it does not read `SSH_AUTH_SOCK` unless the caller
+//! passes that environment in.
 //!
 //! The supported entry points are re-exported at the crate root. The
 //! sequence-facing types used by the public rekey and transport-error APIs,
@@ -15,25 +20,8 @@
 //!
 //! # Public surface
 //!
-//! `KexInit` is the one type to be aware of here. It is the argument to
-//! [`ClientConfig::with_kexinit`] and the result of [`ClientConfig::kexinit`],
-//! so it is part of this crate's API, but it lives in a private module and
-//! cannot yet be named by a downstream caller. `docs/visibility.md` records
-//! that, the reasoning behind the rest of the surface, and the measurement that
-//! keeps it honest.
-//!
-//! The blocker is not the export. `pub use msg::kexinit::KexInit;` is a one-line
-//! change and it compiles — but the *real* `msg` module and the hand-maintained
-//! `#[cfg(doctest)]` mirror that shadows it are two different declarations of the
-//! same name, and the export has to be gated to match. A consumer names one name;
-//! rustdoc resolves it in whichever module it is building. Gating the export
-//! correctly turns out to need the mirror to agree on visibility for
-//! `NegotiatedAlgorithms` and `NegotiationError` as well, and the mirror's
-//! `NegotiationError` variant is `pub(crate)`, so `negotiate`'s own doc link to
-//! `NegotiationError::NoCommonAlgorithm` then resolves to a private item and
-//! `RUSTDOCFLAGS="-D warnings" cargo doc` fails with three errors that do not
-//! exist at HEAD. That is the whole reason this is still open: it is a
-//! visibility-mirroring problem, not a missing `pub use`.
+//! [`KexInit`], [`NegotiatedAlgorithms`], and [`NegotiationError`] are public
+//! so callers can construct and narrow proposals for either handshake.
 
 extern crate self as neotales_ssh;
 
@@ -101,8 +89,21 @@ pub(crate) mod msg {
             CURVE25519_SHA256_LIBSSH,
             ECDH_SHA2_NISTP256,
             KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
         ];
-        pub const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[HOST_KEY_SSH_ED25519];
+        pub const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[
+            "ssh-ed25519-cert-v01@openssh.com",
+            HOST_KEY_SSH_ED25519,
+            "rsa-sha2-512",
+            "rsa-sha2-256",
+            "ecdsa-sha2-nistp256",
+        ];
+
+        pub const DEFAULT_HOST_KEY_ALGORITHMS: &[&str] = &[
+            HOST_KEY_SSH_ED25519, "rsa-sha2-512", "rsa-sha2-256", "ecdsa-sha2-nistp256",
+        ];
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub enum NegotiationError {
@@ -267,6 +268,7 @@ pub mod transport;
 pub mod wire;
 
 pub mod agent;
+pub mod agent_server;
 pub mod cert;
 pub mod chacha_cipher;
 pub mod compression;
@@ -279,6 +281,7 @@ pub mod keepalive;
 pub mod known_hosts;
 #[allow(dead_code)]
 pub mod openssh_key;
+pub mod private_key;
 pub mod proxy;
 #[allow(clippy::missing_errors_doc)]
 pub mod rsa_hostkey;
@@ -287,6 +290,8 @@ pub mod server_policy;
 pub mod sftp;
 pub mod ssh_config;
 pub mod tcpip_forward;
+pub mod streamlocal;
+pub mod x11;
 
 pub use agent::AgentClient;
 pub use cert::Certificate;
@@ -298,8 +303,10 @@ pub use gssapi::{
     GssapiExchangeComplete, GssapiExchangeState, GssapiMechanismResult, GssapiMessage,
     GssapiRequest, GssapiResponse, GssapiToken, GssapiTokenMechanism,
 };
+pub use hostkey::HostPublicKey;
 pub use keepalive::GlobalRequest;
 pub use known_hosts::KnownHosts;
+pub use msg::kexinit::{KexInit, NegotiatedAlgorithms, NegotiationError};
 pub use openssh_key::OpenSshPrivateKey;
 pub use proxy::ProxyClient;
 pub use rsa_hostkey::RsaHostKey;
@@ -320,7 +327,10 @@ pub use client::{
 pub use direct_tcpip::{ClientDirectTcpip, DirectTcpipPolicy, ServerDirectTcpip};
 pub use sequence::{Direction, SequenceError};
 pub use server::{DEFAULT_SERVER_IDENTIFICATION, ServerConfig, ServerTransport};
-pub use session::{ClientSessions, ServerSessions, SessionPolicy};
+pub use session::{
+    ClientSessions, EnvironmentAssignment, EnvironmentPlan, EnvironmentPlanError, ServerSessions,
+    SessionPolicy,
+};
 
 /// A string that wipes itself when it is dropped.
 ///

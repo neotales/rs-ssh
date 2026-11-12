@@ -10,15 +10,15 @@ mod msg;
 
 use msg::kexinit::{
     AES128_CTR, AES128_GCM_OPENSSH, AES256_CTR, AES256_GCM_OPENSSH, COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH, CURVE25519_SHA256, DEFAULT_CLIENT_KEX_ALGORITHMS,
-    DEFAULT_COMPRESSION_ALGORITHMS, DEFAULT_SERVER_KEX_ALGORITHMS, ECDH_SHA2_NISTP256,
-    ENCRYPTION_CHACHA20_POLY1305_OPENSSH, EXT_INFO_C, EXT_INFO_S, HMAC_SHA2_256,
-    HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512, HMAC_SHA2_512_ETM_OPENSSH, HOST_KEY_SSH_ED25519,
-    KEX_STRICT_C_V00_OPENSSH, KEX_STRICT_S_V00_OPENSSH, KNOWN_HOST_KEY_ALGORITHMS,
-    KNOWN_KEX_ALGORITHMS, KexInit, NegotiationError, RSA_SHA2_256, RSA_SHA2_512, SSH_MSG_KEXINIT,
-    SUPPORTED_ALGORITHMS, SUPPORTED_COMPRESSION_ALGORITHMS, SUPPORTED_ENCRYPTION_ALGORITHMS,
-    SUPPORTED_EXTENSIONS, SUPPORTED_HOST_KEY_ALGORITHMS, SUPPORTED_KEX_ALGORITHMS,
-    SUPPORTED_MAC_ALGORITHMS, is_kex_marker, negotiate_algorithm,
+    CURVE25519_SHA256, DEFAULT_CLIENT_KEX_ALGORITHMS, DEFAULT_COMPRESSION_ALGORITHMS,
+    DEFAULT_SERVER_KEX_ALGORITHMS, ECDH_SHA2_NISTP256, ENCRYPTION_CHACHA20_POLY1305_OPENSSH,
+    EXT_INFO_C, EXT_INFO_S, HMAC_SHA2_256, HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512,
+    HMAC_SHA2_512_ETM_OPENSSH, HOST_KEY_SSH_ED25519, KEX_STRICT_C_V00_OPENSSH,
+    KEX_STRICT_S_V00_OPENSSH, KNOWN_HOST_KEY_ALGORITHMS, KNOWN_KEX_ALGORITHMS, KexInit,
+    NegotiationError, RSA_SHA2_256, RSA_SHA2_512, SSH_MSG_KEXINIT, SUPPORTED_ALGORITHMS,
+    SUPPORTED_COMPRESSION_ALGORITHMS, SUPPORTED_ENCRYPTION_ALGORITHMS, SUPPORTED_EXTENSIONS,
+    SUPPORTED_HOST_KEY_ALGORITHMS, SUPPORTED_KEX_ALGORITHMS, SUPPORTED_MAC_ALGORITHMS,
+    is_kex_marker, negotiate_algorithm,
 };
 use neotales_ssh::{Error, Reader, Writer, encode_name_list};
 
@@ -164,11 +164,11 @@ fn no_algorithm_list_contains_a_duplicate_entry() {
 }
 
 #[test]
-fn the_known_catalogs_are_strict_supersets_of_the_supported_ones() {
-    // `KNOWN_*` exists to be larger. If it stops being larger, one of the two
-    // constants is misnamed and one of the two documentation claims is a lie.
+fn known_catalogs_contain_every_supported_algorithm() {
+    // KEX still recognises unimplemented mechanisms. Every known host-key
+    // algorithm now has a handshake implementation, so those catalogs agree.
     assert!(KNOWN_KEX_ALGORITHMS.len() > SUPPORTED_KEX_ALGORITHMS.len());
-    assert!(KNOWN_HOST_KEY_ALGORITHMS.len() > SUPPORTED_HOST_KEY_ALGORITHMS.len());
+    assert_eq!(KNOWN_HOST_KEY_ALGORITHMS, SUPPORTED_HOST_KEY_ALGORITHMS);
     for name in SUPPORTED_KEX_ALGORITHMS {
         assert!(
             KNOWN_KEX_ALGORITHMS.contains(name),
@@ -183,22 +183,19 @@ fn the_known_catalogs_are_strict_supersets_of_the_supported_ones() {
     }
     // The names that are recognised but never negotiated, named explicitly so
     // that adding a mechanism to either handshake has to delete a line here.
-    for name in [
-        "ecdh-sha2-nistp384",
-        "ecdh-sha2-nistp521",
-        "diffie-hellman-group14-sha256",
-    ] {
-        assert!(KNOWN_KEX_ALGORITHMS.contains(&name));
-        assert!(
-            !SUPPORTED_KEX_ALGORITHMS.contains(&name),
-            "{name} has no mechanism in kex/, so no handshake can accept it",
-        );
-    }
+    // Task 0007 supplies the larger curves and SHA-256 group exchange;
+    // group14 remains recognized-only and must not be advertised.
+    let name = "diffie-hellman-group14-sha256";
+    assert!(KNOWN_KEX_ALGORITHMS.contains(&name));
+    assert!(
+        !SUPPORTED_KEX_ALGORITHMS.contains(&name),
+        "{name} still has no handshake path"
+    );
     for name in ["rsa-sha2-512", "rsa-sha2-256", "ecdsa-sha2-nistp256"] {
         assert!(KNOWN_HOST_KEY_ALGORITHMS.contains(&name));
         assert!(
-            !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&name),
-            "{name} has an implementation but no handshake path to it",
+            SUPPORTED_HOST_KEY_ALGORITHMS.contains(&name),
+            "{name} must have a handshake path",
         );
     }
 }
@@ -491,11 +488,11 @@ fn encoding_and_decoding_use_ssh_name_list_encoding() -> Result<(), Error> {
     );
     assert_eq!(
         decoded.compression_algorithms_client_to_server,
-        [COMPRESSION_NONE, COMPRESSION_ZLIB_OPENSSH]
+        [COMPRESSION_NONE]
     );
     assert_eq!(
         decoded.compression_algorithms_server_to_client,
-        [COMPRESSION_NONE, COMPRESSION_ZLIB_OPENSSH]
+        [COMPRESSION_NONE]
     );
     Ok(())
 }
@@ -664,10 +661,7 @@ fn p0_names_are_present_once_and_compression_is_only_none() {
         );
     }
     assert!(SUPPORTED_KEX_ALGORITHMS.contains(&"mlkem768x25519-sha256"));
-    assert_eq!(
-        DEFAULT_COMPRESSION_ALGORITHMS,
-        [COMPRESSION_NONE, COMPRESSION_ZLIB_OPENSSH]
-    );
+    assert_eq!(DEFAULT_COMPRESSION_ALGORITHMS, [COMPRESSION_NONE]);
     assert_eq!(
         DEFAULT_CLIENT_KEX_ALGORITHMS
             .iter()

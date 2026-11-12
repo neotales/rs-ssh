@@ -1,8 +1,9 @@
 //! RFC 8308 `SSH_MSG_EXT_INFO` encoding and extension parsing.
 //!
 //! This module handles the message wire format and the RFC 8308
-//! `server-sig-algs` extension. It does not send the message or alter a
-//! handshake's negotiated algorithms.
+//! `server-sig-algs` extension. The value contains raw comma-separated bytes,
+//! without a nested SSH string prefix. `ClientConfig::with_extension_info`
+//! enables transport/auth negotiation; this module is the wire codec only.
 
 use std::collections::HashSet;
 
@@ -87,8 +88,8 @@ impl Extension {
         S: IntoIterator<Item = N>,
         N: AsRef<str>,
     {
-        let value = encode_name_list(names)?;
-        Self::new(SERVER_SIG_ALGS, &value)
+        let framed = encode_name_list(names)?;
+        Self::new(SERVER_SIG_ALGS, &framed[4..])
     }
 
     /// Returns the extension name.
@@ -303,17 +304,9 @@ fn validate_extension_name(name: &str) -> Result<(), Error> {
 }
 
 fn decode_complete_name_list(input: &[u8]) -> Result<Vec<String>, Error> {
-    let mut reader = Reader::new(input);
-    let length = reader.read_uint32()?;
-    let expected = usize::try_from(length)
-        .ok()
-        .and_then(|length| length.checked_add(4))
-        .ok_or(Error::InvalidName)?;
-    if expected != input.len() {
-        decode_name_list(input)?;
-        return Err(Error::InvalidName);
-    }
-    decode_name_list(input)
+    let mut framed = Writer::new();
+    framed.write_string(input)?;
+    decode_name_list(framed.as_bytes())
 }
 
 fn ensure_unique_names(extensions: &[Extension]) -> Result<(), Error> {

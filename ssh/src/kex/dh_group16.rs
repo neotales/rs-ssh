@@ -423,9 +423,10 @@ impl DhGroup16 {
         let private =
             ephemeral.into_material::<Group16Private>(KEX_DIFFIE_HELLMAN_GROUP16_SHA512)?;
         let prime = group16_prime()?;
-        let private = BigUint::from_bytes_be(&private.0);
-        let shared = peer.modpow(&private, &prime);
-        SharedSecret::from_raw(&shared.to_bytes_be())
+        let private = Zeroizing::new(BigUint::from_bytes_be(&private.0));
+        let shared = Zeroizing::new(peer.modpow(&private, &prime));
+        let magnitude = Zeroizing::new(shared.to_bytes_be());
+        SharedSecret::from_raw(&magnitude)
     }
 }
 
@@ -1016,9 +1017,9 @@ pub(crate) fn compute_group16_exchange_hash(
     writer.write_string(host_key_blob)?;
     write_positive_mpint(&mut writer, &client_public_key)?;
     write_positive_mpint(&mut writer, &server_public_key)?;
-    let mut framed = writer.into_bytes();
+    let mut framed = Zeroizing::new(writer.into_bytes());
     framed.extend_from_slice(shared_secret.as_bytes());
-    Ok(Sha512::digest(framed).into())
+    Ok(Sha512::digest(framed.as_slice()).into())
 }
 
 /// Alias for [`compute_group16_exchange_hash`] using the algorithm name.
@@ -1170,7 +1171,8 @@ fn validate_private_bytes(private: &[u8; DH_GROUP16_PRIVATE_LENGTH]) -> Result<(
 fn public_from_private(private: &[u8; DH_GROUP16_PRIVATE_LENGTH]) -> Result<BigUint, KexError> {
     validate_private_bytes(private)?;
     let prime = group16_prime()?;
-    Ok(BigUint::from(DH_GROUP16_GENERATOR).modpow(&BigUint::from_bytes_be(private), &prime))
+    let exponent = Zeroizing::new(BigUint::from_bytes_be(private));
+    Ok(BigUint::from(DH_GROUP16_GENERATOR).modpow(&exponent, &prime))
 }
 
 fn parse_public_value(value: &[u8]) -> Result<BigUint, KexError> {

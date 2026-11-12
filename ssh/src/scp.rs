@@ -3,7 +3,9 @@
 //! This module only operates on a caller-supplied byte stream.  It does not
 //! create a process, open a socket, or send an SSH `exec` request.  The
 //! [`upload_command`] and [`download_command`] helpers return command text for
-//! the caller to use with its own channel policy.
+//! the caller to use with its own channel policy. [`crate::session::ClientSessions::request_scp_upload`]
+//! and [`crate::session::ClientSessions::request_scp_download`] send that text
+//! as an `exec` request.
 //!
 //! The implementation handles one regular file and deliberately rejects the
 //! legacy `D` and `E` directory records.  Header lines and materialized file
@@ -329,7 +331,7 @@ pub fn upload_command<P>(path: P) -> Result<String, ScpError>
 where
     P: AsRef<[u8]>,
 {
-    build_command("-t", path.as_ref())
+    upload_command_with_shell(path, RemoteShell::Posix)
 }
 
 /// Builds the command text for an SCP download without executing it.
@@ -344,7 +346,40 @@ pub fn download_command<P>(path: P) -> Result<String, ScpError>
 where
     P: AsRef<[u8]>,
 {
-    build_command("-f", path.as_ref())
+    download_command_with_shell(path, RemoteShell::Posix)
+}
+
+/// Explicit remote exec quoting policy. This does not detect or start a shell.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RemoteShell {
+    /// POSIX single-quote escaping, retained as the default.
+    #[default]
+    Posix,
+    /// PowerShell literal-string escaping. Backslashes remain path bytes.
+    /// The caller must know that the remote command interpreter is PowerShell.
+    PowerShell,
+}
+
+/// Builds an upload exec command using the caller's remote shell policy.
+///
+/// # Errors
+/// Rejects empty paths, invalid UTF-8, NUL, CR, and LF. No command is executed.
+pub fn upload_command_with_shell(
+    path: impl AsRef<[u8]>,
+    shell: RemoteShell,
+) -> Result<String, ScpError> {
+    build_command("-t", path.as_ref(), shell)
+}
+
+/// Builds a download exec command using the caller's remote shell policy.
+///
+/// # Errors
+/// Rejects the same invalid path bytes as [`upload_command_with_shell`].
+pub fn download_command_with_shell(
+    path: impl AsRef<[u8]>,
+    shell: RemoteShell,
+) -> Result<String, ScpError> {
+    build_command("-f", path.as_ref(), shell)
 }
 
 /// Uploads one in-memory file to an SCP sink over `stream`.
@@ -613,7 +648,7 @@ where
 /// A short alias for [`ScpClient`].
 pub type Scp<T> = ScpClient<T>;
 
-fn build_command(flag: &str, path: &[u8]) -> Result<String, ScpError> {
+fn build_command(flag: &str, path: &[u8], shell: RemoteShell) -> Result<String, ScpError> {
     validate_path(path)?;
     let path = std::str::from_utf8(path).map_err(|_| ScpError::InvalidPath)?;
     let mut command = String::with_capacity(path.len().saturating_add(16));
@@ -622,7 +657,10 @@ fn build_command(flag: &str, path: &[u8]) -> Result<String, ScpError> {
     command.push_str(" -- '");
     for character in path.chars() {
         if character == '\'' {
-            command.push_str("'\\''");
+            command.push_str(match shell {
+                RemoteShell::Posix => "'\\''",
+                RemoteShell::PowerShell => "''",
+            });
         } else {
             command.push(character);
         }

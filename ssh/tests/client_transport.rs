@@ -54,10 +54,10 @@ use kex::{
 };
 use msg::kexinit::{
     AES128_CTR, AES128_GCM_OPENSSH, AES256_CTR, AES256_GCM_OPENSSH, COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH, CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
+    CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
     ENCRYPTION_CHACHA20_POLY1305_OPENSSH, EXT_INFO_S, HMAC_SHA2_256, HMAC_SHA2_512,
-    HOST_KEY_RSA_SHA2_256, HOST_KEY_SSH_ED25519, KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
-    KEX_STRICT_S_V00_OPENSSH, KexInit, NegotiatedAlgorithms, SSH_MSG_KEXINIT,
+    HOST_KEY_SSH_ED25519, KEX_DIFFIE_HELLMAN_GROUP16_SHA512, KEX_STRICT_S_V00_OPENSSH, KexInit,
+    NegotiatedAlgorithms, SSH_MSG_KEXINIT,
 };
 use neotales_ssh::{build_packet_default, decode_packet};
 use sequence::SequenceState;
@@ -297,7 +297,7 @@ fn malformed_and_incompatible_kexinit_fail_without_starting_kex()
             HMAC_SHA2_256,
             true,
         );
-        proposal.server_host_key_algorithms = vec![HOST_KEY_RSA_SHA2_256.to_owned()];
+        proposal.server_host_key_algorithms = vec!["ssh-rsa".to_owned()];
         let (peer, config) =
             custom_peer_and_config(proposal, CURVE25519_SHA256, 63, PRE_BANNER, None)?;
         let result = config.connect(peer.client_stream.clone(), |_key| Ok::<(), Infallible>(()));
@@ -801,6 +801,8 @@ fn direct_chacha_protector_checks_key_length_sequence_and_rekey()
     let mut receiver = PacketProtector::new(suite, PacketKeyMaterial::new(&iv, &key, None))?;
     let padding = vec![0x5a_u8; protection_padding(CLIENT_PAYLOAD.len(), suite).len()];
     let packet = sender.seal(3, CLIENT_PAYLOAD, &padding)?;
+    assert!(sender.seal(3, CLIENT_PAYLOAD, &padding).is_err());
+    assert!(sender.seal(2, CLIENT_PAYLOAD, &padding).is_err());
     let mut clear = Vec::new();
     clear
         .extend_from_slice(&u32::try_from(CLIENT_PAYLOAD.len() + padding.len() + 1)?.to_be_bytes());
@@ -845,18 +847,30 @@ fn default_proposal_advertises_only_implemented_mechanisms_and_required_categori
             CURVE25519_SHA256_LIBSSH,
             ECDH_SHA2_NISTP256,
             KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+            // Task 0007: both handshake paths now complete these mechanisms.
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
             sequence::KEX_STRICT_C_V00_OPENSSH,
         ]
         .map(str::to_owned)
     );
-    assert_eq!(kexinit.server_host_key_algorithms, [HOST_KEY_SSH_ED25519]);
+    assert_eq!(
+        kexinit.server_host_key_algorithms,
+        [
+            HOST_KEY_SSH_ED25519,
+            "rsa-sha2-512",
+            "rsa-sha2-256",
+            "ecdsa-sha2-nistp256"
+        ]
+    );
     assert_eq!(
         kexinit.compression_algorithms_client_to_server,
-        [COMPRESSION_NONE, COMPRESSION_ZLIB_OPENSSH]
+        [COMPRESSION_NONE]
     );
     assert_eq!(
         kexinit.compression_algorithms_server_to_client,
-        [COMPRESSION_NONE, COMPRESSION_ZLIB_OPENSSH]
+        [COMPRESSION_NONE]
     );
     assert!(
         kexinit

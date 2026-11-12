@@ -8,7 +8,7 @@
 use std::any::Any;
 use std::fmt;
 
-use neotales_ssh::{Error as WireError, Reader, Writer, encode_mpint};
+use neotales_ssh::{Error as WireError, Reader, Writer};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -26,6 +26,11 @@ mod ecdh_p256;
 #[allow(dead_code)]
 #[path = "mlkem768_x25519.rs"]
 pub(crate) mod mlkem768_x25519;
+// Legacy codec harnesses include this file without the transport dispatchers.
+// Their unused modern entry points are exercised through both public transports
+// by tests/kex_breadth.rs, not dead production code.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod modern;
 
 pub(crate) use curve25519::{CURVE25519_PUBLIC_KEY_LENGTH, Curve25519};
 #[allow(unused_imports)]
@@ -89,9 +94,9 @@ pub enum KexError {
     EntropyFailure,
     /// A role was used before its input arrived or after its one-shot transition.
     InvalidState,
-    /// An exchange hash was not 32 bytes, as required by the baseline mechanisms.
+    /// An exchange hash did not match the selected mechanism's digest width.
     InvalidExchangeHash,
-    /// A session identifier was not 32 bytes.
+    /// A session identifier had an invalid digest width.
     InvalidSessionId,
     /// A completion presented a session identifier different from the established one.
     SessionIdMismatch,
@@ -115,8 +120,8 @@ impl fmt::Display for KexError {
             Self::NonContributorySecret => "SSH KEX shared secret is non-contributory",
             Self::EntropyFailure => "secure random-number generation failed",
             Self::InvalidState => "SSH KEX role is in an invalid state",
-            Self::InvalidExchangeHash => "SSH exchange hash must contain 32 bytes",
-            Self::InvalidSessionId => "SSH session identifier must contain 32 bytes",
+            Self::InvalidExchangeHash => "SSH exchange hash has an invalid length",
+            Self::InvalidSessionId => "SSH session identifier has an invalid length",
             Self::SessionIdMismatch => "SSH session identifier does not match",
             Self::DerivedKeyLimitExceeded => "SSH derived-key output exceeds the safety limit",
         })
@@ -426,12 +431,29 @@ impl SharedSecret {
         if all_zero(raw) {
             return Err(KexError::NonContributorySecret);
         }
-        let mut positive = Vec::with_capacity(raw.len().saturating_add(1));
-        if raw.first().is_some_and(|byte| *byte & 0x80 != 0) {
-            positive.push(0);
+        // Encode the positive magnitude directly. The general mpint encoder
+        // first owns another ordinary Vec, which would retain a secret copy.
+        let first = raw
+            .iter()
+            .position(|byte| *byte != 0)
+            .ok_or(KexError::NonContributorySecret)?;
+        let magnitude = &raw[first..];
+        let sign = usize::from(magnitude[0] & 0x80 != 0);
+        let length = magnitude
+            .len()
+            .checked_add(sign)
+            .ok_or(KexError::DerivedKeyLimitExceeded)?;
+        if length > neotales_ssh::DEFAULT_STRING_LIMIT {
+            return Err(KexError::DerivedKeyLimitExceeded);
         }
-        positive.extend_from_slice(raw);
-        Ok(Self(encode_mpint(positive)?))
+        let length_u32 = u32::try_from(length).map_err(|_| KexError::DerivedKeyLimitExceeded)?;
+        let mut encoded = Zeroizing::new(Vec::with_capacity(4 + length));
+        encoded.extend_from_slice(&length_u32.to_be_bytes());
+        if sign != 0 {
+            encoded.push(0);
+        }
+        encoded.extend_from_slice(magnitude);
+        Ok(Self(std::mem::take(&mut *encoded)))
     }
 
     /// Returns the complete SSH mpint encoding, including its string length.
@@ -698,12 +720,12 @@ impl ExchangeHashInput {
     /// # Errors
     ///
     /// Returns a wire error if a field exceeds the SSH string limit.
-    pub(crate) fn framed_bytes(&self) -> Result<Vec<u8>, KexError> {
+    pub(crate) fn framed_bytes(&self) -> Result<Zeroizing<Vec<u8>>, KexError> {
         let mut writer = Writer::new();
         writer.write_string(&self.host_key_blob)?;
         writer.write_string(&self.client_public_key)?;
         writer.write_string(&self.server_public_key)?;
-        let mut bytes = writer.into_bytes();
+        let mut bytes = Zeroizing::new(writer.into_bytes());
         bytes.extend_from_slice(self.shared_secret.as_bytes());
         Ok(bytes)
     }
@@ -742,9 +764,9 @@ pub(crate) fn compute_exchange_hash(
     writer.write_string(input.host_key_blob())?;
     writer.write_string(input.client_public_key())?;
     writer.write_string(input.server_public_key())?;
-    let mut framed = writer.into_bytes();
+    let mut framed = Zeroizing::new(writer.into_bytes());
     framed.extend_from_slice(input.shared_secret().as_bytes());
-    Ok(Sha256::digest(framed).into())
+    Ok(Sha256::digest(framed.as_slice()).into())
 }
 
 /// A successfully completed key exchange and its retained session identifier.

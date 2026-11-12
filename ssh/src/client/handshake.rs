@@ -4,10 +4,7 @@ use std::fmt;
 use std::io::{Read, Write};
 
 use crate::cipher::{PacketKeyMaterial, PacketProtectionError, PacketProtector, PacketSuite};
-use crate::hostkey::{
-    Ed25519PublicKey, HostKeyError, VerifiedHostKey, verify_and_trust_host_key,
-    verify_host_key_signature,
-};
+use crate::hostkey::{Ed25519PublicKey, HostKeyError, HostPublicKey, verify_algorithm_host_key};
 use crate::kex::dh_group16::{Group16ClientKex, Group16KexContext};
 use crate::kex::mlkem768_x25519::ClientKex as MlKemClientKex;
 use crate::kex::{
@@ -16,11 +13,11 @@ use crate::kex::{
 };
 use crate::msg::kexinit::{
     AES128_CTR, AES128_GCM_OPENSSH, AES256_CTR, AES256_GCM_OPENSSH, COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH, CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
-    HMAC_SHA2_256, HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512, HMAC_SHA2_512_ETM_OPENSSH,
-    HOST_KEY_SSH_ED25519, KEX_DIFFIE_HELLMAN_GROUP16_SHA512, KEX_MLKEM768X25519_SHA256,
-    KEX_STRICT_C_V00_OPENSSH, KexInit, NegotiationError, SSH_MSG_KEXINIT,
-    SUPPORTED_HOST_KEY_ALGORITHMS, SUPPORTED_MAC_ALGORITHMS, kex_guess_matches,
+    CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256, HMAC_SHA2_256,
+    HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512, HMAC_SHA2_512_ETM_OPENSSH,
+    KEX_DIFFIE_HELLMAN_GROUP16_SHA512, KEX_MLKEM768X25519_SHA256, KEX_STRICT_C_V00_OPENSSH,
+    KexInit, NegotiationError, SSH_MSG_KEXINIT, SUPPORTED_HOST_KEY_ALGORITHMS,
+    SUPPORTED_MAC_ALGORITHMS, kex_guess_matches,
 };
 use crate::sequence::{
     Direction, PacketDisposition, PacketObservation, RekeyPhase, SSH_MSG_DEBUG, SSH_MSG_DISCONNECT,
@@ -151,15 +148,11 @@ impl From<NegotiationError> for HandshakeError {
 /// Reusable client proposal and connection policy.
 ///
 /// The default proposal advertises the implemented ephemeral ECDH mechanisms,
-/// group 16 DH, `ssh-ed25519`, every packet suite accepted by SSH-004, the
-/// OpenSSH client strict-KEX marker, and the compression algorithms `none` and
-/// `zlib@openssh.com` in that order. A fresh random cookie is generated for each
-/// connection.
-///
-/// This said "no compression", which was false. `DEFAULT_COMPRESSION_ALGORITHMS`
-/// is `&[COMPRESSION_NONE, COMPRESSION_ZLIB_OPENSSH]` (`msg/kexinit.rs:454`), so
-/// the default proposal *offers* zlib after none. Nothing here requests it, so no
-/// session is compressed unless a server asks and a caller opts in.
+/// group 16 DH, Ed25519, RSA SHA-2, NIST P-256 host keys, all implemented packet
+/// suites, the strict-KEX marker, and only `none` compression. A fresh random
+/// cookie is generated for each connection. Use [`Self::connect_with_host_keys`]
+/// for an algorithm-aware callback; [`Self::connect`] retains the Ed25519-only
+/// callback contract and rejects other key types.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     kexinit: KexInit,
@@ -191,6 +184,21 @@ impl ClientConfig {
         Self { kexinit }
     }
 
+    /// Requests RFC 8308 signature negotiation by advertising `ext-info-c`.
+    /// The server's list is recorded before client public-key authentication.
+    #[must_use]
+    pub fn with_extension_info(mut self) -> Self {
+        if !self
+            .kexinit
+            .kex_algorithms
+            .iter()
+            .any(|name| name == "ext-info-c")
+        {
+            self.kexinit.kex_algorithms.push("ext-info-c".to_owned());
+        }
+        self
+    }
+
     /// Returns the configured proposal before per-connection cookie generation.
     #[must_use]
     pub const fn kexinit(&self) -> &KexInit {
@@ -217,6 +225,27 @@ impl ClientConfig {
         S: std::io::Read + std::io::Write,
         F: FnOnce(&Ed25519PublicKey) -> Result<(), E>,
     {
+        self.connect_with_host_keys(stream, |key| match key {
+            HostPublicKey::Ed25519(key) => trust_callback(key).map_err(|_| ()),
+            _ => Err(()),
+        })
+    }
+
+    /// Connects with a mandatory trust callback for every supported host key.
+    /// The callback runs only after signature verification and before NEWKEYS.
+    ///
+    /// # Errors
+    /// Returns the same handshake and trust errors as [`Self::connect`].
+    #[allow(clippy::too_many_lines)]
+    pub fn connect_with_host_keys<S, F, E>(
+        &self,
+        stream: S,
+        trust_callback: F,
+    ) -> Result<ClientTransport<S>, HandshakeError>
+    where
+        S: Read + Write,
+        F: FnOnce(&HostPublicKey) -> Result<(), E>,
+    {
         let mut client_kexinit = self.kexinit.clone();
         if client_kexinit.reserved != 0 || client_kexinit.first_kex_packet_follows {
             return Err(HandshakeError::Kex(KexError::InvalidProposal));
@@ -224,6 +253,15 @@ impl ClientConfig {
         getrandom::fill(&mut client_kexinit.cookie)
             .map_err(|_error| HandshakeError::EntropyFailure)?;
         let (mut transport, peer_version) = ClientTransport::start(stream, CLIENT_IDENTIFICATION)?;
+        transport.ext_info = if client_kexinit
+            .kex_algorithms
+            .iter()
+            .any(|name| name == "ext-info-c")
+        {
+            crate::transport::ExtensionState::Awaiting
+        } else {
+            crate::transport::ExtensionState::Disabled
+        };
         transport.configure_rekey_proposal(self.kexinit.clone());
         let client_payload = client_kexinit.encode()?;
 
@@ -246,6 +284,61 @@ impl ClientConfig {
             Some(server_kexinit.first_kex_packet_follows),
         )?;
 
+        if crate::kex::modern::supported(&algorithms.kex) {
+            use crate::kex::modern;
+            let gex = algorithms.kex == modern::GEX;
+            if gex {
+                transport.sequence.configure_group_exchange()?;
+            }
+            let context = modern::Context::new(
+                CLIENT_IDENTIFICATION,
+                &peer_version,
+                &client_kexinit.encode()?,
+                &server_kexinit.encode()?,
+                &algorithms.kex,
+            )?;
+            let mut client = modern::Client::new(context)?;
+            let first = client.first()?;
+            transport.write_handshake_packet(&first, first[0])?;
+            let mut pending = transport.receive_handshake_packet()?;
+            if !server_guess_is_correct {
+                transport.discard_guessed_handshake_packet(&pending)?;
+                pending = transport.receive_handshake_packet()?;
+            }
+            if gex {
+                let init = client.accept_group(&pending.payload)?;
+                transport.accept_handshake_packet(&pending, 31, None)?;
+                transport.write_handshake_packet(&init, 32)?;
+                pending = transport.receive_handshake_packet()?;
+            }
+            let completion = client.complete(&pending.payload)?;
+            let verified = verify_algorithm_host_key(
+                &algorithms.host_key,
+                &completion.host,
+                &completion.signature,
+                &completion.hash,
+                trust_callback,
+            )?;
+            transport.accept_handshake_packet(&pending, if gex { 33 } else { 31 }, None)?;
+            let derived = modern::derive(
+                &algorithms.kex,
+                &completion.shared,
+                &completion.hash,
+                &completion.hash,
+                protection.lengths,
+            )?;
+            let write = protection.write_protector(&derived)?;
+            let read = protection.read_protector(&derived)?;
+            transport.write_handshake_packet(&[SSH_MSG_NEWKEYS], SSH_MSG_NEWKEYS)?;
+            let newkeys = transport.receive_handshake_packet()?;
+            if newkeys.payload != [SSH_MSG_NEWKEYS] {
+                return Err(TransportError::InvalidMessage.into());
+            }
+            transport.accept_handshake_packet(&newkeys, SSH_MSG_NEWKEYS, None)?;
+            transport.finish_handshake(completion.hash, verified, write, read)?;
+            return Ok(transport);
+        }
+
         if algorithms.kex == KEX_DIFFIE_HELLMAN_GROUP16_SHA512 {
             let context = Group16KexContext::new(
                 CLIENT_IDENTIFICATION,
@@ -264,7 +357,8 @@ impl ClientConfig {
                 transport.receive_handshake_packet()?
             };
             let completion = mechanism.complete(&pending_reply.payload)?;
-            let verified_host_key = verify_and_trust_host_key(
+            let verified_host_key = verify_algorithm_host_key(
+                &algorithms.host_key,
                 completion.host_key_blob(),
                 completion
                     .signature_blob()
@@ -315,7 +409,8 @@ impl ClientConfig {
                 transport.receive_handshake_packet()?
             };
             let completion = client.complete(&context, &pending_reply.payload)?;
-            let verified_host_key = verify_and_trust_host_key(
+            let verified_host_key = verify_algorithm_host_key(
+                &algorithms.host_key,
                 &completion.host_key_blob,
                 &completion.signature_blob,
                 &completion.exchange_hash,
@@ -377,7 +472,8 @@ impl ClientConfig {
             shared_secret.clone(),
         )?;
         let exchange_hash = compute_exchange_hash(&context, &exchange_input)?;
-        let verified_host_key = verify_and_trust_host_key(
+        let verified_host_key = verify_algorithm_host_key(
+            &algorithms.host_key,
             reply.host_key_blob(),
             reply.signature_blob(),
             &exchange_hash,
@@ -407,6 +503,44 @@ impl ClientConfig {
             read_protector,
         )?;
         Ok(transport)
+    }
+
+    /// Connects using `known_hosts` raw-key or CA trust, with explicit Unix time
+    /// for certificate validation. Offers Ed25519 certificates before raw keys.
+    /// Host principal, validity and CA signature must match. All critical
+    /// options are rejected. Unknown hosts/CAs never prompt or mutate the store.
+    ///
+    /// # Errors
+    /// Returns handshake, certificate trust, or protected transport errors.
+    pub fn connect_with_known_hosts<S: Read + Write>(
+        &self,
+        stream: S,
+        hosts: &neotales_ssh::known_hosts::KnownHosts,
+        host: &str,
+        port: u16,
+        now: u64,
+    ) -> Result<ClientTransport<S>, HandshakeError> {
+        let mut config = self.clone();
+        config
+            .kexinit
+            .server_host_key_algorithms
+            .insert(0, neotales_ssh::cert::SSH_ED25519_CERT_V01.to_owned());
+        config.connect_with_host_keys(stream, |key| -> Result<(), ()> {
+            if let HostPublicKey::Certificate(blob) = key {
+                neotales_ssh::cert::verify_host_certificate(blob, hosts, host, port, now)
+                    .map(|_| ())
+                    .map_err(|_| ())
+            } else {
+                let blob = key.to_blob().map_err(|_| ())?;
+                if hosts.check(host, port, &blob)
+                    == neotales_ssh::known_hosts::KnownHostsStatus::Trusted
+                {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        })
     }
 }
 
@@ -1054,14 +1188,19 @@ where
         exchange_hash: &[u8; 32],
     ) -> Result<(), HandshakeError> {
         let trusted = self
-            .verified_host_key
+            .verified_server_host_key
             .as_ref()
             .ok_or(TransportError::NotEstablished)?;
-        let peer_key = Ed25519PublicKey::from_blob(host_key_blob)?;
-        if &peer_key != trusted.public_key() {
+        if host_key_blob != trusted.key.to_blob()? {
             return Err(HandshakeError::Kex(KexError::HostKeyMismatch));
         }
-        verify_host_key_signature(&peer_key, signature_blob, exchange_hash)?;
+        verify_algorithm_host_key(
+            &trusted.algorithm,
+            host_key_blob,
+            signature_blob,
+            exchange_hash,
+            |_| Ok::<(), ()>(()),
+        )?;
         Ok(())
     }
 
@@ -1150,6 +1289,11 @@ impl ProtectionPlan {
         algorithms: &crate::msg::kexinit::NegotiatedAlgorithms,
     ) -> Result<Self, HandshakeError> {
         if !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&algorithms.host_key.as_str()) {
+            return Err(HandshakeError::UnsupportedAlgorithm);
+        }
+        if algorithms.compression_client_to_server != COMPRESSION_NONE
+            || algorithms.compression_server_to_client != COMPRESSION_NONE
+        {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
         let write_compression =
@@ -1254,9 +1398,15 @@ fn supported_client_kexinit(cookie: [u8; 16]) -> KexInit {
             CURVE25519_SHA256_LIBSSH.to_owned(),
             ECDH_SHA2_NISTP256.to_owned(),
             KEX_DIFFIE_HELLMAN_GROUP16_SHA512.to_owned(),
+            crate::kex::modern::P384.to_owned(),
+            crate::kex::modern::P521.to_owned(),
+            crate::kex::modern::GEX.to_owned(),
             KEX_STRICT_C_V00_OPENSSH.to_owned(),
         ],
-        vec![HOST_KEY_SSH_ED25519.to_owned()],
+        crate::msg::kexinit::DEFAULT_HOST_KEY_ALGORITHMS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
         vec![
             CHACHA20_POLY1305_OPENSSH_NAME.to_owned(),
             AES128_CTR.to_owned(),
@@ -1283,14 +1433,8 @@ fn supported_client_kexinit(cookie: [u8; 16]) -> KexInit {
             HMAC_SHA2_256_ETM_OPENSSH.to_owned(),
             HMAC_SHA2_512_ETM_OPENSSH.to_owned(),
         ],
-        vec![
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned(),
-        ],
-        vec![
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned(),
-        ],
+        vec![COMPRESSION_NONE.to_owned()],
+        vec![COMPRESSION_NONE.to_owned()],
         Vec::new(),
         Vec::new(),
         false,

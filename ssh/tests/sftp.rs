@@ -28,6 +28,222 @@ struct ScriptedStream {
     read_lengths: Vec<usize>,
 }
 
+#[test]
+fn data_longer_than_the_requested_read_is_rejected() -> Result<(), Box<dyn Error>> {
+    let mut responses = version_response()?;
+    responses.extend(frame(&handle_response(0, b"h")?)?);
+    responses.extend(frame(&data_response(1, b"too long")?)?);
+    let mut client = SftpClient::new(ScriptedStream::new(responses));
+    client.initialize()?;
+    let handle = client.open(b"file", SftpOpenFlags::READ)?;
+    assert!(matches!(
+        client.read(&handle, 0, 1),
+        Err(SftpError::InvalidFrame)
+    ));
+    Ok(())
+}
+
+#[test]
+fn openssh_extensions_require_advertisement_versions_and_use_protocol_field_order()
+-> Result<(), Box<dyn Error>> {
+    let mut version = Writer::new();
+    version.write_byte(SSH_FXP_VERSION);
+    version.write_uint32(3);
+    for (name, revision) in [
+        ("posix-rename@openssh.com", "1"),
+        ("hardlink@openssh.com", "1"),
+        ("fsync@openssh.com", "1"),
+        ("statvfs@openssh.com", "2"),
+        ("limits@openssh.com", "1"),
+    ] {
+        version.write_string(name)?;
+        version.write_string(revision)?;
+    }
+    let mut responses = frame(version.as_bytes())?;
+    for id in 0..3 {
+        responses.extend(frame(&status_response(id, 0, b"")?)?);
+    }
+    for (id, count) in [(3, 11), (4, 4)] {
+        let mut reply = Writer::new();
+        reply.write_byte(sftp::SSH_FXP_EXTENDED_REPLY);
+        reply.write_uint32(id);
+        for value in 1..=count {
+            reply.write_uint64(value);
+        }
+        responses.extend(frame(reply.as_bytes())?);
+    }
+    for id in 5..7 {
+        responses.extend(frame(&status_response(id, 0, b"")?)?);
+    }
+    let mut client = SftpClient::new(ScriptedStream::new(responses));
+    client.initialize()?;
+    client.posix_rename(b"old", b"new")?;
+    client.hardlink(b"old", b"new")?;
+    client.fsync(b"handle")?;
+    let stats = client.statvfs(b"path")?;
+    assert_eq!(stats.block_size, 1);
+    assert_eq!(stats.files, 6);
+    assert_eq!(stats.name_max, 11);
+    let limits = client.limits()?;
+    assert_eq!(limits.packet_length, 1);
+    assert_eq!(limits.open_handles, 4);
+    client.set_symlink_order(sftp::SymlinkOrder::OpenSsh);
+    client.symlink(b"link", b"target")?;
+    client.set_symlink_order(sftp::SymlinkOrder::Draft);
+    client.symlink(b"link", b"target")?;
+    let output = client.into_inner().output;
+    let frames = all_frames(&output)?;
+    for (index, name) in [
+        (1, "posix-rename@openssh.com"),
+        (2, "hardlink@openssh.com"),
+        (3, "fsync@openssh.com"),
+        (4, "statvfs@openssh.com"),
+        (5, "limits@openssh.com"),
+    ] {
+        assert_eq!(frames[index][0], 200);
+        let mut reader = neotales_ssh::Reader::new(&frames[index][5..]);
+        assert_eq!(reader.read_string()?, name.as_bytes());
+    }
+    assert_eq!(
+        parse_strings(&frames[6], 2)?,
+        [b"target".to_vec(), b"link".to_vec()]
+    );
+    assert_eq!(
+        parse_strings(&frames[7], 2)?,
+        [b"link".to_vec(), b"target".to_vec()]
+    );
+
+    let mut client = SftpClient::new(ScriptedStream::new(version_response()?));
+    client.initialize()?;
+    let before = client.transport().output.len();
+    assert!(matches!(
+        client.posix_rename(b"old", b"new"),
+        Err(SftpError::ExtensionUnavailable)
+    ));
+    assert!(matches!(
+        client.hardlink(b"old", b"new"),
+        Err(SftpError::ExtensionUnavailable)
+    ));
+    assert!(matches!(
+        client.fsync(b"h"),
+        Err(SftpError::ExtensionUnavailable)
+    ));
+    assert!(matches!(
+        client.statvfs(b"p"),
+        Err(SftpError::ExtensionUnavailable)
+    ));
+    assert!(matches!(
+        client.limits(),
+        Err(SftpError::ExtensionUnavailable)
+    ));
+    assert_eq!(client.transport().output.len(), before);
+    Ok(())
+}
+
+#[test]
+fn pipelined_stats_are_bounded_and_responses_are_matched_by_id() -> Result<(), Box<dyn Error>> {
+    let mut responses = version_response()?;
+    for (id, size) in [(1, 11), (0, 22)] {
+        let mut reply = Writer::new();
+        reply.write_byte(SSH_FXP_ATTRS);
+        reply.write_uint32(id);
+        reply.write_uint32(sftp::SSH_FILEXFER_ATTR_SIZE);
+        reply.write_uint64(size);
+        responses.extend(frame(reply.as_bytes())?);
+    }
+    let mut client = SftpClient::new(ScriptedStream::new(responses));
+    client.initialize()?;
+    let first = client.begin_stat(b"first")?;
+    let second = client.begin_stat(b"second")?;
+    assert_eq!(client.outstanding_requests(), 2);
+    assert!(matches!(
+        client.stat(b"mixing sync and async"),
+        Err(SftpError::RequestInFlight)
+    ));
+    assert_eq!(client.finish_stat(first)?.size, Some(22));
+    assert_eq!(client.finish_stat(second)?.size, Some(11));
+    assert_eq!(client.outstanding_requests(), 0);
+    for _ in 0..sftp::MAX_SFTP_OUTSTANDING {
+        client.begin_stat(b"bounded")?;
+    }
+    let before = client.transport().output.len();
+    assert!(matches!(
+        client.begin_stat(b"over cap"),
+        Err(SftpError::TooManyRequests)
+    ));
+    assert_eq!(client.transport().output.len(), before);
+
+    let mut responses = version_response()?;
+    responses.extend(frame(&attributes_response(100))?);
+    let mut client = SftpClient::new(ScriptedStream::new(responses));
+    client.initialize()?;
+    let id = client.begin_stat(b"path")?;
+    assert!(matches!(
+        client.finish_stat(id),
+        Err(SftpError::ResponseIdMismatch { actual: 100, .. })
+    ));
+    assert!(client.begin_stat(b"after bad id").is_err());
+    assert_eq!(client.outstanding_requests(), 0);
+    Ok(())
+}
+
+#[test]
+fn empty_extension_pairs_and_tiny_directory_entries_have_item_budgets() -> Result<(), Box<dyn Error>>
+{
+    let mut version = Writer::new();
+    version.write_byte(SSH_FXP_VERSION);
+    version.write_uint32(3);
+    for _ in 0..=sftp::MAX_SFTP_EXTENSIONS {
+        version.write_string(b"")?;
+        version.write_string(b"")?;
+    }
+    let mut client = SftpClient::new(ScriptedStream::new(frame(version.as_bytes())?));
+    assert!(matches!(client.initialize(), Err(SftpError::InvalidFrame)));
+
+    let mut attrs = Writer::new();
+    attrs.write_uint32(sftp::SSH_FILEXFER_ATTR_EXTENDED);
+    attrs.write_uint32(u32::try_from(sftp::MAX_SFTP_EXTENDED_ATTRIBUTES + 1)?);
+    for _ in 0..=sftp::MAX_SFTP_EXTENDED_ATTRIBUTES {
+        attrs.write_string(b"")?;
+        attrs.write_string(b"")?;
+    }
+    assert!(matches!(
+        SftpAttributes::decode(attrs.as_bytes()),
+        Err(SftpError::InvalidAttributes)
+    ));
+
+    for (entries, pairs) in [(sftp::MAX_SFTP_DIRECTORY_ENTRIES + 1, 0), (17, 256)] {
+        let mut names = Writer::new();
+        names.write_byte(SSH_FXP_NAME);
+        names.write_uint32(1);
+        names.write_uint32(u32::try_from(entries)?);
+        for _ in 0..entries {
+            names.write_string(b"x")?;
+            names.write_string(b"")?;
+            names.write_uint32(if pairs == 0 {
+                0
+            } else {
+                sftp::SSH_FILEXFER_ATTR_EXTENDED
+            });
+            if pairs > 0 {
+                names.write_uint32(pairs);
+                for _ in 0..pairs {
+                    names.write_string(b"")?;
+                    names.write_string(b"")?;
+                }
+            }
+        }
+        let mut responses = version_response()?;
+        responses.extend(frame(&handle_response(0, b"h")?)?);
+        responses.extend(frame(names.as_bytes())?);
+        let mut client = SftpClient::new(ScriptedStream::new(responses));
+        client.initialize()?;
+        let handle = client.opendir(b"dir")?;
+        assert!(client.readdir(&handle).is_err());
+    }
+    Ok(())
+}
+
 impl ScriptedStream {
     fn new(input: Vec<u8>) -> Self {
         Self {

@@ -79,6 +79,18 @@ fn wrong_passphrase_fails_without_echoing_the_passphrase() -> Result<(), Box<dyn
 
     assert!(!error.to_string().contains(wrong_passphrase));
     assert!(!format!("{error:?}").contains(wrong_passphrase));
+    let mut passphrase = wrong_passphrase.as_bytes().to_vec();
+    let error = neotales_ssh::private_key::import_openssh(&fixture, &mut passphrase)
+        .expect_err("wrong passphrase must not import a signer");
+    assert!(!format!("{error:?}").contains(wrong_passphrase));
+    assert!(passphrase.iter().all(|byte| *byte == 0));
+    let mut passphrase = PASSPHRASE.to_vec();
+    let imported = neotales_ssh::private_key::import_openssh(&fixture, &mut passphrase)?;
+    assert_eq!(
+        imported.public_key_blob()?,
+        public_blob(&public_point(&SEED))?
+    );
+    assert!(passphrase.iter().all(|byte| *byte == 0));
     Ok(())
 }
 
@@ -197,6 +209,95 @@ fn encrypted_fixture(seed: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Erro
 
 fn public_point(seed: &[u8; 32]) -> [u8; 32] {
     SigningKey::from_bytes(seed).verifying_key().to_bytes()
+}
+
+#[test]
+fn identity_import_preserves_all_three_openssh_algorithms_with_and_without_encryption()
+-> Result<(), Box<dyn Error>> {
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+    let rsa = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024)?;
+    let mut rsa_public = Writer::new();
+    rsa_public.write_string("ssh-rsa")?;
+    positive_mpint(&mut rsa_public, &rsa.e().to_bytes_be())?;
+    positive_mpint(&mut rsa_public, &rsa.n().to_bytes_be())?;
+    let mut rsa_fields = Writer::new();
+    rsa_fields.write_string("ssh-rsa")?;
+    for value in [
+        rsa.n(),
+        rsa.e(),
+        rsa.d(),
+        &rsa.crt_coefficient().ok_or("missing CRT coefficient")?,
+        &rsa.primes()[0],
+        &rsa.primes()[1],
+    ] {
+        positive_mpint(&mut rsa_fields, &value.to_bytes_be())?;
+    }
+    rsa_fields.write_string(COMMENT)?;
+    let ecdsa = EcdsaSigner::from_private_bytes([2; 32])?;
+    let public = ecdsa.public_key_blob()?;
+    let mut reader = Reader::new(&public);
+    reader.read_string()?;
+    reader.read_string()?;
+    let point = reader.read_string()?;
+    let mut ecdsa_fields = Writer::new();
+    ecdsa_fields.write_string("ecdsa-sha2-nistp256")?;
+    ecdsa_fields.write_string("nistp256")?;
+    ecdsa_fields.write_string(point)?;
+    positive_mpint(&mut ecdsa_fields, &[2; 32])?;
+    ecdsa_fields.write_string(COMMENT)?;
+    for (public, fields) in [
+        (rsa_public.into_bytes(), rsa_fields.into_bytes()),
+        (public, ecdsa_fields.into_bytes()),
+    ] {
+        for encrypted in [false, true] {
+            let mut section = Writer::new();
+            section.write_uint32(17);
+            section.write_uint32(17);
+            let mut section = section.into_bytes();
+            section.extend_from_slice(&fields);
+            let block = if encrypted {
+                AES_BLOCK_SIZE
+            } else {
+                NONE_BLOCK_SIZE
+            };
+            let mut section = pad_private_section(section, block);
+            let mut options = Writer::new();
+            let (cipher, kdf) = if encrypted {
+                let derived = derive_key(PASSPHRASE, SALT, ROUNDS, 48)?;
+                let mut cipher =
+                    ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&derived[..32], &derived[32..])?;
+                cipher.apply_keystream(&mut section);
+                options.write_string(SALT)?;
+                options.write_uint32(ROUNDS);
+                (b"aes256-ctr".as_slice(), b"bcrypt".as_slice())
+            } else {
+                (b"none".as_slice(), b"none".as_slice())
+            };
+            let fixture = container(cipher, kdf, options.as_bytes(), 1, &public, &section)?;
+            let mut password = PASSPHRASE.to_vec();
+            let imported = neotales_ssh::private_key::import_openssh(&fixture, &mut password)?;
+            assert_eq!(imported.public_key_blob()?, public);
+            assert!(password.iter().all(|byte| *byte == 0));
+            if encrypted {
+                let mut wrong = b"synthetic-wrong-passphrase".to_vec();
+                let error = neotales_ssh::private_key::import_openssh(&fixture, &mut wrong)
+                    .expect_err("wrong passphrase must fail");
+                assert_eq!(format!("{error:?}"), "InvalidKey");
+                assert!(wrong.iter().all(|byte| *byte == 0));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn positive_mpint(writer: &mut Writer, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut encoded = Vec::new();
+    if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
+        encoded.push(0);
+    }
+    encoded.extend_from_slice(bytes);
+    writer.write_mpint(&encoded)?;
+    Ok(())
 }
 
 fn public_blob(point: &[u8; 32]) -> Result<Vec<u8>, Box<dyn Error>> {

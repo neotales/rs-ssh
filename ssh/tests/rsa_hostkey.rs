@@ -28,6 +28,45 @@ const EXCHANGE_HASH: [u8; 32] = [
 ];
 
 #[test]
+fn digestinfo_signatures_interoperate_and_bare_digests_are_rejected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let private = fixed_rsa_private_key()?;
+    let signer = fixed_signer()?;
+    for (algorithm, digest, padding) in [
+        (
+            SSH_RSA_SHA2_256,
+            sha2::Sha256::digest(EXCHANGE_HASH).to_vec(),
+            rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+        ),
+        (
+            SSH_RSA_SHA2_512,
+            sha2::Sha512::digest(EXCHANGE_HASH).to_vec(),
+            rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha512>(),
+        ),
+    ] {
+        // RustCrypto signs directly, without this crate's signer or wire encoder.
+        let independent = private.sign(padding.clone(), &digest)?;
+        let blob = signature_blob(algorithm, &independent)?;
+        verify_host_key_signature(signer.public_key(), &blob, &EXCHANGE_HASH)?;
+        let ours = signer.sign_with_algorithm(&EXCHANGE_HASH, algorithm)?;
+        signer
+            .public_key()
+            .public_key()
+            .verify(padding, &digest, &signature_bytes(&ours)?)?;
+        let old = private.sign(rsa::Pkcs1v15Sign::new_unprefixed(), &digest)?;
+        assert_eq!(
+            verify_host_key_signature(
+                signer.public_key(),
+                &signature_blob(algorithm, &old)?,
+                &EXCHANGE_HASH
+            ),
+            Err(RsaHostKeyError::InvalidSignature)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn fixed_key_signs_and_verifies_both_sha2_algorithms() -> Result<(), Box<dyn std::error::Error>> {
     let signer = fixed_signer()?;
     let public_blob = signer.to_public_key_blob()?;

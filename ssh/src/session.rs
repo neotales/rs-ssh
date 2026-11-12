@@ -1,17 +1,25 @@
-//! SSH session channels for client `exec`/`shell` requests and explicit server policy.
+//! SSH session channels for client `exec`/`shell`/`subsystem` requests and explicit server policy.
 //!
 //! This module never starts a process and never translates an `exec` command
 //! into a platform shell invocation. A server application receives the exact
-//! command bytes, makes its own accept/reject decision, writes any response
-//! bytes through [`ServerSessions`], and asks this module to send the callback's
-//! exit status followed by EOF and CLOSE. When a structured forced command is
-//! configured, it is applied only after that callback accepts; the callback
-//! still observes the exact peer request and a rejection remains final. An
-//! accepted shell is represented as an effective exec request when that
-//! forced command is configured; this module still does not execute it.
+//! command or subsystem bytes, makes its own accept/reject decision, writes any
+//! response bytes through [`ServerSessions`], and asks this module to send the
+//! callback's exit status followed by EOF and CLOSE. When a structured forced
+//! command is configured, it is applied only after that callback accepts; the
+//! callback still observes the exact peer request and a rejection remains final.
+//! An accepted shell or subsystem is represented as an effective exec request
+//! when that forced command is configured; this module still does not execute it.
+//!
+//! [`EnvironmentPlan`] turns OpenSSH `SendEnv` patterns and `SetEnv` assignments
+//! into RFC 4254 `env` requests. It does not read the process environment.
+//! [`ClientSessions::request_scp_upload`], [`ClientSessions::request_scp_download`],
+//! and [`ClientSessions::request_sftp`] send the channel request that starts
+//! those protocols. The SCP and SFTP byte codecs stay in their own modules and
+//! still do not open a channel themselves.
 //!
 //! [`ServerSessions`] has two deliberately separate policy layers. The public
-//! [`SessionPolicy`] callback remains the base decision for `exec` and `shell`.
+//! [`SessionPolicy`] callback remains the base decision for `exec`, `shell`, and
+//! `subsystem`.
 //! An optional structured [`ServerPolicy`] is a mandatory gate for PTY,
 //! environment, and forwarding-related decisions and supplies the exact
 //! forced-command bytes. If both are configured, the callback is evaluated
@@ -21,7 +29,9 @@
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use neotales_ssh::server_policy::ServerPolicy;
+use neotales_ssh::server_policy::{
+    MAX_ENVIRONMENT_NAME_LENGTH, MAX_ENVIRONMENT_NAMES, MAX_ENVIRONMENT_VALUE_LENGTH, ServerPolicy,
+};
 use neotales_ssh::{Reader, Writer};
 
 use crate::channel::{
@@ -39,6 +49,14 @@ pub const SESSION_REQUEST_SHELL: &str = "shell";
 pub const SESSION_REQUEST_PTY: &str = "pty-req";
 /// The RFC 4254 `env` channel request name.
 pub const SESSION_REQUEST_ENV: &str = "env";
+/// The RFC 4254 `subsystem` channel request name.
+pub const SESSION_REQUEST_SUBSYSTEM: &str = "subsystem";
+/// The subsystem name used by SFTP.
+pub const SFTP_SUBSYSTEM: &str = "sftp";
+/// The maximum byte length of one subsystem name.
+pub const MAX_SUBSYSTEM_NAME_LENGTH: usize = 255;
+/// The maximum number of caller-supplied environment entries a plan will scan.
+pub const MAX_ENVIRONMENT_INPUTS: usize = 1024;
 /// The RFC 4254 `exit-status` channel request name.
 pub const SESSION_REQUEST_EXIT_STATUS: &str = "exit-status";
 /// The RFC 4254 `exit-signal` channel request name.
@@ -133,7 +151,8 @@ impl From<ChannelError> for SessionError {
 /// `Exec` contains the exact SSH string bytes received from the peer. A
 /// structured forced command is applied to the owned result only after this
 /// callback accepts; it never changes the bytes observed here. `Shell` has no
-/// command field, so no empty or fabricated command is supplied.
+/// command field, so no empty or fabricated command is supplied. `Subsystem`
+/// contains the exact subsystem-name bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionRequest<'request> {
     /// An opaque RFC 4254 `exec` command.
@@ -143,6 +162,11 @@ pub enum SessionRequest<'request> {
     },
     /// An RFC 4254 interactive shell request with no command bytes.
     Shell,
+    /// An RFC 4254 `subsystem` request.
+    Subsystem {
+        /// Exact subsystem-name bytes, excluding the SSH string length prefix.
+        name: &'request [u8],
+    },
 }
 
 /// An owned session request returned in a [`SessionEvent`].
@@ -159,6 +183,9 @@ pub enum OwnedSessionRequest {
     /// A shell request without a command, unless a forced command transformed
     /// the accepted result into [`OwnedSessionRequest::Exec`].
     Shell,
+    /// An RFC 4254 subsystem name, unless a forced command transformed the
+    /// accepted result into [`OwnedSessionRequest::Exec`].
+    Subsystem(Vec<u8>),
 }
 
 /// The result returned by an explicit server session policy callback.
@@ -206,7 +233,7 @@ impl SessionDecision {
 /// constructing [`ServerSessions`] without installing one leaves session opens
 /// denied; this trait deliberately has no accepting default implementation.
 pub trait SessionPolicy {
-    /// Evaluates one exact `exec` or command-free `shell` request.
+    /// Evaluates one exact `exec`, command-free `shell`, or `subsystem` request.
     fn authorize(&self, request: SessionRequest<'_>) -> SessionDecision;
 }
 
@@ -920,6 +947,284 @@ impl TryFrom<&[u8]> for EnvironmentRequest {
     }
 }
 
+/// One environment variable selected for an RFC 4254 `env` request.
+///
+/// The [`fmt::Debug`] implementation reports lengths only. It does not format
+/// the name or the value.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EnvironmentAssignment {
+    name: Vec<u8>,
+    value: Vec<u8>,
+}
+
+impl fmt::Debug for EnvironmentAssignment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnvironmentAssignment")
+            .field("name_len", &self.name.len())
+            .field("value_len", &self.value.len())
+            .finish()
+    }
+}
+
+impl EnvironmentAssignment {
+    /// Returns the exact variable name.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Returns the exact variable value.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+}
+
+/// A failure while selecting environment variables to send.
+///
+/// The error does not contain a pattern, name, or value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnvironmentPlanError {
+    /// A `SendEnv` pattern was empty, oversized, or not a name pattern.
+    InvalidPattern,
+    /// A `SetEnv` token was not a bounded `NAME=value` assignment.
+    InvalidAssignment,
+    /// The selected assignment list would exceed [`MAX_ENVIRONMENT_NAMES`].
+    TooManyAssignments,
+    /// The caller-supplied environment exceeded [`MAX_ENVIRONMENT_INPUTS`].
+    TooManyInputs,
+}
+
+impl fmt::Display for EnvironmentPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPattern => "SSH SendEnv pattern is invalid",
+            Self::InvalidAssignment => "SSH SetEnv assignment is invalid",
+            Self::TooManyAssignments => "SSH environment plan exceeds the assignment limit",
+            Self::TooManyInputs => "SSH environment plan input exceeds the scan limit",
+        })
+    }
+}
+
+impl std::error::Error for EnvironmentPlanError {}
+
+/// The `env` requests a client should send for one session.
+///
+/// `SendEnv` patterns are matched, case-sensitively, against the caller-supplied
+/// environment. `*` matches any byte run and `?` matches one byte. A pattern
+/// prefixed with `-` removes names selected by an earlier pattern. `SetEnv`
+/// assignments are exact `NAME=value` tokens; a later assignment replaces an
+/// earlier value for the same name, including a value selected by `SendEnv`.
+/// Invalid environment entries are skipped during `SendEnv` matching. An invalid
+/// `SetEnv` token fails the plan.
+///
+/// This type does not read the process environment, open a channel, or send a
+/// request. [`ClientSessions::request_environment`] sends the result.
+///
+/// [`fmt::Debug`] reports the assignment count only.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EnvironmentPlan {
+    assignments: Vec<EnvironmentAssignment>,
+}
+
+impl fmt::Debug for EnvironmentPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnvironmentPlan")
+            .field("assignment_count", &self.assignments.len())
+            .finish()
+    }
+}
+
+impl EnvironmentPlan {
+    /// Builds a plan from `SendEnv` patterns, `SetEnv` assignments, and an
+    /// explicit environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvironmentPlanError`] for an invalid pattern or assignment, or
+    /// when the input or the selected list exceeds its bound. The plan is not
+    /// returned on an error.
+    pub fn from_send_and_set<S, T, N, V>(
+        send_env: impl IntoIterator<Item = S>,
+        set_env: impl IntoIterator<Item = T>,
+        environment: impl IntoIterator<Item = (N, V)>,
+    ) -> Result<Self, EnvironmentPlanError>
+    where
+        S: AsRef<str>,
+        T: AsRef<str>,
+        N: AsRef<str>,
+        V: AsRef<[u8]>,
+    {
+        let mut supplied = Vec::new();
+        for (name, value) in environment {
+            if supplied.len() == MAX_ENVIRONMENT_INPUTS {
+                return Err(EnvironmentPlanError::TooManyInputs);
+            }
+            // Retain the supplied wrappers, not copies of their bytes. Borrowed
+            // maps stay borrowed until a value has passed selection and bounds.
+            supplied.push((name, value));
+        }
+
+        let mut selected: Vec<EnvironmentAssignment> = Vec::new();
+        for pattern in send_env {
+            let (body, remove) = split_send_pattern(pattern.as_ref())?;
+            if remove {
+                selected.retain(|assignment| !wildcard_match(body, assignment.name()));
+                continue;
+            }
+            for (name, value) in &supplied {
+                let name = name.as_ref();
+                let value = value.as_ref();
+                if !wildcard_match(body, name.as_bytes())
+                    || selected
+                        .iter()
+                        .any(|assignment| assignment.name() == name.as_bytes())
+                {
+                    continue;
+                }
+                if !valid_environment_name(name) || !valid_environment_value(value) {
+                    continue;
+                }
+                push_assignment(&mut selected, name.as_bytes(), value)?;
+            }
+        }
+
+        for assignment in set_env {
+            let (name, value) = split_set_env(assignment.as_ref())?;
+            if let Some(existing) = selected
+                .iter_mut()
+                .find(|existing| existing.name() == name.as_bytes())
+            {
+                existing.value = value.as_bytes().to_vec();
+                continue;
+            }
+            push_assignment(&mut selected, name.as_bytes(), value.as_bytes())?;
+        }
+
+        Ok(Self {
+            assignments: selected,
+        })
+    }
+
+    /// Returns the selected assignments in send order.
+    #[must_use]
+    pub fn assignments(&self) -> &[EnvironmentAssignment] {
+        &self.assignments
+    }
+
+    /// Returns whether the plan sends no variables.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.assignments.is_empty()
+    }
+
+    /// Returns the number of selected assignments.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.assignments.len()
+    }
+}
+
+fn push_assignment(
+    selected: &mut Vec<EnvironmentAssignment>,
+    name: &[u8],
+    value: &[u8],
+) -> Result<(), EnvironmentPlanError> {
+    if selected.len() == MAX_ENVIRONMENT_NAMES {
+        return Err(EnvironmentPlanError::TooManyAssignments);
+    }
+    selected.push(EnvironmentAssignment {
+        name: name.to_vec(),
+        value: value.to_vec(),
+    });
+    Ok(())
+}
+
+fn split_send_pattern(token: &str) -> Result<(&[u8], bool), EnvironmentPlanError> {
+    if token.is_empty()
+        || token.contains('=')
+        || token.contains('\0')
+        || token.chars().any(char::is_whitespace)
+    {
+        return Err(EnvironmentPlanError::InvalidPattern);
+    }
+    let (body, remove) = token
+        .strip_prefix('-')
+        .map_or((token, false), |body| (body, true));
+    if body.is_empty() || body.len() > MAX_ENVIRONMENT_NAME_LENGTH {
+        return Err(EnvironmentPlanError::InvalidPattern);
+    }
+    Ok((body.as_bytes(), remove))
+}
+
+fn split_set_env(token: &str) -> Result<(&str, &str), EnvironmentPlanError> {
+    let Some((name, value)) = token.split_once('=') else {
+        return Err(EnvironmentPlanError::InvalidAssignment);
+    };
+    if !valid_environment_name(name) || !valid_environment_value(value.as_bytes()) {
+        return Err(EnvironmentPlanError::InvalidAssignment);
+    }
+    Ok((name, value))
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_ENVIRONMENT_NAME_LENGTH
+        && !name.contains('=')
+        && !name.contains('\0')
+        && !name.chars().any(char::is_whitespace)
+}
+
+fn valid_environment_value(value: &[u8]) -> bool {
+    value.len() <= MAX_ENVIRONMENT_VALUE_LENGTH
+        && !value.contains(&0)
+        && std::str::from_utf8(value).is_ok()
+}
+
+fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
+    let mut pattern_index = 0;
+    let mut value_index = 0;
+    let mut star_index = None;
+    let mut star_value_index = 0;
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == value[value_index])
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            star_value_index = value_index;
+            pattern_index += 1;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+fn validate_subsystem_name(name: &[u8]) -> Result<(), SessionError> {
+    if name.is_empty()
+        || name.len() > MAX_SUBSYSTEM_NAME_LENGTH
+        || name.contains(&0)
+        || name.iter().any(u8::is_ascii_whitespace)
+    {
+        return Err(SessionError::InvalidRequest);
+    }
+    Ok(())
+}
+
 /// A validated RFC 4254 `exit-signal` request payload.
 ///
 /// The signal name is an opaque SSH string without an added `SIG` prefix.  The
@@ -1169,9 +1474,94 @@ impl TryFrom<&[u8]> for ExitSignal {
     }
 }
 
+/// A decoded session control. This crate applies no operating-system effects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionControl {
+    /// RFC 4254 signal name without the `SIG` prefix.
+    Signal(Vec<u8>),
+    /// Columns, rows, pixel width, and pixel height, in RFC wire order.
+    WindowChange([u32; 4]),
+    /// RFC 4335 break duration in milliseconds.
+    Break(u32),
+}
+
+impl SessionControl {
+    fn decode(name: &[u8], data: &[u8]) -> Result<Self, SessionError> {
+        let mut reader = Reader::new(data);
+        let control = match name {
+            b"signal" => {
+                let signal = reader
+                    .read_string_with_limit(64)
+                    .map_err(|_| SessionError::InvalidRequest)?;
+                if signal.is_empty()
+                    || !signal
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"@.-_".contains(byte))
+                {
+                    return Err(SessionError::InvalidRequest);
+                }
+                Self::Signal(signal.to_vec())
+            }
+            b"window-change" => Self::WindowChange([
+                reader
+                    .read_uint32()
+                    .map_err(|_| SessionError::InvalidRequest)?,
+                reader
+                    .read_uint32()
+                    .map_err(|_| SessionError::InvalidRequest)?,
+                reader
+                    .read_uint32()
+                    .map_err(|_| SessionError::InvalidRequest)?,
+                reader
+                    .read_uint32()
+                    .map_err(|_| SessionError::InvalidRequest)?,
+            ]),
+            b"break" => Self::Break(
+                reader
+                    .read_uint32()
+                    .map_err(|_| SessionError::InvalidRequest)?,
+            ),
+            _ => return Err(SessionError::InvalidRequest),
+        };
+        if !reader.is_empty() {
+            return Err(SessionError::InvalidRequest);
+        }
+        Ok(control)
+    }
+}
+
 /// One routed client/server session event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
+    /// Explicit policy result for a session agent-forwarding request.
+    AgentForwardingRequested {
+        /// Session that requested forwarding.
+        session: ChannelId,
+        /// Whether a reply was requested.
+        want_reply: bool,
+        /// Explicit permission; absent policy denies.
+        accepted: bool,
+    },
+    /// An agent channel offered to the opted-in client application. No local
+    /// agent is opened. Confirm or reject this open explicitly; subsequent
+    /// data events carry only application-owned opaque bytes.
+    AgentChannelOpen {
+        /// Standard channel limits and validated empty type-specific data.
+        request: crate::channel::ChannelOpenRequest,
+    },
+    /// A valid control was evaluated without applying a host effect.
+    ControlRequested {
+        /// Recipient session.
+        session: ChannelId,
+        /// Decoded control.
+        control: SessionControl,
+        /// Exact control payload bytes.
+        data: Vec<u8>,
+        /// Whether a response was requested.
+        want_reply: bool,
+        /// Explicit policy decision; absent control policy always denies.
+        accepted: bool,
+    },
     /// A session channel was confirmed locally.
     Opened {
         /// The local recipient channel identifier.
@@ -1329,6 +1719,7 @@ impl SessionEvent {
 #[derive(Debug)]
 pub struct ClientSessions<T> {
     channels: ChannelConnection<T>,
+    agent_forwarding_requested: bool,
 }
 
 impl<T> ClientSessions<T> {
@@ -1337,13 +1728,17 @@ impl<T> ClientSessions<T> {
     pub const fn new(transport: T) -> Self {
         Self {
             channels: ChannelConnection::new(transport),
+            agent_forwarding_requested: false,
         }
     }
 
     /// Reuses an existing generic channel connection.
     #[must_use]
     pub const fn from_connection(channels: ChannelConnection<T>) -> Self {
-        Self { channels }
+        Self {
+            channels,
+            agent_forwarding_requested: false,
+        }
     }
 
     /// Returns the shared channel endpoint.
@@ -1396,6 +1791,53 @@ where
     pub fn open_session_with_id(&mut self, session: ChannelId) -> Result<(), SessionError> {
         self.channels
             .open_channel(session, SESSION_CHANNEL_TYPE.as_bytes(), &[])?;
+        Ok(())
+    }
+
+    /// Sends a signal request without delivering a local signal.
+    ///
+    /// # Errors
+    /// Returns a validation, channel-state, or transport error.
+    pub fn send_signal(&mut self, session: ChannelId, name: &[u8]) -> Result<(), SessionError> {
+        let mut data = Writer::new();
+        data.write_string_with_limit(name, 64)
+            .map_err(|_| SessionError::InvalidRequest)?;
+        SessionControl::decode(b"signal", data.as_bytes())?;
+        self.channels
+            .send_request(session, b"signal", false, data.as_bytes())?;
+        Ok(())
+    }
+
+    /// Sends character and pixel dimensions without changing a local PTY.
+    ///
+    /// # Errors
+    /// Returns a channel-state or transport error.
+    pub fn window_change(
+        &mut self,
+        session: ChannelId,
+        dimensions: [u32; 4],
+    ) -> Result<(), SessionError> {
+        let mut data = Writer::new();
+        for dimension in dimensions {
+            data.write_uint32(dimension);
+        }
+        self.channels
+            .send_request(session, b"window-change", false, data.as_bytes())?;
+        Ok(())
+    }
+
+    /// Sends an RFC 4335 break duration in milliseconds.
+    ///
+    /// # Errors
+    /// Returns a channel-state or transport error.
+    pub fn send_break(
+        &mut self,
+        session: ChannelId,
+        milliseconds: u32,
+        want_reply: bool,
+    ) -> Result<(), SessionError> {
+        self.channels
+            .send_request(session, b"break", want_reply, &milliseconds.to_be_bytes())?;
         Ok(())
     }
 
@@ -1476,6 +1918,184 @@ where
         Ok(())
     }
 
+    /// Sends every assignment in a [`EnvironmentPlan`] as an `env` request.
+    ///
+    /// Assignments are sent in plan order. An empty plan is a successful no-op.
+    /// A transport failure can leave earlier assignments already written.
+    ///
+    /// # Errors
+    ///
+    /// Returns a size, channel-state, or transport error from [`Self::request_env`].
+    pub fn request_environment(
+        &mut self,
+        session: ChannelId,
+        plan: &EnvironmentPlan,
+        want_reply: bool,
+    ) -> Result<(), SessionError> {
+        for assignment in plan.assignments() {
+            self.request_env(session, assignment.name(), assignment.value(), want_reply)?;
+        }
+        Ok(())
+    }
+
+    /// Sends an RFC 4254 `subsystem` request with the exact subsystem name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::InvalidRequest`] for an empty, oversized, NUL, or
+    /// whitespace-containing name, or a channel-state or transport error.
+    pub fn request_subsystem(
+        &mut self,
+        session: ChannelId,
+        name: &[u8],
+        want_reply: bool,
+    ) -> Result<(), SessionError> {
+        validate_subsystem_name(name)?;
+        let mut writer = Writer::new();
+        writer
+            .write_string_with_limit(name, MAX_CHANNEL_PACKET_SIZE as usize)
+            .map_err(map_wire_error)?;
+        self.channels.send_request(
+            session,
+            SESSION_REQUEST_SUBSYSTEM.as_bytes(),
+            want_reply,
+            &writer.into_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Sends the `sftp` subsystem request.
+    ///
+    /// This does not speak SFTP. The caller joins the channel bytes to
+    /// [`crate::sftp::SftpClient`] after the server accepts the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request_subsystem`].
+    pub fn request_sftp(
+        &mut self,
+        session: ChannelId,
+        want_reply: bool,
+    ) -> Result<(), SessionError> {
+        self.request_subsystem(session, SFTP_SUBSYSTEM.as_bytes(), want_reply)
+    }
+
+    /// Sends an `exec` request for `scp -t` of one path.
+    ///
+    /// The command text is the same text [`crate::scp::upload_command`] returns.
+    /// This method does not speak the SCP byte protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::InvalidRequest`] for a path
+    /// [`crate::scp::upload_command`] rejects, or a channel-state or transport
+    /// error.
+    pub fn request_scp_upload<P>(
+        &mut self,
+        session: ChannelId,
+        path: P,
+        want_reply: bool,
+    ) -> Result<(), SessionError>
+    where
+        P: AsRef<[u8]>,
+    {
+        let command =
+            neotales_ssh::scp::upload_command(path).map_err(|_| SessionError::InvalidRequest)?;
+        self.request_exec(session, command.as_bytes(), want_reply)
+    }
+
+    /// Sends an `exec` request for `scp -f` of one path.
+    ///
+    /// The command text is the same text [`crate::scp::download_command`] returns.
+    /// This method does not speak the SCP byte protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::InvalidRequest`] for a path
+    /// [`crate::scp::download_command`] rejects, or a channel-state or transport
+    /// error.
+    pub fn request_scp_download<P>(
+        &mut self,
+        session: ChannelId,
+        path: P,
+        want_reply: bool,
+    ) -> Result<(), SessionError>
+    where
+        P: AsRef<[u8]>,
+    {
+        let command =
+            neotales_ssh::scp::download_command(path).map_err(|_| SessionError::InvalidRequest)?;
+        self.request_exec(session, command.as_bytes(), want_reply)
+    }
+
+    /// Requests an SCP upload using an explicit remote quoting policy.
+    ///
+    /// # Errors
+    /// Rejects an invalid path or a channel-state/transport failure.
+    pub fn request_scp_upload_with_shell(
+        &mut self,
+        session: ChannelId,
+        path: impl AsRef<[u8]>,
+        shell: neotales_ssh::scp::RemoteShell,
+        want_reply: bool,
+    ) -> Result<(), SessionError> {
+        let command = neotales_ssh::scp::upload_command_with_shell(path, shell)
+            .map_err(|_| SessionError::InvalidRequest)?;
+        self.request_exec(session, command.as_bytes(), want_reply)
+    }
+
+    /// Explicitly requests agent forwarding. Nothing requests it by default.
+    /// This never connects to an agent or reads the process environment.
+    ///
+    /// # Errors
+    /// Returns a channel-state or transport error.
+    pub fn request_agent_forwarding(
+        &mut self,
+        session: ChannelId,
+        want_reply: bool,
+    ) -> Result<(), SessionError> {
+        self.channels
+            .send_request(session, b"auth-agent-req@openssh.com", want_reply, &[])?;
+        self.agent_forwarding_requested = true;
+        Ok(())
+    }
+
+    /// Confirms an offered agent channel for application-managed opaque bytes.
+    ///
+    /// # Errors
+    /// Rejects missing opt-in, invalid metadata, and channel/transport errors.
+    pub fn accept_agent_channel(
+        &mut self,
+        request: &crate::channel::ChannelOpenRequest,
+    ) -> Result<ChannelId, SessionError> {
+        if !self.agent_forwarding_requested
+            || request.channel_type() != b"auth-agent@openssh.com"
+            || !request.type_specific_data().is_empty()
+        {
+            return Err(SessionError::InvalidRequest);
+        }
+        let local = self.channels.allocate_channel_id()?;
+        self.channels
+            .confirm_open(request.sender_channel(), local)?;
+        Ok(local)
+    }
+
+    /// Requests an SCP download using an explicit remote quoting policy.
+    ///
+    /// # Errors
+    /// Rejects an invalid path or a channel-state/transport failure.
+    pub fn request_scp_download_with_shell(
+        &mut self,
+        session: ChannelId,
+        path: impl AsRef<[u8]>,
+        shell: neotales_ssh::scp::RemoteShell,
+        want_reply: bool,
+    ) -> Result<(), SessionError> {
+        let command = neotales_ssh::scp::download_command_with_shell(path, shell)
+            .map_err(|_| SessionError::InvalidRequest)?;
+        self.request_exec(session, command.as_bytes(), want_reply)
+    }
+
     /// Writes bounded response bytes to an open session.
     ///
     /// # Errors
@@ -1549,6 +2169,25 @@ where
             .ok_or(SessionError::UnexpectedMessage)?;
         match event {
             ChannelEvent::Opened(session) => Ok(SessionEvent::Opened { session }),
+            ChannelEvent::OpenRequest(request)
+                if request.channel_type() == b"auth-agent@openssh.com" =>
+            {
+                if self.agent_forwarding_requested && request.type_specific_data().is_empty() {
+                    return Ok(SessionEvent::AgentChannelOpen { request });
+                }
+                self.channels.reject_open(
+                    request.sender_channel(),
+                    SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                    b"agent forwarding denied",
+                    b"",
+                )?;
+                Ok(SessionEvent::OpenRejected {
+                    session: None,
+                    reason: SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                    description: b"agent forwarding denied".to_vec(),
+                    language: Vec::new(),
+                })
+            }
             ChannelEvent::OpenFailed {
                 channel,
                 reason,
@@ -1664,7 +2303,8 @@ impl ServerSessionState {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ServerOptionalState {
     pty: bool,
-    environment: Vec<(Vec<u8>, Vec<u8>)>,
+    environment: Vec<Vec<u8>>,
+    agent_forwarding: bool,
 }
 
 /// A server-side, default-deny session endpoint.
@@ -1679,7 +2319,12 @@ pub struct ServerSessions<T> {
     allow_channel_open: bool,
     sessions: std::collections::BTreeMap<ChannelId, ServerSessionState>,
     optional: std::collections::BTreeMap<ChannelId, ServerOptionalState>,
+    control_policy: Option<Box<ControlPolicy>>,
+    agent_forwarding_policy: Option<Box<dyn Fn(ChannelId) -> bool>>,
+    agent_channels: std::collections::BTreeSet<ChannelId>,
 }
+
+type ControlPolicy = dyn Fn(ChannelId, &SessionControl) -> bool;
 
 impl<T> fmt::Debug for ServerSessions<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1688,6 +2333,12 @@ impl<T> fmt::Debug for ServerSessions<T> {
             .field("channel_count", &self.channels.channel_count())
             .field("policy_configured", &self.policy.is_some())
             .field("server_policy_configured", &self.server_policy.is_some())
+            .field("control_policy_configured", &self.control_policy.is_some())
+            .field(
+                "agent_policy_configured",
+                &self.agent_forwarding_policy.is_some(),
+            )
+            .field("agent_channel_count", &self.agent_channels.len())
             .field("allow_channel_open", &self.allow_channel_open)
             .field("session_count", &self.sessions.len())
             .field("optional_state_count", &self.optional.len())
@@ -1706,6 +2357,9 @@ impl<T> ServerSessions<T> {
             allow_channel_open: false,
             sessions: std::collections::BTreeMap::new(),
             optional: std::collections::BTreeMap::new(),
+            control_policy: None,
+            agent_forwarding_policy: None,
+            agent_channels: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1849,6 +2503,21 @@ impl<T> ServerSessions<T> {
         self.allow_channel_open = allow;
     }
 
+    /// Installs explicit permission for agent-forwarding session requests.
+    /// The default is deny, independent of the exec/shell policy.
+    pub fn set_agent_forwarding_policy(&mut self, policy: impl Fn(ChannelId) -> bool + 'static) {
+        self.agent_forwarding_policy = Some(Box::new(policy));
+    }
+
+    /// Installs explicit policy for signal, window-change, and break requests.
+    /// No callback is installed by default. The callback applies no host effect.
+    pub fn set_control_policy(
+        &mut self,
+        policy: impl Fn(ChannelId, &SessionControl) -> bool + 'static,
+    ) {
+        self.control_policy = Some(Box::new(policy));
+    }
+
     /// Returns whether inbound session opens are currently eligible for confirmation.
     #[must_use]
     pub const fn allows_channel_open(&self) -> bool {
@@ -1883,6 +2552,26 @@ impl<T> ServerSessions<T>
 where
     T: ChannelTransport,
 {
+    /// Opens an opaque agent channel only for a session granted forwarding.
+    /// No agent protocol is interpreted and no local socket is opened.
+    ///
+    /// # Errors
+    /// Rejects missing permission and channel-allocation/transport errors.
+    pub fn open_agent_channel(&mut self, session: ChannelId) -> Result<ChannelId, SessionError> {
+        if !self
+            .optional
+            .get(&session)
+            .is_some_and(|state| state.agent_forwarding)
+        {
+            return Err(SessionError::InvalidRequest);
+        }
+        let channel = self.channels.allocate_channel_id()?;
+        self.channels
+            .open_channel(channel, b"auth-agent@openssh.com", &[])?;
+        self.agent_channels.insert(channel);
+        Ok(channel)
+    }
+
     /// Reads and routes one payload, applying explicit session policy.
     ///
     /// # Errors
@@ -1896,6 +2585,27 @@ where
             .ok_or(SessionError::UnexpectedMessage)?;
         match event {
             ChannelEvent::OpenRequest(request) => self.handle_open(&request),
+            ChannelEvent::Opened(session) if self.agent_channels.contains(&session) => {
+                Ok(SessionEvent::Opened { session })
+            }
+            ChannelEvent::OpenFailed {
+                channel,
+                reason,
+                description,
+                language,
+            } if self.agent_channels.remove(&channel) => Ok(SessionEvent::OpenRejected {
+                session: Some(channel),
+                reason,
+                description,
+                language,
+            }),
+            ChannelEvent::Data {
+                channel: session,
+                data,
+            } if self.agent_channels.contains(&session) => Ok(SessionEvent::Data { session, data }),
+            ChannelEvent::Eof { channel: session } if self.agent_channels.contains(&session) => {
+                Ok(SessionEvent::Eof { session })
+            }
             ChannelEvent::Data {
                 channel: session,
                 data,
@@ -1920,8 +2630,19 @@ where
                 Ok(SessionEvent::Eof { session })
             }
             ChannelEvent::Close { channel: session } => {
+                // A peer-first close needs an immediate acknowledgement, even
+                // before a request, EOF, or exit status. A locally closed
+                // channel was already retired by the channel dispatcher.
+                if self
+                    .channels
+                    .channel(session)
+                    .is_some_and(|channel| !channel.local_close_sent())
+                {
+                    self.channels.send_close(session)?;
+                }
                 self.sessions.remove(&session);
                 self.optional.remove(&session);
+                self.agent_channels.remove(&session);
                 Ok(SessionEvent::Close { session })
             }
             ChannelEvent::Request {
@@ -2218,6 +2939,67 @@ where
             .channel(session)
             .ok_or(SessionError::InvalidRequest)?
             .local_maximum_packet_size() as usize;
+        if request_type == b"auth-agent-req@openssh.com" {
+            if !data.is_empty() {
+                return Err(SessionError::InvalidRequest);
+            }
+            let eligible = self
+                .session_state(session)
+                .is_some_and(|state| !state.accepted())
+                && self
+                    .optional
+                    .get(&session)
+                    .is_some_and(|state| !state.agent_forwarding);
+            let accepted = eligible
+                && match &self.agent_forwarding_policy {
+                    Some(policy) => catch_unwind(AssertUnwindSafe(|| policy(session)))
+                        .map_err(|_| SessionError::CallbackPanicked)?,
+                    None => false,
+                };
+            if accepted {
+                self.optional
+                    .get_mut(&session)
+                    .ok_or(SessionError::InvalidRequest)?
+                    .agent_forwarding = true;
+            }
+            if want_reply {
+                if accepted {
+                    self.channels.send_request_success(session)?;
+                } else {
+                    self.channels.send_request_failure(session)?;
+                }
+            }
+            return Ok(SessionEvent::AgentForwardingRequested {
+                session,
+                want_reply,
+                accepted,
+            });
+        }
+        if matches!(
+            request_type.as_slice(),
+            b"signal" | b"window-change" | b"break"
+        ) {
+            let control = SessionControl::decode(&request_type, data)?;
+            let accepted = match &self.control_policy {
+                Some(policy) => catch_unwind(AssertUnwindSafe(|| policy(session, &control)))
+                    .map_err(|_| SessionError::CallbackPanicked)?,
+                None => false,
+            };
+            if want_reply {
+                if accepted {
+                    self.channels.send_request_success(session)?;
+                } else {
+                    self.channels.send_request_failure(session)?;
+                }
+            }
+            return Ok(SessionEvent::ControlRequested {
+                session,
+                control,
+                data: data.to_vec(),
+                want_reply,
+                accepted,
+            });
+        }
         if request_type == SESSION_REQUEST_PTY.as_bytes() {
             let request = PtyRequest::parse(data, maximum)?;
             if !self.tty_allowed() {
@@ -2268,9 +3050,7 @@ where
                 let Some(optional) = self.optional.get_mut(&session) else {
                     return Err(SessionError::InvalidRequest);
                 };
-                optional
-                    .environment
-                    .push((request.name.clone(), request.value.clone()));
+                optional.environment.push(request.name.clone());
             } else if want_reply {
                 self.channels.send_request_failure(session)?;
             }
@@ -2320,6 +3100,16 @@ where
                 return Err(SessionError::InvalidRequest);
             }
             OwnedSessionRequest::Shell
+        } else if request_type == SESSION_REQUEST_SUBSYSTEM.as_bytes() {
+            let mut reader = Reader::new(data);
+            let name = reader
+                .read_string_with_limit(maximum)
+                .map_err(map_wire_error)?;
+            if !reader.is_empty() {
+                return Err(SessionError::InvalidRequest);
+            }
+            validate_subsystem_name(name)?;
+            OwnedSessionRequest::Subsystem(name.to_vec())
         } else {
             if want_reply {
                 self.channels.send_request_failure(session)?;
@@ -2333,6 +3123,7 @@ where
         let borrowed = match &owned_request {
             OwnedSessionRequest::Exec(command) => SessionRequest::Exec { command },
             OwnedSessionRequest::Shell => SessionRequest::Shell,
+            OwnedSessionRequest::Subsystem(name) => SessionRequest::Subsystem { name },
         };
         let forced_command = self
             .server_policy
@@ -2391,6 +3182,10 @@ where
                 Some(command) => OwnedSessionRequest::Exec(command.to_vec()),
                 None => OwnedSessionRequest::Shell,
             },
+            OwnedSessionRequest::Subsystem(name) => match forced_command {
+                Some(command) => OwnedSessionRequest::Exec(command.to_vec()),
+                None => OwnedSessionRequest::Subsystem(name),
+            },
         }
     }
 
@@ -2418,7 +3213,7 @@ where
             !optional
                 .environment
                 .iter()
-                .any(|(accepted, _)| accepted == request.name())
+                .any(|accepted| accepted == request.name())
         })
     }
 

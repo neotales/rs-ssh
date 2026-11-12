@@ -4,11 +4,14 @@
 //! It deliberately does not open or configure a channel, start an external
 //! program, or create a network endpoint.  The caller supplies a stream that
 //! is already carrying the SFTP byte stream (for example, the two directions of
-//! an SSH channel joined by the application).
+//! an SSH channel joined by the application). [`crate::session::ClientSessions::request_sftp`]
+//! sends the `sftp` subsystem request that starts that channel; this module does
+//! not.
 //!
-//! Requests are strictly sequential: one request is written and its one
-//! response is read before another request can be started.  SFTP frames are
-//! bounded at 16 MiB, paths at 4096 bytes, and handles at 256 bytes.
+//! Synchronous operations exchange one request at a time. `begin_stat` and
+//! `finish_stat` provide a bounded STAT pipeline matched by id, including
+//! out-of-order replies. Synchronous operations cannot overlap that pipeline.
+//! Frames are bounded at 16 MiB, paths at 4096 bytes, and handles at 256 bytes.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -115,6 +118,12 @@ pub const SSH_FXP_RENAME: u8 = 18;
 pub const SSH_FXP_READLINK: u8 = 19;
 /// SFTP `SYMLINK` packet type.
 pub const SSH_FXP_SYMLINK: u8 = 20;
+/// SFTP extension request message number.
+pub const SSH_FXP_EXTENDED: u8 = 200;
+/// SFTP extension reply message number.
+pub const SSH_FXP_EXTENDED_REPLY: u8 = 201;
+/// Maximum number of pending or buffered pipelined requests.
+pub const MAX_SFTP_OUTSTANDING: usize = 16;
 /// SFTP `STATUS` response type.
 pub const SSH_FXP_STATUS: u8 = 101;
 /// SFTP `HANDLE` response type.
@@ -377,6 +386,10 @@ pub enum SftpError {
     AlreadyInitialized,
     /// A request was attempted while another request was outstanding.
     RequestInFlight,
+    /// An extension or its required version was not advertised.
+    ExtensionUnavailable,
+    /// The bounded pipeline already contains its maximum number of requests.
+    TooManyRequests,
     /// The request-id space was exhausted.
     RequestIdExhausted,
     /// A read length cannot be represented by the v3 wire field.
@@ -406,6 +419,8 @@ impl fmt::Debug for SftpError {
             Self::NotInitialized => formatter.write_str("NotInitialized"),
             Self::AlreadyInitialized => formatter.write_str("AlreadyInitialized"),
             Self::RequestInFlight => formatter.write_str("RequestInFlight"),
+            Self::ExtensionUnavailable => formatter.write_str("ExtensionUnavailable"),
+            Self::TooManyRequests => formatter.write_str("TooManyRequests"),
             Self::RequestIdExhausted => formatter.write_str("RequestIdExhausted"),
             Self::InvalidReadLength => formatter.write_str("InvalidReadLength"),
             Self::Status(code) => formatter.debug_tuple("Status").field(code).finish(),
@@ -438,6 +453,12 @@ impl fmt::Display for SftpError {
             Self::NotInitialized => formatter.write_str("SFTP client is not initialized"),
             Self::AlreadyInitialized => formatter.write_str("SFTP client is already initialized"),
             Self::RequestInFlight => formatter.write_str("an SFTP request is already outstanding"),
+            Self::ExtensionUnavailable => {
+                formatter.write_str("SFTP extension version was not advertised")
+            }
+            Self::TooManyRequests => {
+                formatter.write_str("SFTP outstanding request budget exceeded")
+            }
             Self::RequestIdExhausted => formatter.write_str("SFTP request id space is exhausted"),
             Self::InvalidReadLength => formatter.write_str("SFTP read length is invalid"),
             Self::Status(code) => write!(formatter, "SFTP server returned status {code}"),
@@ -1556,10 +1577,62 @@ impl SftpAttributesInput for Option<&SftpAttributes> {
     }
 }
 
-/// A sequential SFTP version 3 client over a caller-supplied byte stream.
+/// The two supported SYMLINK wire layouts. No shell or local path is involved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymlinkOrder {
+    /// Draft-02: link path, then target path.
+    #[default]
+    Draft,
+    /// OpenSSH PROTOCOL 4.1: target path, then link path.
+    OpenSsh,
+}
+
+/// Filesystem statistics in OpenSSH statvfs reply order (PROTOCOL 4.4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SftpStatVfs {
+    /// Filesystem block size.
+    pub block_size: u64,
+    /// Fundamental filesystem block size.
+    pub fragment_size: u64,
+    /// Total blocks, measured in `fragment_size` units.
+    pub blocks: u64,
+    /// Free blocks.
+    pub free_blocks: u64,
+    /// Blocks available to non-root users.
+    pub available_blocks: u64,
+    /// Total inodes.
+    pub files: u64,
+    /// Free inodes.
+    pub free_files: u64,
+    /// Inodes available to non-root users.
+    pub available_files: u64,
+    /// Filesystem identifier.
+    pub filesystem_id: u64,
+    /// Filesystem flags.
+    pub flags: u64,
+    /// Maximum filename length.
+    pub name_max: u64,
+}
+
+/// Advertised OpenSSH server limits. A zero means unspecified, not permission
+/// to exceed this crate's local bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SftpLimits {
+    /// Maximum complete packet length.
+    pub packet_length: u64,
+    /// Maximum read request length.
+    pub read_length: u64,
+    /// Maximum write request length.
+    pub write_length: u64,
+    /// Maximum simultaneously open handles.
+    pub open_handles: u64,
+}
+
+/// An SFTP version 3 client over a caller-supplied byte stream.
 ///
-/// Use [`Self::initialize`] once, then issue one operation at a time.  The
-/// client never negotiates a channel and never owns a network endpoint.
+/// Use [`Self::initialize`] once, then issue synchronous operations or a bounded
+/// [`Self::begin_stat`]/[`Self::finish_stat`] batch. The client never negotiates
+/// a channel and never owns a network endpoint.
 pub struct SftpClient<T> {
     transport: T,
     initialized: bool,
@@ -1567,6 +1640,10 @@ pub struct SftpClient<T> {
     extensions: Vec<SftpExtension>,
     next_request_id: u32,
     request_in_flight: bool,
+    symlink_order: SymlinkOrder,
+    pending_stats: std::collections::BTreeSet<u32>,
+    buffered_stats: std::collections::BTreeMap<u32, Vec<u8>>,
+    pipeline_failed: bool,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -1594,6 +1671,10 @@ impl<T> SftpClient<T> {
             extensions: Vec::new(),
             next_request_id: 0,
             request_in_flight: false,
+            symlink_order: SymlinkOrder::Draft,
+            pending_stats: std::collections::BTreeSet::new(),
+            buffered_stats: std::collections::BTreeMap::new(),
+            pipeline_failed: false,
         }
     }
 
@@ -1631,6 +1712,19 @@ impl<T> SftpClient<T> {
         &self.extensions
     }
 
+    /// Selects a known peer's SYMLINK layout. Use `OpenSsh` when the authenticated
+    /// SSH peer identification names OpenSSH; VERSION alone does not identify
+    /// the implementation. Draft order remains the default and an explicit option.
+    pub fn set_symlink_order(&mut self, order: SymlinkOrder) {
+        self.symlink_order = order;
+    }
+
+    /// Returns the number of sent but not yet collected pipelined STAT requests.
+    #[must_use]
+    pub fn outstanding_requests(&self) -> usize {
+        self.pending_stats.len()
+    }
+
     /// Returns the next request id that will be used.
     #[must_use]
     pub const fn next_request_id(&self) -> u32 {
@@ -1665,6 +1759,214 @@ impl<T> SftpClient<T>
 where
     T: Read + Write,
 {
+    /// Sends an advertised version-1 POSIX rename request.
+    ///
+    /// # Errors
+    /// Returns advertisement, path, framing, transport, id, or status errors.
+    pub fn posix_rename(
+        &mut self,
+        old: impl SftpBytes,
+        new: impl SftpBytes,
+    ) -> Result<(), SftpError> {
+        let (old, new) = (old.as_sftp_bytes(), new.as_sftp_bytes());
+        validate_path_bytes(old)?;
+        validate_path_bytes(new)?;
+        let reply = self.extended_request("posix-rename@openssh.com", b"1", &[old, new])?;
+        status_result(&reply, false).map(|_| ())
+    }
+
+    /// Sends an advertised version-1 hardlink request.
+    ///
+    /// # Errors
+    /// Returns advertisement, path, framing, transport, id, or status errors.
+    pub fn hardlink(&mut self, old: impl SftpBytes, new: impl SftpBytes) -> Result<(), SftpError> {
+        let (old, new) = (old.as_sftp_bytes(), new.as_sftp_bytes());
+        validate_path_bytes(old)?;
+        validate_path_bytes(new)?;
+        let reply = self.extended_request("hardlink@openssh.com", b"1", &[old, new])?;
+        status_result(&reply, false).map(|_| ())
+    }
+
+    /// Sends an advertised version-1 fsync request for an opaque handle.
+    ///
+    /// # Errors
+    /// Returns advertisement, handle, framing, transport, id, or status errors.
+    pub fn fsync(&mut self, handle: impl SftpBytes) -> Result<(), SftpError> {
+        let handle = handle.as_sftp_bytes();
+        validate_handle_bytes(handle)?;
+        let reply = self.extended_request("fsync@openssh.com", b"1", &[handle])?;
+        status_result(&reply, false).map(|_| ())
+    }
+
+    /// Reads advertised version-2 filesystem statistics.
+    ///
+    /// # Errors
+    /// Returns advertisement, path, framing, transport, id, or status errors.
+    pub fn statvfs(&mut self, path: impl SftpBytes) -> Result<SftpStatVfs, SftpError> {
+        let path = path.as_sftp_bytes();
+        validate_path_bytes(path)?;
+        let reply = self.extended_request("statvfs@openssh.com", b"2", &[path])?;
+        let [
+            block_size,
+            fragment_size,
+            blocks,
+            free_blocks,
+            available_blocks,
+            files,
+            free_files,
+            available_files,
+            filesystem_id,
+            flags,
+            name_max,
+        ] = extension_words::<11>(&reply)?;
+        Ok(SftpStatVfs {
+            block_size,
+            fragment_size,
+            blocks,
+            free_blocks,
+            available_blocks,
+            files,
+            free_files,
+            available_files,
+            filesystem_id,
+            flags,
+            name_max,
+        })
+    }
+
+    /// Reads advertised version-1 limits. Local packet and write caps still apply.
+    ///
+    /// # Errors
+    /// Returns advertisement, framing, transport, id, or status errors.
+    pub fn limits(&mut self) -> Result<SftpLimits, SftpError> {
+        let reply = self.extended_request("limits@openssh.com", b"1", &[])?;
+        let [packet_length, read_length, write_length, open_handles] =
+            extension_words::<4>(&reply)?;
+        Ok(SftpLimits {
+            packet_length,
+            read_length,
+            write_length,
+            open_handles,
+        })
+    }
+
+    fn extended_request(
+        &mut self,
+        name: &str,
+        version: &[u8],
+        fields: &[&[u8]],
+    ) -> Result<Vec<u8>, SftpError> {
+        if !self.initialized {
+            return Err(SftpError::NotInitialized);
+        }
+        if !self
+            .extensions
+            .iter()
+            .any(|extension| extension.name == name.as_bytes() && extension.value == version)
+        {
+            return Err(SftpError::ExtensionUnavailable);
+        }
+        self.exchange(SSH_FXP_EXTENDED, |id| {
+            let mut packet = PacketBuilder::with_capacity(64);
+            packet.push_byte(SSH_FXP_EXTENDED);
+            packet.push_uint32(id);
+            packet.push_string(name.as_bytes(), MAX_SFTP_PATH_SIZE, SftpError::InvalidFrame)?;
+            for field in fields {
+                packet.push_string(field, MAX_SFTP_PATH_SIZE, SftpError::PathTooLong)?;
+            }
+            packet.finish()
+        })
+    }
+
+    /// Starts a pipelined STAT request without waiting for its response.
+    /// Up to [`MAX_SFTP_OUTSTANDING`] requests may be sent. Synchronous methods
+    /// cannot be mixed in until all pending responses have been collected.
+    ///
+    /// # Errors
+    /// Rejects invalid paths, a full/failed pipeline, id exhaustion, or I/O errors.
+    pub fn begin_stat(&mut self, path: impl SftpBytes) -> Result<u32, SftpError> {
+        if !self.initialized {
+            return Err(SftpError::NotInitialized);
+        }
+        if self.pipeline_failed {
+            return Err(SftpError::InvalidFrame);
+        }
+        if self.request_in_flight {
+            return Err(SftpError::RequestInFlight);
+        }
+        if self.pending_stats.len() == MAX_SFTP_OUTSTANDING {
+            return Err(SftpError::TooManyRequests);
+        }
+        let path = path.as_sftp_bytes();
+        validate_path_bytes(path)?;
+        let id = self.next_request_id;
+        let next = id.checked_add(1).ok_or(SftpError::RequestIdExhausted)?;
+        let mut packet = PacketBuilder::with_capacity(64);
+        packet.push_byte(SSH_FXP_STAT);
+        packet.push_uint32(id);
+        packet.push_string(path, MAX_SFTP_PATH_SIZE, SftpError::PathTooLong)?;
+        if let Err(error) = write_packet(&mut self.transport, &packet.finish()?) {
+            return Err(self.fail_pipeline(error));
+        }
+        self.next_request_id = next;
+        self.pending_stats.insert(id);
+        Ok(id)
+    }
+
+    /// Collects a pipelined STAT by id, buffering out-of-order replies within a
+    /// 16 MiB aggregate wire-byte budget and the outstanding item cap.
+    ///
+    /// # Errors
+    /// Unknown/duplicate peer ids and I/O or buffer-budget failures disable the
+    /// pipeline. Attributes use the same metadata budgets as synchronous STAT.
+    pub fn finish_stat(&mut self, id: u32) -> Result<SftpAttributes, SftpError> {
+        if self.pipeline_failed || !self.pending_stats.contains(&id) {
+            return Err(SftpError::InvalidFrame);
+        }
+        let reply = if let Some(reply) = self.buffered_stats.remove(&id) {
+            reply
+        } else {
+            loop {
+                let reply = match read_packet(&mut self.transport) {
+                    Ok(reply) => reply,
+                    Err(error) => return Err(self.fail_pipeline(error)),
+                };
+                let actual = match response_id(&reply) {
+                    Ok(actual) => actual,
+                    Err(error) => return Err(self.fail_pipeline(error)),
+                };
+                if !self.pending_stats.contains(&actual)
+                    || self.buffered_stats.contains_key(&actual)
+                {
+                    return Err(self.fail_pipeline(SftpError::ResponseIdMismatch {
+                        expected: id,
+                        actual,
+                    }));
+                }
+                if actual == id {
+                    break reply;
+                }
+                let retained: usize = self.buffered_stats.values().map(Vec::len).sum();
+                if reply.len() > MAX_SFTP_PACKET_SIZE - retained {
+                    return Err(self.fail_pipeline(SftpError::FrameTooLarge));
+                }
+                self.buffered_stats.insert(actual, reply);
+            }
+        };
+        self.pending_stats.remove(&id);
+        if reply.first() == Some(&SSH_FXP_STATUS) {
+            status_result(&reply, false)?;
+        }
+        parse_attributes_response(&reply)
+    }
+
+    fn fail_pipeline(&mut self, error: SftpError) -> SftpError {
+        self.pipeline_failed = true;
+        self.pending_stats.clear();
+        self.buffered_stats.clear();
+        error
+    }
+
     /// Creates a client and performs SFTP VERSION negotiation.
     ///
     /// # Errors
@@ -2328,11 +2630,11 @@ where
         single_name_field(&response)
     }
 
-    /// Creates a symbolic link using draft-02 wire order.
+    /// Creates a symbolic link using the explicitly selected peer wire order.
     ///
     /// The first path is the link path and the second path is the target path.
-    /// OpenSSH's historical reversed order is intentionally not selected
-    /// implicitly.
+    /// Set [`SymlinkOrder::OpenSsh`] for a known OpenSSH peer; the byte-stream
+    /// client cannot infer the SSH identification. Draft order is the default.
     ///
     /// # Errors
     ///
@@ -2346,12 +2648,16 @@ where
         let target_path = target_path.as_sftp_bytes();
         validate_path_bytes(link_path)?;
         validate_path_bytes(target_path)?;
+        let (first, second) = match self.symlink_order {
+            SymlinkOrder::Draft => (link_path, target_path),
+            SymlinkOrder::OpenSsh => (target_path, link_path),
+        };
         let response = self.exchange(SSH_FXP_SYMLINK, |id| {
             let mut packet = PacketBuilder::with_capacity(64);
             packet.push_byte(SSH_FXP_SYMLINK);
             packet.push_uint32(id);
-            packet.push_string(link_path, MAX_SFTP_PATH_SIZE, SftpError::PathTooLong)?;
-            packet.push_string(target_path, MAX_SFTP_PATH_SIZE, SftpError::PathTooLong)?;
+            packet.push_string(first, MAX_SFTP_PATH_SIZE, SftpError::PathTooLong)?;
+            packet.push_string(second, MAX_SFTP_PATH_SIZE, SftpError::PathTooLong)?;
             packet.finish()
         })?;
         status_result(&response, false).map(|_| ())
@@ -2359,7 +2665,7 @@ where
 
     /// Creates a symbolic link with a target-first public argument order.
     ///
-    /// The wire order remains the draft-02 link path followed by target path.
+    /// Uses the same selected wire order as [`Self::symlink`].
     ///
     /// # Errors
     ///
@@ -2461,7 +2767,10 @@ where
         if !self.initialized {
             return Err(SftpError::NotInitialized);
         }
-        if self.request_in_flight {
+        if self.pipeline_failed {
+            return Err(SftpError::InvalidFrame);
+        }
+        if self.request_in_flight || !self.pending_stats.is_empty() {
             return Err(SftpError::RequestInFlight);
         }
         let id = self.next_request_id;
@@ -2686,6 +2995,9 @@ fn parse_version(packet: &[u8]) -> Result<(u32, Vec<SftpExtension>), SftpError> 
     let version = read_u32(&mut reader)?;
     let mut extensions = Vec::new();
     while !reader.is_empty() {
+        if extensions.len() == MAX_SFTP_EXTENSIONS {
+            return Err(SftpError::InvalidFrame);
+        }
         let name = read_string(&mut reader, MAX_SFTP_PACKET_SIZE)?;
         let value = read_string(&mut reader, MAX_SFTP_PACKET_SIZE)?;
         extensions.push(SftpExtension { name, value });
@@ -2766,14 +3078,32 @@ fn parse_data_response(packet: &[u8], expected_length: usize) -> Result<Vec<u8>,
     let expected_id = response_id(packet)?;
     let body = response_body(packet, SSH_FXP_DATA, expected_id)?;
     let mut reader = Reader::new(body);
-    let data = read_string(&mut reader, MAX_SFTP_PACKET_SIZE)?;
+    let data = reader
+        .read_string_with_limit(MAX_SFTP_PACKET_SIZE)
+        .map_err(map_wire_error)?;
     if !reader.is_empty() {
         return Err(SftpError::InvalidFrame);
     }
-    if data.len() > expected_length {
+    if data.len() > expected_length || data.len() > MAX_SFTP_PACKET_SIZE {
         return Err(SftpError::InvalidFrame);
     }
-    Ok(data)
+    Ok(data.to_vec())
+}
+
+fn extension_words<const N: usize>(packet: &[u8]) -> Result<[u64; N], SftpError> {
+    if packet.first() == Some(&SSH_FXP_STATUS) {
+        status_result(packet, false)?;
+    }
+    let body = response_body(packet, SSH_FXP_EXTENDED_REPLY, response_id(packet)?)?;
+    let mut reader = Reader::new(body);
+    let mut words = [0; N];
+    for word in &mut words {
+        *word = read_u64(&mut reader)?;
+    }
+    if !reader.is_empty() {
+        return Err(SftpError::InvalidFrame);
+    }
+    Ok(words)
 }
 
 fn parse_attributes_response(packet: &[u8]) -> Result<SftpAttributes, SftpError> {
@@ -2793,14 +3123,15 @@ fn parse_name_response(packet: &[u8]) -> Result<Vec<SftpDirectoryEntry>, SftpErr
     let mut reader = Reader::new(body);
     let count = read_u32(&mut reader)?;
     let count = usize::try_from(count).map_err(|_error| SftpError::InvalidFrame)?;
-    if count > reader.len() / 12 {
+    if count > MAX_SFTP_DIRECTORY_ENTRIES || count > reader.len() / 12 {
         return Err(SftpError::InvalidFrame);
     }
     let mut entries = Vec::new();
+    let mut budget = MAX_SFTP_METADATA_ITEMS - count;
     for _ in 0..count {
         let name = read_path(&mut reader)?;
         let long_name = read_string(&mut reader, MAX_SFTP_PACKET_SIZE)?;
-        let attributes = decode_attributes(&mut reader)?;
+        let attributes = decode_attributes_with_budget(&mut reader, &mut budget)?;
         entries.push(SftpDirectoryEntry {
             name,
             long_name,
@@ -2862,6 +3193,23 @@ const KNOWN_ATTRIBUTE_FLAGS: u32 = SSH_FILEXFER_ATTR_SIZE
     | SSH_FILEXFER_ATTR_EXTENDED;
 
 fn decode_attributes(reader: &mut Reader<'_>) -> Result<SftpAttributes, SftpError> {
+    let mut budget = MAX_SFTP_METADATA_ITEMS;
+    decode_attributes_with_budget(reader, &mut budget)
+}
+
+/// Maximum extension pairs retained from one VERSION packet.
+pub const MAX_SFTP_EXTENSIONS: usize = 128;
+/// Maximum extended attribute pairs retained in one attribute block.
+pub const MAX_SFTP_EXTENDED_ATTRIBUTES: usize = 256;
+/// Maximum directory entries retained from one NAME packet.
+pub const MAX_SFTP_DIRECTORY_ENTRIES: usize = 1024;
+/// Aggregate directory-entry and extended-attribute budget for one response.
+pub const MAX_SFTP_METADATA_ITEMS: usize = 4096;
+
+fn decode_attributes_with_budget(
+    reader: &mut Reader<'_>,
+    budget: &mut usize,
+) -> Result<SftpAttributes, SftpError> {
     let flags = read_u32(reader)?;
     if flags & !KNOWN_ATTRIBUTE_FLAGS != 0 {
         return Err(SftpError::InvalidAttributes);
@@ -2890,9 +3238,10 @@ fn decode_attributes(reader: &mut Reader<'_>) -> Result<SftpAttributes, SftpErro
     let extended = if flags & SSH_FILEXFER_ATTR_EXTENDED != 0 {
         let count = read_u32(reader)?;
         let count = usize::try_from(count).map_err(|_error| SftpError::InvalidAttributes)?;
-        if count > reader.len() / 8 {
+        if count > MAX_SFTP_EXTENDED_ATTRIBUTES || count > *budget || count > reader.len() / 8 {
             return Err(SftpError::InvalidAttributes);
         }
+        *budget -= count;
         let mut pairs = Vec::new();
         for _ in 0..count {
             let name = read_string(reader, MAX_SFTP_PACKET_SIZE)?;

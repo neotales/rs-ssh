@@ -6,6 +6,9 @@
 //! token-exchange callback through [`GssapiTokenMechanism`]; the callback is
 //! responsible for whatever mechanism-specific state it owns.  The types in
 //! this module only move bounded, opaque bytes and enforce protocol ordering.
+//! Actual userauth requires [`GssapiMicMechanism`], whose integrity operations
+//! bind the first session identifier, username, service and method. A legacy
+//! token callback and message 63 alone cannot authenticate.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -863,11 +866,11 @@ impl fmt::Debug for GssapiUserAuthRequest {
 pub enum GssapiMechanismResult {
     /// The mechanism needs another token exchange.
     Continue(Vec<u8>),
-    /// The mechanism accepts the exchange; the acknowledgement is still
-    /// required before authentication can succeed.
+    /// The mechanism accepts the token context. Authentication still requires
+    /// a separately verified session MIC; acceptance is never SSH success.
     Accept,
-    /// The mechanism accepts the exchange and has a final token to send before
-    /// the acknowledgement.
+    /// The mechanism accepts the context and has a final token to send.
+    /// Authentication still requires a separately verified session MIC.
     AcceptWithToken(Vec<u8>),
     /// The mechanism rejects the exchange.
     Fail,
@@ -944,6 +947,42 @@ pub trait GssapiTokenMechanism {
 
 /// A short alias for [`GssapiTokenMechanism`].
 pub use GssapiTokenMechanism as GssapiMechanism;
+
+/// Explicit integrity-capable GSSAPI context supplied by the caller. No
+/// Kerberos/SSPI implementation is bundled. Implementations own context state
+/// and must authorize the peer identity before returning token acceptance.
+/// Token-only mechanisms cannot be used as this trait implicitly.
+pub trait GssapiMicMechanism: GssapiTokenMechanism {
+    /// Produces a MIC over the exact RFC 4462 session/user/service/method data.
+    ///
+    /// # Errors
+    /// Returns a non-sensitive mechanism error when integrity is unavailable.
+    fn get_mic(&self, data: &[u8]) -> Result<Vec<u8>, GssapiError>;
+    /// Verifies the MIC using the accepted security context and peer identity.
+    ///
+    /// # Errors
+    /// Rejects any context, identity, or integrity mismatch.
+    fn verify_mic(&self, data: &[u8], mic: &[u8]) -> Result<(), GssapiError>;
+}
+
+/// Builds RFC 4462 section 3.5 MIC input. The session identifier is the first
+/// exchange hash, not a later rekey hash. The service and method are fixed.
+///
+/// # Errors
+/// Rejects empty/oversized session identifiers or oversized usernames.
+pub fn mic_input(session_id: &[u8], username: &[u8]) -> Result<Vec<u8>, GssapiError> {
+    if session_id.is_empty() || session_id.len() > 64 || username.len() > MAX_GSSAPI_USERNAME_LENGTH
+    {
+        return Err(GssapiError::LimitExceeded);
+    }
+    let mut writer = Writer::new();
+    writer.write_string(session_id)?;
+    writer.write_byte(SSH_MSG_USERAUTH_REQUEST);
+    writer.write_string(username)?;
+    writer.write_string(SSH_CONNECTION_SERVICE)?;
+    writer.write_string(GSSAPI_WITH_MIC_METHOD)?;
+    Ok(writer.into_bytes())
+}
 
 /// A closure-backed opaque token mechanism.
 ///
@@ -1032,8 +1071,8 @@ pub enum GssapiExchangeAction {
     SendToken(GssapiToken),
     /// The callback accepted the input; wait for the acknowledgement.
     AwaitExchangeComplete,
-    /// The acknowledgement was accepted; the caller may now cross its own
-    /// authentication success boundary.
+    /// The legacy token-only acknowledgement was accepted. This is not SSH
+    /// authentication: gssapi-with-mic still requires a verified message 66.
     Complete,
 }
 
@@ -1072,8 +1111,9 @@ impl fmt::Debug for GssapiExchangeAction {
 /// message order, token sizes, exchange count, and terminal state.  A
 /// successful callback intentionally stops at
 /// [`GssapiExchangeState::AwaitingExchangeComplete`]; callers must receive the
-/// client acknowledgement and cross their existing SSH authentication success
-/// boundary themselves.
+/// client acknowledgement to finish this token-only state machine. Its
+/// completion is not authentication. The auth module requires a separately
+/// verified MIC and never treats message 63 as success.
 #[derive(Clone, Eq, PartialEq)]
 pub struct GssapiExchange {
     state: GssapiExchangeState,

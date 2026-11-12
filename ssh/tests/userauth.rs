@@ -75,7 +75,7 @@ use hostkey::{Ed25519PublicKey, Ed25519Signer};
 use kex::{Curve25519, KeyExchange};
 use msg::kexinit::{
     AES128_CTR, AES128_GCM_OPENSSH, AES256_CTR, AES256_GCM_OPENSSH, COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH, CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
+    CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
     ENCRYPTION_CHACHA20_POLY1305_OPENSSH, HMAC_SHA2_256, HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512,
     HMAC_SHA2_512_ETM_OPENSSH, HOST_KEY_SSH_ED25519, KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
     KEX_STRICT_C_V00_OPENSSH, KexInit,
@@ -240,6 +240,10 @@ fn default_server_proposal_matches_the_supported_client_lists() {
             CURVE25519_SHA256_LIBSSH,
             ECDH_SHA2_NISTP256,
             KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
+            // Task 0007 adds these only after both handshakes complete them.
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group-exchange-sha256",
             "kex-strict-s-v00@openssh.com",
         ]
         .map(str::to_owned)
@@ -282,17 +286,11 @@ fn default_server_proposal_matches_the_supported_client_lists() {
     }
     assert_eq!(
         proposal.compression_algorithms_client_to_server,
-        [
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned()
-        ]
+        [COMPRESSION_NONE.to_owned(),]
     );
     assert_eq!(
         proposal.compression_algorithms_server_to_client,
-        [
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned()
-        ]
+        [COMPRESSION_NONE.to_owned(),]
     );
 }
 
@@ -1437,8 +1435,7 @@ fn banner_before_success_is_delivered_and_is_not_the_result()
 }
 
 #[test]
-fn partial_success_false_stops_before_the_second_method() -> Result<(), Box<dyn std::error::Error>>
-{
+fn ordinary_failure_allows_a_later_listed_method() -> Result<(), Box<dyn std::error::Error>> {
     let auth_signer = signer(218);
     let auth_blob = auth_signer.public_key_blob()?;
     let config = ServerConfig::new(signer(219));
@@ -1448,17 +1445,18 @@ fn partial_success_false_stops_before_the_second_method() -> Result<(), Box<dyn 
     let (mut client, driver) = connect_auth_pair(&config, policy)?;
     let before = client.outbound_sequence();
     let mut authenticator = ClientAuthenticator::new(&mut client, "partial-user", 4)?;
-    let error = authenticator
-        .authenticate(&[
-            ClientAuthMethod::password("wrong"),
-            ClientAuthMethod::public_key(PublicKeySigner::ed25519(auth_signer)),
-        ])
-        .expect_err("a hard failure must not fall through");
-    assert!(matches!(error, AuthError::AuthenticationFailed));
-    assert_eq!(authenticator.attempts(), 1);
-    assert_eq!(client.outbound_sequence() - before, 2);
+    // Task 0010 / RFC 4252 replaces the old hard-stop expectation: false
+    // means this method did not partially authenticate, not "stop trying".
+    let result = authenticator.authenticate(&[
+        ClientAuthMethod::password("wrong"),
+        ClientAuthMethod::public_key(PublicKeySigner::ed25519(auth_signer)),
+    ])?;
+    assert_eq!(result.method(), AuthMethodKind::PublicKey);
+    assert!(!authenticator.partial_success());
+    assert_eq!(authenticator.attempts(), 3);
+    assert_eq!(client.outbound_sequence() - before, 4);
     let server = driver.take_server().ok_or("server transport was lost")?;
-    assert!(!server.is_authenticated());
+    assert!(server.is_authenticated());
     if let Some(error) = driver.take_error() {
         return Err(Box::new(error));
     }
@@ -1481,6 +1479,7 @@ fn partial_success_true_allows_the_second_method_to_succeed()
         ClientAuthMethod::public_key(PublicKeySigner::ed25519(auth_signer)),
     ])?;
     assert_eq!(result.method(), AuthMethodKind::PublicKey);
+    assert!(authenticator.partial_success());
     assert_eq!(authenticator.attempts(), 3);
     let server = driver.take_server().ok_or("server transport was lost")?;
     assert!(server.is_authenticated());
@@ -1575,6 +1574,7 @@ fn server_keyboard_callback_supplies_prompts_and_checks_responses() {
 
 #[test]
 fn keyboard_interactive_sends_one_matching_response() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = take_plaintext_drop(PlaintextSlot::AuthRequest);
     let seen_prompt = Rc::new(Cell::new(false));
     let seen_prompt_for_callback = Rc::clone(&seen_prompt);
     let config = ServerConfig::new(signer(222));
@@ -1589,6 +1589,10 @@ fn keyboard_interactive_sends_one_matching_response() -> Result<(), Box<dyn std:
         },
     )])?;
     assert_eq!(result.method(), AuthMethodKind::KeyboardInteractive);
+    assert_eq!(
+        take_plaintext_drop(PlaintextSlot::AuthRequest),
+        Some(PlaintextDrop::Wiped)
+    );
     assert!(seen_prompt.get());
     assert_eq!(authenticator.attempts(), 2);
     let server = driver.take_server().ok_or("server transport was lost")?;

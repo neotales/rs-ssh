@@ -11,10 +11,10 @@ keywords = ["ssh", "sftp", "scp", "cryptography", "network-programming"]
 categories = ["cryptography", "network-programming"]
 
 [dependencies]
-aes.workspace = true
-aes-gcm.workspace = true
+aes = { workspace = true, features = ["zeroize"] }
+aes-gcm = { workspace = true, features = ["zeroize"] }
 chacha20.workspace = true
-ctr.workspace = true
+ctr = { workspace = true, features = ["zeroize"] }
 ed25519-dalek.workspace = true
 flate2.workspace = true
 getrandom.workspace = true

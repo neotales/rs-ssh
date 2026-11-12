@@ -29,6 +29,9 @@ use crate::hostkey::{Ed25519PublicKey, Ed25519Signer, HostKeyError, verify_host_
 use crate::server::{
     ServerTransport, ServerTransportError, TransportError as ServerUnderlyingTransportError,
 };
+use neotales_ssh::ecdsa_hostkey::{
+    EcdsaP384Signer, EcdsaP521Signer, SSH_ECDSA_SHA2_NISTP384, SSH_ECDSA_SHA2_NISTP521,
+};
 
 /// SSH message number for `SSH_MSG_SERVICE_REQUEST`.
 pub const SSH_MSG_SERVICE_REQUEST: u8 = 5;
@@ -76,10 +79,14 @@ pub const SSH_KEYBOARD_INTERACTIVE_METHOD: &str = "keyboard-interactive";
 pub const SSH_ED25519: &str = "ssh-ed25519";
 /// The RSA user-authentication signature algorithm name.
 pub const SSH_RSA_SHA2_256: &str = "rsa-sha2-256";
+/// RSA SHA-512 public-key authentication algorithm.
+pub const SSH_RSA_SHA2_512: &str = "rsa-sha2-512";
 /// The RSA public-key blob type name.
 pub const SSH_RSA: &str = "ssh-rsa";
 /// The maximum number of prompts or responses in one keyboard-interactive round.
 pub const MAX_KEYBOARD_INTERACTIVE_PROMPTS: usize = 32;
+/// Maximum challenge rounds for one keyboard-interactive method exchange.
+pub const MAX_KEYBOARD_INTERACTIVE_ROUNDS: usize = 32;
 /// The maximum byte length of one keyboard-interactive prompt or response.
 pub const MAX_KEYBOARD_INTERACTIVE_STRING: usize = 1024;
 /// Alias for [`MAX_KEYBOARD_INTERACTIVE_PROMPTS`] used for response limits.
@@ -393,13 +400,28 @@ impl RsaAuthSigner {
     /// Returns [`AuthError::InvalidProof`] if the upstream RSA operation or
     /// fixed-size signature encoding fails.
     pub fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>, AuthError> {
-        let digest = sha2::Sha256::digest(bytes);
-        let raw_signature = self
-            .key
-            .sign(rsa::Pkcs1v15Sign::new_unprefixed(), digest.as_slice())
-            .map_err(|_error| AuthError::InvalidProof)?;
+        self.sign_with_algorithm(bytes, SSH_RSA_SHA2_256)
+    }
+
+    /// Signs using a negotiated RSA SHA-2 algorithm, including `DigestInfo`.
+    ///
+    /// # Errors
+    /// Rejects SHA-1, unknown names, and failed signing operations.
+    pub fn sign_with_algorithm(&self, bytes: &[u8], algorithm: &str) -> Result<Vec<u8>, AuthError> {
+        let raw_signature = match algorithm {
+            SSH_RSA_SHA2_256 => self.key.sign(
+                rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                &sha2::Sha256::digest(bytes),
+            ),
+            SSH_RSA_SHA2_512 => self.key.sign(
+                rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha512>(),
+                &sha2::Sha512::digest(bytes),
+            ),
+            _ => return Err(AuthError::InvalidKey),
+        }
+        .map_err(|_| AuthError::InvalidProof)?;
         let mut writer = Writer::new();
-        writer.write_string(SSH_RSA_SHA2_256)?;
+        writer.write_string(algorithm)?;
         writer.write_string(&raw_signature)?;
         Ok(writer.into_bytes())
     }
@@ -519,6 +541,27 @@ impl AgentKeySigner {
         self.flags
     }
 
+    /// Selects a signature algorithm compatible with this agent key.
+    ///
+    /// # Errors
+    /// Rejects SHA-1, unknown names, and algorithms for a different key type.
+    pub fn with_signature_algorithm(mut self, algorithm: &str) -> Result<Self, AuthError> {
+        let (key_algorithm, _) = agent_signing_flags(&self.key_blob)?;
+        let (algorithm, flags) = match (key_algorithm, algorithm) {
+            (SSH_RSA_SHA2_256, SSH_RSA_SHA2_256) => {
+                (SSH_RSA_SHA2_256, crate::agent::SSH_AGENT_RSA_SHA2_256)
+            }
+            (SSH_RSA_SHA2_256, SSH_RSA_SHA2_512) => {
+                (SSH_RSA_SHA2_512, crate::agent::SSH_AGENT_RSA_SHA2_512)
+            }
+            (name, requested) if name == requested => (name, 0),
+            _ => return Err(AuthError::InvalidKey),
+        };
+        self.algorithm = algorithm;
+        self.flags = flags;
+        Ok(self)
+    }
+
     /// Signs by asking the agent, with flags implied by the key type.
     ///
     /// # Errors
@@ -582,6 +625,12 @@ fn agent_signing_flags(key_blob: &[u8]) -> Result<(&'static str, u32), AuthError
     if algorithm == SSH_ECDSA_SHA2_NISTP256.as_bytes() {
         return Ok((SSH_ECDSA_SHA2_NISTP256, 0));
     }
+    if algorithm == SSH_ECDSA_SHA2_NISTP384.as_bytes() {
+        return Ok((SSH_ECDSA_SHA2_NISTP384, 0));
+    }
+    if algorithm == SSH_ECDSA_SHA2_NISTP521.as_bytes() {
+        return Ok((SSH_ECDSA_SHA2_NISTP521, 0));
+    }
     Err(AuthError::InvalidKey)
 }
 
@@ -600,12 +649,26 @@ fn map_agent_error(error: &AgentError) -> AuthError {
 
 /// A client-side public-key signer usable by the authentication loop.
 pub enum PublicKeySigner {
+    /// Ed25519 certificate and subject signer, associated by the
+    /// `ed25519_certificate` constructor before authentication.
+    Ed25519Certificate {
+        /// Subject signer; never printed by this enum's Debug implementation.
+        signer: Ed25519Signer,
+        /// Existing user certificate; no certificate is issued here.
+        blob: Vec<u8>,
+    },
     /// An Ed25519 signer using raw SSH transcript bytes.
     Ed25519(Ed25519Signer),
     /// An RSA signer using `rsa-sha2-256` and PKCS#1 v1.5/SHA-256.
     Rsa(RsaAuthSigner),
+    /// RSA SHA-512 by default, still constrained by server-sig-algs when present.
+    RsaSha512(RsaAuthSigner),
     /// A NIST P-256 ECDSA signer using `ecdsa-sha2-nistp256`.
     Ecdsa(EcdsaSigner),
+    /// NIST P-384 identity signer.
+    EcdsaP384(EcdsaP384Signer),
+    /// NIST P-521 identity signer.
+    EcdsaP521(EcdsaP521Signer),
     /// A key held by an OpenSSH agent, which signs on this value's behalf.
     ///
     /// The variant is deliberately honest about where the key lives: it holds
@@ -618,6 +681,26 @@ pub enum PublicKeySigner {
 }
 
 impl PublicKeySigner {
+    /// Associates an existing user certificate with an Ed25519 subject key.
+    /// The server, not this constructor, decides CA/principal/time trust.
+    ///
+    /// # Errors
+    /// Rejects a non-user/non-Ed25519 certificate or subject mismatch.
+    pub fn ed25519_certificate(signer: Ed25519Signer, blob: &[u8]) -> Result<Self, AuthError> {
+        let certificate =
+            neotales_ssh::cert::parse_certificate(blob).map_err(|_| AuthError::InvalidKey)?;
+        if certificate.algorithm() != neotales_ssh::cert::SSH_ED25519_CERT_V01
+            || certificate.certificate_type() != neotales_ssh::cert::CertificateType::User
+            || certificate.subject_public_key_blob()
+                != signer.public_key_blob().map_err(map_hostkey_error)?
+        {
+            return Err(AuthError::InvalidKey);
+        }
+        Ok(Self::Ed25519Certificate {
+            signer,
+            blob: blob.to_vec(),
+        })
+    }
     /// Creates an Ed25519 public-key signer.
     #[must_use]
     pub const fn ed25519(signer: Ed25519Signer) -> Self {
@@ -628,6 +711,24 @@ impl PublicKeySigner {
     #[must_use]
     pub const fn rsa(signer: RsaAuthSigner) -> Self {
         Self::Rsa(signer)
+    }
+
+    /// Creates an explicit RSA SHA-512 authentication signer.
+    #[must_use]
+    pub const fn rsa_sha512(signer: RsaAuthSigner) -> Self {
+        Self::RsaSha512(signer)
+    }
+
+    /// Creates a NIST P-384 identity signer.
+    #[must_use]
+    pub const fn ecdsa_p384(signer: EcdsaP384Signer) -> Self {
+        Self::EcdsaP384(signer)
+    }
+
+    /// Creates a NIST P-521 identity signer.
+    #[must_use]
+    pub const fn ecdsa_p521(signer: EcdsaP521Signer) -> Self {
+        Self::EcdsaP521(signer)
     }
 
     /// Creates a NIST P-256 ECDSA public-key signer.
@@ -651,9 +752,13 @@ impl PublicKeySigner {
     #[must_use]
     pub fn algorithm(&self) -> &'static str {
         match self {
+            Self::Ed25519Certificate { .. } => neotales_ssh::cert::SSH_ED25519_CERT_V01,
             Self::Ed25519(_) => SSH_ED25519,
             Self::Rsa(_) => SSH_RSA_SHA2_256,
+            Self::RsaSha512(_) => SSH_RSA_SHA2_512,
             Self::Ecdsa(_) => SSH_ECDSA_SHA2_NISTP256,
+            Self::EcdsaP384(_) => SSH_ECDSA_SHA2_NISTP384,
+            Self::EcdsaP521(_) => SSH_ECDSA_SHA2_NISTP521,
             Self::Agent(signer) => signer.algorithm(),
         }
     }
@@ -665,9 +770,12 @@ impl PublicKeySigner {
     /// Returns an [`AuthError`] if the fixed key encoding fails.
     pub fn public_key_blob(&self) -> Result<Vec<u8>, AuthError> {
         match self {
+            Self::Ed25519Certificate { blob, .. } => Ok(blob.clone()),
             Self::Ed25519(signer) => signer.public_key_blob().map_err(map_hostkey_error),
-            Self::Rsa(signer) => Ok(signer.public_key_blob().to_vec()),
+            Self::Rsa(signer) | Self::RsaSha512(signer) => Ok(signer.public_key_blob().to_vec()),
             Self::Ecdsa(signer) => signer.public_key_blob().map_err(map_ecdsa_error),
+            Self::EcdsaP384(signer) => signer.public_key_blob().map_err(|_| AuthError::InvalidKey),
+            Self::EcdsaP521(signer) => signer.public_key_blob().map_err(|_| AuthError::InvalidKey),
             Self::Agent(signer) => Ok(signer.key_blob().to_vec()),
         }
     }
@@ -680,10 +788,44 @@ impl PublicKeySigner {
 
     fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>, AuthError> {
         match self {
+            Self::Ed25519Certificate { signer, .. } => {
+                signer.sign_exchange_hash(bytes).map_err(map_hostkey_error)
+            }
             Self::Ed25519(signer) => signer.sign_exchange_hash(bytes).map_err(map_hostkey_error),
             Self::Rsa(signer) => signer.sign(bytes),
+            Self::RsaSha512(signer) => signer.sign_with_algorithm(bytes, SSH_RSA_SHA2_512),
             Self::Ecdsa(signer) => signer.sign_exchange_hash(bytes).map_err(map_ecdsa_error),
+            Self::EcdsaP384(signer) => signer
+                .sign_exchange_hash(bytes)
+                .map_err(|_| AuthError::InvalidProof),
+            Self::EcdsaP521(signer) => signer
+                .sign_exchange_hash(bytes)
+                .map_err(|_| AuthError::InvalidProof),
             Self::Agent(signer) => signer.sign(bytes),
+        }
+    }
+
+    pub(crate) fn sign_algorithm(
+        &self,
+        bytes: &[u8],
+        algorithm: &str,
+    ) -> Result<Vec<u8>, AuthError> {
+        match self {
+            Self::Rsa(signer) | Self::RsaSha512(signer) => {
+                signer.sign_with_algorithm(bytes, algorithm)
+            }
+            Self::Agent(signer) if matches!(algorithm, SSH_RSA_SHA2_256 | SSH_RSA_SHA2_512) => {
+                signer.sign_with_flags(
+                    bytes,
+                    if algorithm == SSH_RSA_SHA2_512 {
+                        crate::agent::SSH_AGENT_RSA_SHA2_512
+                    } else {
+                        crate::agent::SSH_AGENT_RSA_SHA2_256
+                    },
+                )
+            }
+            _ if algorithm == self.algorithm() => self.sign(bytes),
+            _ => Err(AuthError::InvalidKey),
         }
     }
 }
@@ -1071,10 +1213,10 @@ impl KeyboardInteractiveChallenge {
             || self.name.len() > MAX_KEYBOARD_INTERACTIVE_STRING
             || self.instruction.len() > MAX_KEYBOARD_INTERACTIVE_STRING
             || self.language.len() > MAX_KEYBOARD_INTERACTIVE_STRING
-            || self
-                .prompts
-                .iter()
-                .any(|prompt| prompt.text_value.len() > MAX_KEYBOARD_INTERACTIVE_STRING)
+            || self.prompts.iter().any(|prompt| {
+                prompt.text_value.is_empty()
+                    || prompt.text_value.len() > MAX_KEYBOARD_INTERACTIVE_STRING
+            })
         {
             return Err(AuthError::InvalidRequest);
         }
@@ -1149,7 +1291,8 @@ pub type KeyboardInteractiveDecision = KeyboardInteractiveServerDecision;
 /// A server keyboard-interactive callback.
 ///
 /// The callback is called first with an empty response slice to obtain the
-/// challenge, then once with the received responses to make the decision.
+/// challenge, then with each round's responses. Returning another challenge
+/// continues the exchange; only `Accept` completes authentication.
 pub trait KeyboardInteractiveCallback {
     /// Supplies or evaluates one keyboard-interactive round.
     fn decide(&self, username: &str, responses: &[String]) -> KeyboardInteractiveServerDecision;
@@ -1250,7 +1393,7 @@ where
 /// A bounded, redacted set of keyboard-interactive responses.
 #[derive(Clone, Eq, PartialEq)]
 pub struct KeyboardInteractiveResponse {
-    responses: Vec<String>,
+    responses: Zeroizing<Vec<String>>,
 }
 
 impl KeyboardInteractiveResponse {
@@ -1262,7 +1405,7 @@ impl KeyboardInteractiveResponse {
         S: Into<String>,
     {
         Self {
-            responses: responses.into_iter().map(Into::into).collect(),
+            responses: Zeroizing::new(responses.into_iter().map(Into::into).collect()),
         }
     }
 
@@ -1308,7 +1451,9 @@ impl fmt::Display for KeyboardInteractiveResponse {
 
 impl From<Vec<String>> for KeyboardInteractiveResponse {
     fn from(responses: Vec<String>) -> Self {
-        Self::new(responses)
+        Self {
+            responses: Zeroizing::new(responses),
+        }
     }
 }
 
@@ -1336,7 +1481,7 @@ where
 impl KeyboardInteractiveResponder for KeyboardInteractiveResponse {
     fn respond(&self, _prompts: &[KeyboardInteractivePrompt]) -> Result<Vec<String>, AuthError> {
         self.validate()?;
-        Ok(self.responses.clone())
+        Ok(self.responses.to_vec())
     }
 }
 
@@ -1368,6 +1513,7 @@ impl KeyboardInteractiveResponder for Vec<&'static str> {
 
 /// Encodes one bounded RFC 4256 info response.
 ///
+/// The returned packet belongs to the caller and must be wiped after use.
 /// # Errors
 ///
 /// Returns [`AuthError::InvalidRequest`] when the count or any response string
@@ -1381,7 +1527,13 @@ pub fn encode_keyboard_interactive_response(responses: &[String]) -> Result<Vec<
     {
         return Err(AuthError::InvalidRequest);
     }
-    let mut writer = Writer::new();
+    // Reserve the entire packet before adding any answers, so reallocations
+    // cannot release a partial secret-bearing packet.
+    let capacity = 5 + responses
+        .iter()
+        .map(|response| 4 + response.len())
+        .sum::<usize>();
+    let mut writer = Writer::with_capacity(capacity);
     writer.write_byte(SSH_MSG_USERAUTH_INFO_RESPONSE);
     writer
         .write_uint32(u32::try_from(responses.len()).map_err(|_error| AuthError::InvalidRequest)?);
@@ -1395,6 +1547,7 @@ pub fn encode_keyboard_interactive_response(responses: &[String]) -> Result<Vec<
 ///
 /// The count is checked before any response strings are read, so an oversized
 /// count cannot cause the extra strings to be accepted or allocated.
+/// On success, the caller owns the answers and must wipe them after use.
 ///
 /// # Errors
 ///
@@ -1416,7 +1569,7 @@ pub fn decode_keyboard_interactive_response(
     if count > MAX_KEYBOARD_INTERACTIVE_RESPONSES || count != expected_count {
         return Err(AuthError::InvalidRequest);
     }
-    let mut responses = Vec::with_capacity(count);
+    let mut responses = Zeroizing::new(Vec::with_capacity(count));
     for _ in 0..count {
         let response = reader.read_string_with_limit(MAX_KEYBOARD_INTERACTIVE_STRING)?;
         responses.push(
@@ -1428,8 +1581,10 @@ pub fn decode_keyboard_interactive_response(
     if !reader.is_empty() {
         return Err(AuthError::InvalidRequest);
     }
-    Ok(responses)
+    Ok(std::mem::take(&mut *responses))
 }
+
+type NonePolicy = dyn Fn(&str) -> bool;
 
 /// Explicit server authentication policy.
 ///
@@ -1437,20 +1592,29 @@ pub fn decode_keyboard_interactive_response(
 /// accepts every key or password. An empty policy is valid but denies both
 /// methods. `max_attempts` is checked for a value of at least one.
 pub struct ServerAuthPolicy {
+    user_certificate_trust: Option<neotales_ssh::cert::UserCertificateTrust>,
+    none_policy: Option<Box<NonePolicy>>,
     authorized_keys: Vec<Vec<u8>>,
     password_verifier: Option<Box<dyn PasswordVerifier>>,
     password_decision_callback: Option<Box<dyn PasswordDecisionCallback>>,
     public_key_verifier: Option<Box<dyn PublicKeyVerifier>>,
     keyboard_interactive_callback: Option<Box<dyn KeyboardInteractiveCallback>>,
     gssapi_mechanism: Option<Box<dyn GssapiTokenMechanism>>,
+    gssapi_mic_mechanism: Option<Box<dyn neotales_ssh::gssapi::GssapiMicMechanism>>,
     banner: Option<AuthBanner>,
     max_attempts: usize,
+    signature_algorithms: Vec<&'static str>,
 }
 
 impl fmt::Debug for ServerAuthPolicy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServerAuthPolicy")
+            .field(
+                "user_certificate_trust",
+                &self.user_certificate_trust.is_some(),
+            )
+            .field("none_policy", &self.none_policy.is_some())
             .field("authorized_key_count", &self.authorized_keys.len())
             .field("password_verifier", &self.password_verifier.is_some())
             .field(
@@ -1463,8 +1627,10 @@ impl fmt::Debug for ServerAuthPolicy {
                 &self.keyboard_interactive_callback.is_some(),
             )
             .field("gssapi_mechanism", &self.gssapi_mechanism.is_some())
+            .field("gssapi_mic_mechanism", &self.gssapi_mic_mechanism.is_some())
             .field("banner", &self.banner.is_some())
             .field("max_attempts", &self.max_attempts)
+            .field("signature_algorithms", &self.signature_algorithms)
             .finish()
     }
 }
@@ -1480,15 +1646,81 @@ impl ServerAuthPolicy {
             return Err(AuthError::InvalidRequest);
         }
         Ok(Self {
+            user_certificate_trust: None,
+            none_policy: None,
             authorized_keys: Vec::new(),
             password_verifier: None,
             password_decision_callback: None,
             public_key_verifier: None,
             keyboard_interactive_callback: None,
             gssapi_mechanism: None,
+            gssapi_mic_mechanism: None,
             banner: None,
             max_attempts,
+            signature_algorithms: vec![
+                SSH_ED25519,
+                SSH_RSA_SHA2_256,
+                SSH_RSA_SHA2_512,
+                SSH_ECDSA_SHA2_NISTP256,
+                SSH_ECDSA_SHA2_NISTP384,
+                SSH_ECDSA_SHA2_NISTP521,
+            ],
         })
+    }
+
+    /// Allows `none` only when this explicit account policy returns true.
+    /// Absent policy denies; panics are reported without authenticating.
+    #[must_use]
+    pub fn with_none_policy(mut self, policy: impl Fn(&str) -> bool + 'static) -> Self {
+        self.none_policy = Some(Box::new(policy));
+        self
+    }
+
+    /// Enables Ed25519 user certificates under explicit CA, clock, and
+    /// account-principal policy. Critical options are rejected, never ignored.
+    #[must_use]
+    pub fn with_user_certificate_trust(
+        mut self,
+        trust: neotales_ssh::cert::UserCertificateTrust,
+    ) -> Self {
+        self.user_certificate_trust = Some(trust);
+        if !self
+            .signature_algorithms
+            .contains(&neotales_ssh::cert::SSH_ED25519_CERT_V01)
+        {
+            self.signature_algorithms
+                .push(neotales_ssh::cert::SSH_ED25519_CERT_V01);
+        }
+        self
+    }
+
+    /// Restricts accepted public-key signatures and the RFC 8308 advertised list.
+    ///
+    /// # Errors
+    /// Unknown names and duplicate entries are rejected. An empty list denies
+    /// every public-key algorithm without enabling another method.
+    pub fn with_signature_algorithms(mut self, algorithms: &[&str]) -> Result<Self, AuthError> {
+        let mut selected = Vec::new();
+        for algorithm in algorithms {
+            let name = match *algorithm {
+                SSH_ED25519 => SSH_ED25519,
+                neotales_ssh::cert::SSH_ED25519_CERT_V01 => {
+                    neotales_ssh::cert::SSH_ED25519_CERT_V01
+                }
+                SSH_RSA_SHA2_256 => SSH_RSA_SHA2_256,
+                SSH_RSA_SHA2_512 => SSH_RSA_SHA2_512,
+                SSH_ECDSA_SHA2_NISTP256 => SSH_ECDSA_SHA2_NISTP256,
+                SSH_ECDSA_SHA2_NISTP384 => SSH_ECDSA_SHA2_NISTP384,
+                SSH_ECDSA_SHA2_NISTP521 => SSH_ECDSA_SHA2_NISTP521,
+                _ => return Err(AuthError::InvalidKey),
+            };
+            if selected.contains(&name) {
+                return Err(AuthError::InvalidRequest);
+            }
+            selected.push(name);
+        }
+        self.signature_algorithms = selected;
+        Ok(self)
     }
 
     /// Alias for [`Self::new`] that emphasizes the retry bound.
@@ -1743,6 +1975,17 @@ impl ServerAuthPolicy {
         self.gssapi_mechanism.is_some()
     }
 
+    /// Enables GSSAPI-with-MIC only under an explicit integrity-capable caller
+    /// context. Token acceptance alone never authenticates. No KDC is bundled.
+    #[must_use]
+    pub fn with_gssapi_mic_mechanism(
+        mut self,
+        mechanism: impl neotales_ssh::gssapi::GssapiMicMechanism + 'static,
+    ) -> Self {
+        self.gssapi_mic_mechanism = Some(Box::new(mechanism));
+        self
+    }
+
     /// Installs a fixed challenge and a response verifier.
     #[must_use]
     pub fn with_keyboard_interactive_challenge<V>(
@@ -1818,7 +2061,7 @@ impl ServerAuthPolicy {
     /// Returns whether at least one public key is authorized.
     #[must_use]
     pub fn public_key_enabled(&self) -> bool {
-        !self.authorized_keys.is_empty()
+        !self.authorized_keys.is_empty() || self.user_certificate_trust.is_some()
     }
 
     /// Returns whether a password callback is configured.
@@ -1847,6 +2090,9 @@ impl ServerAuthPolicy {
 
     fn available_methods(&self) -> Vec<&'static str> {
         let mut methods = Vec::with_capacity(3);
+        if self.gssapi_mic_mechanism.is_some() {
+            methods.push(GSSAPI_WITH_MIC_METHOD);
+        }
         if self.public_key_enabled() {
             methods.push(SSH_PUBLICKEY_METHOD);
         }
@@ -2020,6 +2266,7 @@ impl ServerAuthState {
 struct PendingKeyboardInteractive {
     username: String,
     challenge: KeyboardInteractiveChallenge,
+    rounds: usize,
 }
 
 struct PendingGssapi {
@@ -2137,16 +2384,16 @@ where
                 return Err(map_server_transport_error(error));
             }
         };
-        self.handle_auth_packet(&payload)
+        let payload = PlaintextBytes::new(PlaintextSlot::AuthRequest, payload);
+        self.handle_auth_packet(payload.as_slice())
     }
 
     /// Processes one already-read service or user-authentication packet.
     ///
     /// This is the transport-independent half of [`Self::step`] for callers
     /// that own a packet source other than [`ServerTransport::read_auth_packet`].
-    /// Keyboard-interactive info responses must be passed to
-    /// [`Self::handle_keyboard_interactive_response`] because the baseline
-    /// pre-auth transport intentionally accepts only messages 5 and 50.
+    /// Keyboard-interactive info responses are routed only to a pending
+    /// challenge. An unsolicited response never authenticates.
     ///
     /// # Errors
     ///
@@ -2162,9 +2409,15 @@ where
         match message {
             SSH_MSG_SERVICE_REQUEST => self.handle_service_request(payload),
             SSH_MSG_USERAUTH_REQUEST => self.handle_userauth_request(payload),
+            SSH_MSG_USERAUTH_INFO_RESPONSE if self.pending_keyboard.is_some() => {
+                self.handle_keyboard_interactive_response(payload)
+            }
             SSH_MSG_USERAUTH_GSSAPI_RESPONSE
             | SSH_MSG_USERAUTH_GSSAPI_TOKEN
-            | SSH_MSG_USERAUTH_GSSAPI_EXCHANGE_COMPLETE => self.handle_gssapi_packet(payload),
+            | SSH_MSG_USERAUTH_GSSAPI_EXCHANGE_COMPLETE
+            | neotales_ssh::gssapi::SSH_MSG_USERAUTH_GSSAPI_MIC => {
+                self.handle_gssapi_packet(payload)
+            }
             _ => Err(AuthError::UnexpectedMessage),
         }
     }
@@ -2204,6 +2457,9 @@ where
         if service != SSH_USERAUTH_SERVICE.as_bytes() || self.state.service_accepted {
             return Err(AuthError::UnsupportedService);
         }
+        self.transport
+            .send_signature_algorithms(&self.policy.signature_algorithms)
+            .map_err(map_server_transport_error)?;
         let mut response = Writer::new();
         response.write_byte(SSH_MSG_SERVICE_ACCEPT);
         response.write_string(SSH_USERAUTH_SERVICE)?;
@@ -2222,6 +2478,7 @@ where
         // GSSAPI context.  The normal transport cannot deliver the follow-up
         // GSSAPI packets, but custom packet sources use the handler below.
         self.pending_gssapi = None;
+        self.pending_keyboard = None;
         self.write_banner_if_needed()?;
         if self.state.attempts >= self.policy.max_attempts() {
             self.write_failure()?;
@@ -2242,8 +2499,25 @@ where
             return Err(AuthError::InvalidRequest);
         }
 
-        let result = if header.method == SSH_PUBLICKEY_METHOD.as_bytes() {
-            self.handle_publickey(payload, header.position)
+        let result = if header.method == b"none" {
+            if header.position != payload.len() {
+                return Err(AuthError::InvalidRequest);
+            }
+            let username =
+                std::str::from_utf8(header.username).map_err(|_| AuthError::InvalidRequest)?;
+            let accepted = match &self.policy.none_policy {
+                Some(policy) => catch_unwind(AssertUnwindSafe(|| policy(username)))
+                    .map_err(|_| AuthError::CallbackPanicked)?,
+                None => false,
+            };
+            if accepted {
+                self.write_success()
+            } else {
+                self.write_failure()?;
+                Ok(ServerAuthStep::Failure)
+            }
+        } else if header.method == SSH_PUBLICKEY_METHOD.as_bytes() {
+            self.handle_publickey(header.username, payload, header.position)
         } else if header.method == SSH_PASSWORD_METHOD.as_bytes() {
             self.handle_password(payload, header.position)
         } else if header.method == SSH_KEYBOARD_INTERACTIVE_METHOD.as_bytes() {
@@ -2265,18 +2539,56 @@ where
 
     fn handle_publickey(
         &mut self,
+        username: &[u8],
         payload: &[u8],
         method_position: usize,
     ) -> Result<ServerAuthStep, AuthError> {
         let mut reader = Reader::new(&payload[method_position..]);
         let signed = reader.read_boolean()?;
         let algorithm = reader.read_string()?.to_vec();
+        if !self
+            .policy
+            .signature_algorithms
+            .iter()
+            .any(|name| name.as_bytes() == algorithm)
+        {
+            self.write_failure()?;
+            return Ok(ServerAuthStep::Failure);
+        }
         let key_blob = reader.read_string_bytes()?;
         let prefix_end = method_position + reader.position();
-        let parsed = parse_public_key(&algorithm, &key_blob)?;
+        let (parsed, authorized) = if algorithm
+            == neotales_ssh::cert::SSH_ED25519_CERT_V01.as_bytes()
+        {
+            let username = std::str::from_utf8(username).map_err(|_| AuthError::InvalidRequest)?;
+            let verified = self
+                .policy
+                .user_certificate_trust
+                .as_ref()
+                .and_then(|trust| trust.verify(username, &key_blob).ok());
+            let Some(certificate) = verified else {
+                self.write_failure()?;
+                return Ok(ServerAuthStep::Failure);
+            };
+            if certificate.algorithm() != neotales_ssh::cert::SSH_ED25519_CERT_V01 {
+                return Err(AuthError::InvalidKey);
+            }
+            (
+                parse_public_key(
+                    SSH_ED25519.as_bytes(),
+                    certificate.subject_public_key_blob(),
+                )?,
+                true,
+            )
+        } else {
+            (
+                parse_public_key(&algorithm, &key_blob)?,
+                self.policy.key_authorized(&key_blob),
+            )
+        };
 
         if !signed {
-            if !reader.is_empty() || !self.policy.key_authorized(&key_blob) {
+            if !reader.is_empty() || !authorized {
                 self.write_failure()?;
                 return Ok(ServerAuthStep::Failure);
             }
@@ -2297,7 +2609,7 @@ where
             Ok(signature) if reader.is_empty() => signature,
             Ok(_) | Err(_) => return Err(AuthError::InvalidRequest),
         };
-        if !self.policy.key_authorized(&key_blob) {
+        if !authorized {
             self.write_failure()?;
             return Ok(ServerAuthStep::Failure);
         }
@@ -2308,8 +2620,15 @@ where
             return Ok(ServerAuthStep::Failure);
         }
         let algorithm_name = match algorithm.as_slice() {
+            value if value == neotales_ssh::cert::SSH_ED25519_CERT_V01.as_bytes() => {
+                neotales_ssh::cert::SSH_ED25519_CERT_V01
+            }
             value if value == SSH_ED25519.as_bytes() => SSH_ED25519,
             value if value == SSH_RSA_SHA2_256.as_bytes() => SSH_RSA_SHA2_256,
+            value if value == SSH_RSA_SHA2_512.as_bytes() => SSH_RSA_SHA2_512,
+            value if value == SSH_ECDSA_SHA2_NISTP256.as_bytes() => SSH_ECDSA_SHA2_NISTP256,
+            value if value == SSH_ECDSA_SHA2_NISTP384.as_bytes() => SSH_ECDSA_SHA2_NISTP384,
+            value if value == SSH_ECDSA_SHA2_NISTP521.as_bytes() => SSH_ECDSA_SHA2_NISTP521,
             _ => return Err(AuthError::InvalidKey),
         };
         if self.policy.check_public_key(
@@ -2360,13 +2679,16 @@ where
         method_position: usize,
     ) -> Result<ServerAuthStep, AuthError> {
         let request = GssapiRequest::decode(&payload[method_position..])?;
-        let Some(mechanism) = &self.policy.gssapi_mechanism else {
+        let Some(mechanism) = &self.policy.gssapi_mic_mechanism else {
             // No real GSSAPI mechanism is bundled.  Do not acknowledge an
             // unsupported method or advertise it in the failure list.
             self.write_failure()?;
             return Ok(ServerAuthStep::Failure);
         };
-        let selected = gssapi_mechanism_identifier(mechanism.as_ref())?;
+        let Ok(selected) = gssapi_mechanism_identifier(mechanism.as_ref()) else {
+            self.write_failure()?;
+            return Ok(ServerAuthStep::Failure);
+        };
         let Some(selected) = request
             .mechanisms()
             .iter()
@@ -2392,23 +2714,23 @@ where
 
     /// Handles one already-read RFC 4462 GSSAPI packet.
     ///
-    /// The baseline unauthenticated transport intentionally exposes only
-    /// messages 5 and 50, so custom packet sources must pass messages 60,
-    /// 61, and 63 here.  A mechanism `Accept` is not SSH success by itself:
-    /// message 63 must arrive before success is written.
+    /// Normal transport dispatch routes tokens and MIC here. A mechanism
+    /// `Accept` only permits verification of message 66 over the session,
+    /// username, service and method. Message 63 never authenticates.
     ///
     /// # Errors
     ///
-    /// Returns a bounded protocol, callback, policy, or transport error.  A
-    /// failure response is written before the error is returned whenever the
-    /// transport is still unauthenticated.
+    /// Mechanism/protocol failures return a normal authentication failure and
+    /// discard the pending context. Only a failure to write the response is
+    /// returned as an error; failure never marks the transport authenticated.
     pub fn handle_gssapi_packet(&mut self, payload: &[u8]) -> Result<ServerAuthStep, AuthError> {
         let result = self.handle_gssapi_packet_inner(payload);
         if result.is_err() {
             self.pending_gssapi = None;
             if !self.state.finished {
-                let _ = self.write_failure();
+                self.write_failure()?;
             }
+            return Ok(ServerAuthStep::Failure);
         }
         result
     }
@@ -2418,12 +2740,42 @@ where
             .first()
             .copied()
             .ok_or(AuthError::Gssapi(GssapiError::InvalidMessage))?;
+        if message == neotales_ssh::gssapi::SSH_MSG_USERAUTH_GSSAPI_MIC {
+            let pending = self
+                .pending_gssapi
+                .take()
+                .ok_or(AuthError::Gssapi(GssapiError::InvalidState))?;
+            if pending.exchange.state()
+                != neotales_ssh::gssapi::GssapiExchangeState::AwaitingExchangeComplete
+            {
+                return Err(AuthError::Gssapi(GssapiError::InvalidState));
+            }
+            let mut reader = Reader::new(&payload[1..]);
+            let mic =
+                reader.read_string_with_limit(neotales_ssh::gssapi::MAX_GSSAPI_TOKEN_LENGTH)?;
+            if mic.is_empty() || !reader.is_empty() {
+                return Err(AuthError::InvalidRequest);
+            }
+            let input =
+                neotales_ssh::gssapi::mic_input(self.transport.session_id(), &pending.username)?;
+            let mechanism = self
+                .policy
+                .gssapi_mic_mechanism
+                .as_ref()
+                .ok_or(AuthError::Gssapi(GssapiError::CallbackRejected))?;
+            let accepted = catch_unwind(AssertUnwindSafe(|| mechanism.verify_mic(&input, mic)))
+                .is_ok_and(|result| result.is_ok());
+            if !accepted {
+                return Err(AuthError::Gssapi(GssapiError::CallbackRejected));
+            }
+            return self.write_success();
+        }
         let action = match message {
             SSH_MSG_USERAUTH_GSSAPI_TOKEN => {
                 let Some(pending) = self.pending_gssapi.as_mut() else {
                     return Err(AuthError::Gssapi(GssapiError::InvalidState));
                 };
-                let Some(mechanism) = &self.policy.gssapi_mechanism else {
+                let Some(mechanism) = &self.policy.gssapi_mic_mechanism else {
                     return Err(AuthError::Gssapi(GssapiError::CallbackRejected));
                 };
                 pending
@@ -2432,11 +2784,9 @@ where
                     .map_err(AuthError::from)?
             }
             SSH_MSG_USERAUTH_GSSAPI_EXCHANGE_COMPLETE => {
-                let Some(pending) = self.pending_gssapi.as_mut() else {
-                    return Err(AuthError::Gssapi(GssapiError::InvalidState));
-                };
-                pending.exchange.receive_exchange_complete(payload)?;
-                GssapiExchangeAction::Complete
+                // Task 0011: message 63 is not an integrity proof. Even an
+                // accepted token context must prove the session/user MIC.
+                return Err(AuthError::Gssapi(GssapiError::InvalidState));
             }
             _ => return Err(AuthError::Gssapi(GssapiError::InvalidState)),
         };
@@ -2451,10 +2801,7 @@ where
             GssapiExchangeAction::AwaitExchangeComplete | GssapiExchangeAction::AwaitToken => {
                 Ok(ServerAuthStep::PublicKeyQueryAccepted)
             }
-            GssapiExchangeAction::Complete => {
-                self.pending_gssapi = None;
-                self.write_success()
-            }
+            GssapiExchangeAction::Complete => Err(AuthError::Gssapi(GssapiError::InvalidState)),
         }
     }
 
@@ -2486,6 +2833,7 @@ where
         self.pending_keyboard = Some(PendingKeyboardInteractive {
             username: username.to_owned(),
             challenge: challenge.clone(),
+            rounds: 1,
         });
         self.write_keyboard_interactive_request(&challenge)?;
         Ok(ServerAuthStep::PublicKeyQueryAccepted)
@@ -2493,10 +2841,8 @@ where
 
     /// Handles one RFC 4256 info response after a challenge was written.
     ///
-    /// The baseline server transport intentionally exposes only messages 5 and
-    /// 50 before authentication, so callers that use a custom packet reader can
-    /// pass the received message 61 here. The normal `step` path continues to
-    /// handle service and request packets.
+    /// The normal `step` path routes message 61 here too. At most 32 challenges
+    /// may be sent for one method request; additional rounds fail closed.
     ///
     /// # Errors
     ///
@@ -2521,8 +2867,10 @@ where
         let Some(pending) = self.pending_keyboard.take() else {
             return Err(AuthError::UnexpectedMessage);
         };
-        let responses =
-            decode_keyboard_interactive_response(payload, pending.challenge.prompts.len())?;
+        let responses = Zeroizing::new(decode_keyboard_interactive_response(
+            payload,
+            pending.challenge.prompts.len(),
+        )?);
         match self
             .policy
             .keyboard_interactive_verify(&pending.username, &responses)?
@@ -2532,7 +2880,19 @@ where
                 self.write_failure()?;
                 Ok(ServerAuthStep::Failure)
             }
-            KeyboardInteractiveServerDecision::Challenge(_) => Err(AuthError::UnexpectedMessage),
+            KeyboardInteractiveServerDecision::Challenge(challenge) => {
+                challenge.validate()?;
+                if pending.rounds >= MAX_KEYBOARD_INTERACTIVE_ROUNDS {
+                    return Err(AuthError::AttemptsExhausted);
+                }
+                self.write_keyboard_interactive_request(&challenge)?;
+                self.pending_keyboard = Some(PendingKeyboardInteractive {
+                    username: pending.username,
+                    challenge,
+                    rounds: pending.rounds + 1,
+                });
+                Ok(ServerAuthStep::PublicKeyQueryAccepted)
+            }
         }
     }
 
@@ -2630,6 +2990,10 @@ where
 /// The authentication method that completed on the client.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AuthMethodKind {
+    /// Caller-supplied GSSAPI context with a verified session MIC.
+    Gssapi,
+    /// Explicitly policy-authorized authentication without credentials.
+    None,
     /// Ed25519 or RSA public-key authentication.
     PublicKey,
     /// Password authentication.
@@ -2653,6 +3017,10 @@ pub enum AuthMethodKind {
 /// `neotales_ssh::Zeroizing`. That matters because the variant is public —
 /// building one directly, or matching on it, requires naming the payload type.
 pub enum ClientAuthMethod {
+    /// Explicit integrity-capable context; token-only mechanisms cannot be offered.
+    Gssapi(Box<dyn neotales_ssh::gssapi::GssapiMicMechanism>),
+    /// Explicit `none` request. Never attempted implicitly.
+    None,
     /// A public-key query followed by a signed request.
     PublicKey(Box<PublicKeySigner>),
     /// A non-changing password request, zeroized when the method is dropped.
@@ -2661,11 +3029,17 @@ pub enum ClientAuthMethod {
     /// it. Construct the variant directly only when the value is already a
     /// `Zeroizing<String>` this crate handed back.
     Password(Zeroizing<String>),
-    /// One RFC 4256 keyboard-interactive round.
+    /// A bounded RFC 4256 exchange with one or more challenge rounds.
     KeyboardInteractive(Box<dyn KeyboardInteractiveResponder>),
 }
 
 impl ClientAuthMethod {
+    /// Explicitly offers GSSAPI-with-MIC using a caller-owned security context.
+    /// No mechanism is selected, initialized, or discovered by default.
+    #[must_use]
+    pub fn gssapi(mechanism: impl neotales_ssh::gssapi::GssapiMicMechanism + 'static) -> Self {
+        Self::Gssapi(Box::new(mechanism))
+    }
     /// Creates a public-key method.
     #[must_use]
     pub fn public_key(signer: PublicKeySigner) -> Self {
@@ -2738,6 +3112,8 @@ impl ClientAuthMethod {
     #[must_use]
     pub const fn kind(&self) -> AuthMethodKind {
         match self {
+            Self::Gssapi(_) => AuthMethodKind::Gssapi,
+            Self::None => AuthMethodKind::None,
             Self::PublicKey(_) => AuthMethodKind::PublicKey,
             Self::Password(_) => AuthMethodKind::Password,
             Self::KeyboardInteractive(_) => AuthMethodKind::KeyboardInteractive,
@@ -2748,6 +3124,8 @@ impl ClientAuthMethod {
 impl fmt::Debug for ClientAuthMethod {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Gssapi(_) => formatter.write_str("Gssapi(<redacted>)"),
+            Self::None => formatter.write_str("None"),
             Self::PublicKey(signer) => formatter.debug_tuple("PublicKey").field(signer).finish(),
             Self::Password(_) => formatter.write_str("Password(\"<redacted>\")"),
             Self::KeyboardInteractive(_) => {
@@ -2792,6 +3170,8 @@ pub struct ClientAuthenticator<'a, S> {
     service_requested: bool,
     attempts: usize,
     banner_callback: Box<BannerCallback>,
+    server_methods: Option<Vec<String>>,
+    partial_success: bool,
 }
 
 impl<S> fmt::Debug for ClientAuthenticator<'_, S> {
@@ -2840,6 +3220,8 @@ where
             service_requested: false,
             attempts: 0,
             banner_callback: Box::new(|_message, _language| {}),
+            server_methods: None,
+            partial_success: false,
         })
     }
 
@@ -2847,6 +3229,13 @@ where
     #[must_use]
     pub const fn attempts(&self) -> usize {
         self.attempts
+    }
+
+    /// Reports the most recent failure's partial-success flag. A true value
+    /// means a factor succeeded, not that the connection is authenticated.
+    #[must_use]
+    pub const fn partial_success(&self) -> bool {
+        self.partial_success
     }
 
     /// Installs a callback invoked for every received authentication banner.
@@ -2916,17 +3305,31 @@ where
         }
         self.ensure_service()?;
         for method in methods {
+            let name = match method {
+                ClientAuthMethod::Gssapi(_) => GSSAPI_WITH_MIC_METHOD,
+                ClientAuthMethod::None => "none",
+                ClientAuthMethod::PublicKey(_) => SSH_PUBLICKEY_METHOD,
+                ClientAuthMethod::Password(_) => SSH_PASSWORD_METHOD,
+                ClientAuthMethod::KeyboardInteractive(_) => SSH_KEYBOARD_INTERACTIVE_METHOD,
+            };
+            if self
+                .server_methods
+                .as_ref()
+                .is_some_and(|methods| !methods.iter().any(|allowed| allowed == name))
+            {
+                continue;
+            }
             if self.attempts >= self.max_attempts {
                 return Err(AuthError::AttemptsExhausted);
             }
             match self.authenticate_method(method)? {
                 MethodOutcome::Success => {
+                    self.transport.authenticated = true;
                     return Ok(ClientAuthSuccess {
                         method: method.kind(),
                     });
                 }
-                MethodOutcome::Retry => {}
-                MethodOutcome::HardFailure => return Err(AuthError::AuthenticationFailed),
+                MethodOutcome::Retry | MethodOutcome::Failure => {}
             }
         }
         Err(AuthError::AuthenticationFailed)
@@ -2958,6 +3361,26 @@ where
         method: &ClientAuthMethod,
     ) -> Result<MethodOutcome, AuthError> {
         match method {
+            ClientAuthMethod::Gssapi(mechanism) => {
+                self.consume_attempt()?;
+                self.authenticate_gssapi(mechanism.as_ref())
+            }
+            ClientAuthMethod::None => {
+                self.consume_attempt()?;
+                let mut request = Writer::new();
+                request.write_byte(SSH_MSG_USERAUTH_REQUEST);
+                request.write_string(&self.username)?;
+                request.write_string(SSH_CONNECTION_SERVICE)?;
+                request.write_string("none")?;
+                self.transport
+                    .write_payload(request.as_bytes())
+                    .map_err(map_client_transport_error)?;
+                match self.read_response(ResponseContext::Password)? {
+                    ClientResponse::Success => Ok(MethodOutcome::Success),
+                    ClientResponse::Failure { .. } => Ok(MethodOutcome::Failure),
+                    _ => Err(AuthError::UnexpectedMessage),
+                }
+            }
             ClientAuthMethod::PublicKey(signer) => self.authenticate_publickey(signer),
             ClientAuthMethod::Password(password) => {
                 self.consume_attempt()?;
@@ -2968,6 +3391,112 @@ where
                 self.authenticate_keyboard_interactive(responder.as_ref())
             }
         }
+    }
+
+    fn authenticate_gssapi(
+        &mut self,
+        mechanism: &dyn neotales_ssh::gssapi::GssapiMicMechanism,
+    ) -> Result<MethodOutcome, AuthError> {
+        use neotales_ssh::gssapi::{
+            GssapiMechanismResult, GssapiResponse, GssapiToken, GssapiUserAuthRequest,
+            MAX_GSSAPI_TOKEN_LENGTH,
+        };
+        let Ok(oid) = gssapi_mechanism_identifier(mechanism) else {
+            return Ok(MethodOutcome::Failure);
+        };
+        let request = GssapiUserAuthRequest::try_new(&self.username, [&oid])?.encode()?;
+        self.transport
+            .write_payload(&request)
+            .map_err(map_client_transport_error)?;
+        let response = self.read_gssapi_payload()?;
+        if response.first() == Some(&SSH_MSG_USERAUTH_FAILURE) {
+            return Ok(MethodOutcome::Failure);
+        }
+        if GssapiResponse::decode(&response)?.mechanism() != oid {
+            return Err(AuthError::UnexpectedMessage);
+        }
+        let mut input = Vec::new();
+        for _ in 0..MAX_GSSAPI_EXCHANGES {
+            let result = catch_unwind(AssertUnwindSafe(|| mechanism.exchange(&input)));
+            let (output, complete) = match result {
+                Ok(GssapiMechanismResult::Continue(token)) => (Some(token), false),
+                Ok(GssapiMechanismResult::AcceptWithToken(token)) => (Some(token), true),
+                Ok(GssapiMechanismResult::Accept) => (None, true),
+                Ok(GssapiMechanismResult::Fail) | Err(_) => return Ok(MethodOutcome::Failure),
+            };
+            if let Some(output) = output {
+                let Ok(packet) = GssapiToken::new(output).encode() else {
+                    return Ok(MethodOutcome::Failure);
+                };
+                self.transport
+                    .write_payload(&packet)
+                    .map_err(map_client_transport_error)?;
+            }
+            if complete {
+                let input =
+                    neotales_ssh::gssapi::mic_input(self.transport.session_id(), &self.username)?;
+                let mic = match catch_unwind(AssertUnwindSafe(|| mechanism.get_mic(&input))) {
+                    Ok(Ok(mic)) if !mic.is_empty() && mic.len() <= MAX_GSSAPI_TOKEN_LENGTH => mic,
+                    _ => return Ok(MethodOutcome::Failure),
+                };
+                let mut packet = Writer::new();
+                packet.write_byte(neotales_ssh::gssapi::SSH_MSG_USERAUTH_GSSAPI_MIC);
+                packet.write_string(&mic)?;
+                self.transport
+                    .write_payload(packet.as_bytes())
+                    .map_err(map_client_transport_error)?;
+                return match self.read_gssapi_payload()?.as_slice() {
+                    [SSH_MSG_USERAUTH_SUCCESS] => Ok(MethodOutcome::Success),
+                    payload if payload.first() == Some(&SSH_MSG_USERAUTH_FAILURE) => {
+                        Ok(MethodOutcome::Failure)
+                    }
+                    _ => Err(AuthError::UnexpectedMessage),
+                };
+            }
+            let response = self.read_gssapi_payload()?;
+            if response.first() == Some(&SSH_MSG_USERAUTH_FAILURE) {
+                return Ok(MethodOutcome::Failure);
+            }
+            input = GssapiToken::decode(&response)?.token().to_vec();
+        }
+        Ok(MethodOutcome::Failure)
+    }
+
+    fn read_gssapi_payload(&mut self) -> Result<Vec<u8>, AuthError> {
+        for _ in 0..MAX_AUTH_BANNERS {
+            let payload = self
+                .transport
+                .read_payload()
+                .map_err(map_client_transport_error)?;
+            match payload.first() {
+                Some(&SSH_MSG_USERAUTH_FAILURE) => {
+                    let mut reader = Reader::new(&payload[1..]);
+                    let methods = reader.read_name_list()?;
+                    let partial = reader.read_boolean()?;
+                    if !reader.is_empty() {
+                        return Err(AuthError::InvalidRequest);
+                    }
+                    self.server_methods = Some(methods);
+                    self.partial_success = partial;
+                    return Ok(payload);
+                }
+                Some(&SSH_MSG_USERAUTH_BANNER) => {
+                    let mut reader = Reader::new(&payload[1..]);
+                    let message = reader.read_string_with_limit(DEFAULT_STRING_LIMIT)?;
+                    let language = reader.read_string_with_limit(DEFAULT_STRING_LIMIT)?;
+                    if !reader.is_empty() {
+                        return Err(AuthError::InvalidRequest);
+                    }
+                    self.deliver_banner(
+                        std::str::from_utf8(message).map_err(|_| AuthError::InvalidRequest)?,
+                        std::str::from_utf8(language).map_err(|_| AuthError::InvalidRequest)?,
+                    )?;
+                }
+                Some(_) => return Ok(payload),
+                None => return Err(AuthError::InvalidRequest),
+            }
+        }
+        Err(AuthError::AttemptsExhausted)
     }
 
     fn consume_attempt(&mut self) -> Result<(), AuthError> {
@@ -2983,7 +3512,31 @@ where
         signer: &PublicKeySigner,
     ) -> Result<MethodOutcome, AuthError> {
         self.consume_attempt()?;
-        let algorithm = signer.algorithm();
+        let algorithm = if matches!(signer.algorithm(), SSH_RSA_SHA2_256 | SSH_RSA_SHA2_512) {
+            match self.transport.server_signature_algorithms() {
+                None => signer.algorithm(),
+                Some(names) if names.iter().any(|name| name == signer.algorithm()) => {
+                    signer.algorithm()
+                }
+                Some(names) if names.iter().any(|name| name == SSH_RSA_SHA2_256) => {
+                    SSH_RSA_SHA2_256
+                }
+                Some(names) if names.iter().any(|name| name == SSH_RSA_SHA2_512) => {
+                    SSH_RSA_SHA2_512
+                }
+                Some(_) => return Ok(MethodOutcome::Retry),
+            }
+        } else {
+            let algorithm = signer.algorithm();
+            if self
+                .transport
+                .server_signature_algorithms()
+                .is_some_and(|names| !names.iter().any(|name| name == algorithm))
+            {
+                return Ok(MethodOutcome::Retry);
+            }
+            algorithm
+        };
         let key_blob = signer.public_key_blob()?;
         let query = encode_publickey_request(&self.username, algorithm, &key_blob, false)?;
         self.transport
@@ -3004,7 +3557,7 @@ where
                 return Ok(if partial_success {
                     MethodOutcome::Retry
                 } else {
-                    MethodOutcome::HardFailure
+                    MethodOutcome::Failure
                 });
             }
             ClientResponse::Success => return Ok(MethodOutcome::Success),
@@ -3016,7 +3569,7 @@ where
         self.consume_attempt()?;
         let prefix = encode_publickey_request(&self.username, algorithm, &key_blob, true)?;
         let signed_bytes = encode_signed_bytes(self.transport.session_id(), &prefix)?;
-        let signature_blob = signer.sign(&signed_bytes)?;
+        let signature_blob = signer.sign_algorithm(&signed_bytes, algorithm)?;
         let mut signature_field = Writer::new();
         signature_field.write_string(&signature_blob)?;
         let mut signed_request = prefix;
@@ -3031,7 +3584,7 @@ where
             } => Ok(if partial_success {
                 MethodOutcome::Retry
             } else {
-                MethodOutcome::HardFailure
+                MethodOutcome::Failure
             }),
             ClientResponse::ServiceAccepted
             | ClientResponse::PublicKeyOk { .. }
@@ -3057,9 +3610,9 @@ where
     //
     // Every buffer this crate allocates for those last four is a `PlaintextBytes`,
     // so the wipe is a property of the type rather than of each call site. The
-    // gaps that remain are stated on the type: growth is not covered, and the
-    // keyboard-interactive responses and the inbound side of a server's transport
-    // are not on this chain.
+    // growth limitation is stated on the type. Keyboard-interactive packets
+    // and server-owned inbound authentication packets have separate wrappers
+    // at their ownership boundaries; decoded answer lists use Zeroizing.
     fn authenticate_password(&mut self, password: &str) -> Result<MethodOutcome, AuthError> {
         let mut request = Writer::new();
         request.write_byte(SSH_MSG_USERAUTH_REQUEST);
@@ -3079,7 +3632,7 @@ where
             } => Ok(if partial_success {
                 MethodOutcome::Retry
             } else {
-                MethodOutcome::HardFailure
+                MethodOutcome::Failure
             }),
             ClientResponse::ServiceAccepted
             | ClientResponse::PublicKeyOk { .. }
@@ -3106,56 +3659,55 @@ where
             .write_payload(&request.into_bytes())
             .map_err(map_client_transport_error)?;
 
-        let challenge = match self.read_response(ResponseContext::KeyboardInteractive)? {
-            ClientResponse::KeyboardInteractiveRequest { challenge, .. } => challenge,
-            ClientResponse::Success => return Ok(MethodOutcome::Success),
-            ClientResponse::Failure {
-                partial_success, ..
-            } => {
-                return Ok(if partial_success {
-                    MethodOutcome::Retry
-                } else {
-                    MethodOutcome::HardFailure
-                });
-            }
-            ClientResponse::ServiceAccepted
-            | ClientResponse::PublicKeyOk { .. }
-            | ClientResponse::Unexpected => return Err(AuthError::UnexpectedMessage),
-        };
-        let responses =
-            match catch_unwind(AssertUnwindSafe(|| responder.respond(&challenge.prompts))) {
-                Ok(Ok(responses)) => responses,
-                Ok(Err(error)) => return Err(error),
-                Err(_panic_payload) => return Err(AuthError::CallbackPanicked),
+        let mut context = ResponseContext::KeyboardInteractive;
+        let mut rounds = 0;
+        loop {
+            let challenge = match self.read_response(context)? {
+                ClientResponse::KeyboardInteractiveRequest { challenge, .. } => challenge,
+                ClientResponse::Success => return Ok(MethodOutcome::Success),
+                ClientResponse::Failure {
+                    partial_success, ..
+                } => {
+                    return Ok(if partial_success {
+                        MethodOutcome::Retry
+                    } else {
+                        MethodOutcome::Failure
+                    });
+                }
+                ClientResponse::ServiceAccepted
+                | ClientResponse::PublicKeyOk { .. }
+                | ClientResponse::Unexpected => return Err(AuthError::UnexpectedMessage),
             };
-        let response_count = responses.len();
-        if response_count > MAX_KEYBOARD_INTERACTIVE_RESPONSES
-            || response_count != challenge.prompts.len()
-            || responses
-                .iter()
-                .any(|response| response.len() > MAX_KEYBOARD_INTERACTIVE_STRING)
-        {
-            return Err(AuthError::InvalidRequest);
-        }
+            if rounds >= MAX_KEYBOARD_INTERACTIVE_ROUNDS {
+                return Err(AuthError::AttemptsExhausted);
+            }
+            rounds += 1;
+            let responses = Zeroizing::new(
+                match catch_unwind(AssertUnwindSafe(|| responder.respond(&challenge.prompts))) {
+                    Ok(Ok(responses)) => responses,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_panic_payload) => return Err(AuthError::CallbackPanicked),
+                },
+            );
+            let response_count = responses.len();
+            if response_count > MAX_KEYBOARD_INTERACTIVE_RESPONSES
+                || response_count != challenge.prompts.len()
+                || responses
+                    .iter()
+                    .any(|response| response.len() > MAX_KEYBOARD_INTERACTIVE_STRING)
+            {
+                return Err(AuthError::InvalidRequest);
+            }
 
-        self.consume_attempt()?;
-        let response = encode_keyboard_interactive_response(&responses)?;
-        self.transport
-            .write_payload(&response)
-            .map_err(map_client_transport_error)?;
-        match self.read_response(ResponseContext::KeyboardInteractiveResponse)? {
-            ClientResponse::Success => Ok(MethodOutcome::Success),
-            ClientResponse::Failure {
-                partial_success, ..
-            } => Ok(if partial_success {
-                MethodOutcome::Retry
-            } else {
-                MethodOutcome::HardFailure
-            }),
-            ClientResponse::ServiceAccepted
-            | ClientResponse::PublicKeyOk { .. }
-            | ClientResponse::KeyboardInteractiveRequest { .. }
-            | ClientResponse::Unexpected => Err(AuthError::UnexpectedMessage),
+            self.consume_attempt()?;
+            let response = PlaintextBytes::new(
+                PlaintextSlot::AuthRequest,
+                encode_keyboard_interactive_response(&responses)?,
+            );
+            self.transport
+                .write_payload(response.as_slice())
+                .map_err(map_client_transport_error)?;
+            context = ResponseContext::KeyboardInteractiveResponse;
         }
     }
 
@@ -3184,6 +3736,8 @@ where
                     if !reader.is_empty() {
                         return Err(AuthError::UnexpectedMessage);
                     }
+                    self.server_methods = Some(methods.clone());
+                    self.partial_success = partial_success;
                     return Ok(ClientResponse::Failure {
                         methods,
                         partial_success,
@@ -3221,12 +3775,11 @@ where
                             key_blob,
                         });
                     }
-                    ResponseContext::KeyboardInteractive => {
+                    ResponseContext::KeyboardInteractive
+                    | ResponseContext::KeyboardInteractiveResponse => {
                         return parse_keyboard_interactive_request(&payload[1..]);
                     }
-                    ResponseContext::Service
-                    | ResponseContext::Password
-                    | ResponseContext::KeyboardInteractiveResponse => {
+                    ResponseContext::Service | ResponseContext::Password => {
                         return Err(AuthError::UnexpectedMessage);
                     }
                 },
@@ -3281,7 +3834,10 @@ fn parse_userauth_header(payload: &[u8]) -> Result<RequestHeader<'_>, AuthError>
 
 enum ParsedPublicKey {
     Ed25519(Ed25519PublicKey),
-    Rsa(RsaPublicKey),
+    Rsa(RsaPublicKey, &'static str),
+    Ecdsa256(neotales_ssh::ecdsa_hostkey::EcdsaPublicKey),
+    Ecdsa384(neotales_ssh::ecdsa_hostkey::EcdsaP384PublicKey),
+    Ecdsa521(neotales_ssh::ecdsa_hostkey::EcdsaP521PublicKey),
 }
 
 fn parse_public_key(algorithm: &[u8], blob: &[u8]) -> Result<ParsedPublicKey, AuthError> {
@@ -3290,7 +3846,25 @@ fn parse_public_key(algorithm: &[u8], blob: &[u8]) -> Result<ParsedPublicKey, Au
             .map(ParsedPublicKey::Ed25519)
             .map_err(map_hostkey_error),
         value if value == SSH_RSA_SHA2_256.as_bytes() => {
-            RsaPublicKey::from_blob(blob).map(ParsedPublicKey::Rsa)
+            RsaPublicKey::from_blob(blob).map(|key| ParsedPublicKey::Rsa(key, SSH_RSA_SHA2_256))
+        }
+        value if value == SSH_RSA_SHA2_512.as_bytes() => {
+            RsaPublicKey::from_blob(blob).map(|key| ParsedPublicKey::Rsa(key, SSH_RSA_SHA2_512))
+        }
+        value if value == SSH_ECDSA_SHA2_NISTP256.as_bytes() => {
+            neotales_ssh::ecdsa_hostkey::EcdsaPublicKey::from_blob(blob)
+                .map(ParsedPublicKey::Ecdsa256)
+                .map_err(|_| AuthError::InvalidKey)
+        }
+        value if value == SSH_ECDSA_SHA2_NISTP384.as_bytes() => {
+            neotales_ssh::ecdsa_hostkey::EcdsaP384PublicKey::from_blob(blob)
+                .map(ParsedPublicKey::Ecdsa384)
+                .map_err(|_| AuthError::InvalidKey)
+        }
+        value if value == SSH_ECDSA_SHA2_NISTP521.as_bytes() => {
+            neotales_ssh::ecdsa_hostkey::EcdsaP521PublicKey::from_blob(blob)
+                .map(ParsedPublicKey::Ecdsa521)
+                .map_err(|_| AuthError::InvalidKey)
         }
         _ => Err(AuthError::InvalidKey),
     }
@@ -3306,7 +3880,7 @@ fn validate_authorized_blob(blob: &[u8]) -> Result<(), AuthError> {
     } else if key_type == SSH_RSA.as_bytes() {
         RsaPublicKey::from_blob(blob).map(|_key| ())
     } else {
-        Err(AuthError::InvalidKey)
+        parse_public_key(key_type, blob).map(|_| ())
     }
 }
 
@@ -3315,28 +3889,56 @@ fn verify_public_key(key: &ParsedPublicKey, signature_blob: &[u8], signed_bytes:
         ParsedPublicKey::Ed25519(key) => {
             verify_host_key_signature(key, signature_blob, signed_bytes).is_ok()
         }
-        ParsedPublicKey::Rsa(key) => {
-            let digest = sha2::Sha256::digest(signed_bytes);
-            let Ok(signature) = decode_rsa_signature(signature_blob) else {
+        ParsedPublicKey::Ecdsa256(key) => neotales_ssh::ecdsa_hostkey::verify_host_key_signature(
+            key,
+            signature_blob,
+            signed_bytes,
+        )
+        .is_ok(),
+        ParsedPublicKey::Ecdsa384(key) => {
+            neotales_ssh::ecdsa_hostkey::verify_p384_host_key_signature(
+                key,
+                signature_blob,
+                signed_bytes,
+            )
+            .is_ok()
+        }
+        ParsedPublicKey::Ecdsa521(key) => {
+            neotales_ssh::ecdsa_hostkey::verify_p521_host_key_signature(
+                key,
+                signature_blob,
+                signed_bytes,
+            )
+            .is_ok()
+        }
+        ParsedPublicKey::Rsa(key, algorithm) => {
+            let Ok(signature) = decode_rsa_signature(signature_blob, algorithm) else {
                 return false;
             };
             if signature.len() != key.public_key().size() {
                 return false;
             }
-            key.public_key()
-                .verify(
-                    rsa::Pkcs1v15Sign::new_unprefixed(),
-                    digest.as_slice(),
+            match *algorithm {
+                SSH_RSA_SHA2_256 => key.public_key().verify(
+                    rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                    &sha2::Sha256::digest(signed_bytes),
                     signature,
-                )
-                .is_ok()
+                ),
+                SSH_RSA_SHA2_512 => key.public_key().verify(
+                    rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha512>(),
+                    &sha2::Sha512::digest(signed_bytes),
+                    signature,
+                ),
+                _ => return false,
+            }
+            .is_ok()
         }
     }
 }
 
-fn decode_rsa_signature(blob: &[u8]) -> Result<&[u8], AuthError> {
+fn decode_rsa_signature<'a>(blob: &'a [u8], algorithm: &str) -> Result<&'a [u8], AuthError> {
     let mut reader = Reader::new(blob);
-    if reader.read_string()? != SSH_RSA_SHA2_256.as_bytes() {
+    if reader.read_string()? != algorithm.as_bytes() {
         return Err(AuthError::InvalidProof);
     }
     let signature = reader.read_string()?;
@@ -3477,7 +4079,7 @@ enum ResponseContext {
 enum MethodOutcome {
     Success,
     Retry,
-    HardFailure,
+    Failure,
 }
 
 enum ClientResponse {

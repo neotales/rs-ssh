@@ -647,6 +647,8 @@ impl TryFrom<&[u8]> for TcpipForwardGlobalRequest {
 pub enum TcpipForwardResponse {
     /// The peer accepted the request.
     Success,
+    /// Success for a port-zero request, containing the application's chosen port.
+    AllocatedPort(u32),
     /// The peer rejected the request.
     Failure,
 }
@@ -661,6 +663,13 @@ impl TcpipForwardResponse {
     pub fn decode(input: &[u8]) -> Result<Self, TcpipForwardError> {
         match input {
             [SSH_MSG_REQUEST_SUCCESS] => Ok(Self::Success),
+            [SSH_MSG_REQUEST_SUCCESS, a, b, c, d] => {
+                let port = u32::from_be_bytes([*a, *b, *c, *d]);
+                if port == 0 || port > MAX_TCPIP_FORWARD_PORT {
+                    return Err(TcpipForwardError::InvalidResponse);
+                }
+                Ok(Self::AllocatedPort(port))
+            }
             [SSH_MSG_REQUEST_FAILURE] => Ok(Self::Failure),
             _ => Err(TcpipForwardError::InvalidResponse),
         }
@@ -676,16 +685,36 @@ impl TcpipForwardResponse {
         if MAX_PACKET_CONTENT == 0 {
             return Err(TcpipForwardError::InvalidResponse);
         }
+        if let Self::AllocatedPort(port) = self {
+            if port == 0 || port > MAX_TCPIP_FORWARD_PORT {
+                return Err(TcpipForwardError::InvalidResponse);
+            }
+            let mut writer = Writer::new();
+            writer.write_byte(SSH_MSG_REQUEST_SUCCESS);
+            writer.write_uint32(port);
+            return Ok(writer.into_bytes());
+        }
         Ok(vec![match self {
             Self::Success => SSH_MSG_REQUEST_SUCCESS,
             Self::Failure => SSH_MSG_REQUEST_FAILURE,
+            Self::AllocatedPort(_) => return Err(TcpipForwardError::InvalidResponse),
         }])
     }
 
     /// Returns whether this is a success response.
     #[must_use]
     pub const fn is_success(self) -> bool {
-        matches!(self, Self::Success)
+        matches!(self, Self::Success | Self::AllocatedPort(_))
+    }
+
+    /// Returns a port only when the peer actually included an allocated-port field.
+    #[must_use]
+    pub const fn allocated_port(self) -> Option<u32> {
+        if let Self::AllocatedPort(port) = self {
+            Some(port)
+        } else {
+            None
+        }
     }
 
     /// Returns whether this is a failure response.
@@ -876,6 +905,8 @@ pub struct ServerTcpipForwardRequest {
     pub want_reply: bool,
     /// Whether the request was accepted and recorded or removed.
     pub accepted: bool,
+    /// Port selected for a successful port-zero request; absent for fixed ports.
+    pub allocated_port: Option<u32>,
 }
 
 /// A descriptive alias for [`ServerTcpipForwardRequest`].
@@ -1504,7 +1535,10 @@ pub struct ServerTcpipForward<T> {
     policy: Option<Box<dyn TcpipForwardPolicy>>,
     bindings: BTreeSet<(Vec<u8>, u32)>,
     open_tuples: BTreeMap<ChannelId, ForwardedTcpipTuple>,
+    port_allocator: Option<Box<PortAllocator>>,
 }
+
+type PortAllocator = dyn Fn(&[u8]) -> Option<u32>;
 
 impl<T> fmt::Debug for ServerTcpipForward<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1513,6 +1547,7 @@ impl<T> fmt::Debug for ServerTcpipForward<T> {
             .field("channel_count", &self.channels.channel_count())
             .field("pending_open_count", &self.channels.pending_open_count())
             .field("policy_configured", &self.policy.is_some())
+            .field("port_allocator_configured", &self.port_allocator.is_some())
             .field("binding_count", &self.bindings.len())
             .field("open_tuples", &self.open_tuples)
             .finish()
@@ -1528,6 +1563,7 @@ impl<T> ServerTcpipForward<T> {
             policy: None,
             bindings: BTreeSet::new(),
             open_tuples: BTreeMap::new(),
+            port_allocator: None,
         }
     }
 
@@ -1626,6 +1662,13 @@ impl<T> ServerTcpipForward<T> {
     /// Removes the policy callback, restoring default-deny behavior.
     pub fn clear_policy(&mut self) {
         self.policy = None;
+    }
+
+    /// Installs an application port selector for explicitly allowed port-zero
+    /// requests. This library never binds or listens on a socket. The callback
+    /// must return an already reserved nonzero port, or `None` to deny.
+    pub fn set_port_allocator(&mut self, allocator: impl Fn(&[u8]) -> Option<u32> + 'static) {
+        self.port_allocator = Some(Box::new(allocator));
     }
 
     /// Returns whether an explicit policy is installed.
@@ -1745,15 +1788,35 @@ where
                 return Err(error);
             }
         };
+        let mut allocated_port = None;
         let (kind, bind_address, port, want_reply, accepted) = match &request {
             TcpipForwardGlobalRequest::TcpipForward {
                 bind_address,
                 port,
                 want_reply,
             } => {
-                let accepted = *port != 0 && self.authorize(bind_address, *port);
+                if *port == 0
+                    && *want_reply
+                    && self.authorize(bind_address, 0)
+                    && let Some(allocator) = &self.port_allocator
+                {
+                    allocated_port = catch_unwind(AssertUnwindSafe(|| allocator(bind_address)))
+                        .ok()
+                        .flatten()
+                        .filter(|port| {
+                            *port != 0
+                                && *port <= MAX_TCPIP_FORWARD_PORT
+                                && !self.has_binding(bind_address, *port)
+                        });
+                }
+                let accepted = if *port == 0 {
+                    allocated_port.is_some()
+                } else {
+                    self.authorize(bind_address, *port)
+                };
                 if accepted {
-                    self.bindings.insert((bind_address.clone(), *port));
+                    self.bindings
+                        .insert((bind_address.clone(), allocated_port.unwrap_or(*port)));
                 }
                 (
                     TcpipForwardRequestKind::TcpipForward,
@@ -1787,7 +1850,10 @@ where
         };
         if want_reply {
             let response = if accepted {
-                TcpipForwardResponse::Success
+                allocated_port.map_or(
+                    TcpipForwardResponse::Success,
+                    TcpipForwardResponse::AllocatedPort,
+                )
             } else {
                 TcpipForwardResponse::Failure
             };
@@ -1799,6 +1865,7 @@ where
             port,
             want_reply,
             accepted,
+            allocated_port,
         })
     }
 

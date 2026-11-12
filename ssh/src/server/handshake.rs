@@ -7,7 +7,7 @@ use std::sync::Arc;
 use neotales_ssh::{Error as WireError, build_packet};
 
 use crate::cipher::{PacketKeyMaterial, PacketProtectionError, PacketProtector, PacketSuite};
-use crate::hostkey::{Ed25519PublicKey, Ed25519Signer, HostKeyError};
+use crate::hostkey::{Ed25519PublicKey, Ed25519Signer, HostKeyError, HostSigner};
 use crate::kex::dh_group16::{Group16KexCompletion, Group16KexContext, Group16ServerKex};
 use crate::kex::mlkem768_x25519::ServerKex as MlKemServerKex;
 use crate::kex::{
@@ -16,11 +16,11 @@ use crate::kex::{
 };
 use crate::msg::kexinit::{
     AES128_CTR, AES128_GCM_OPENSSH, AES256_CTR, AES256_GCM_OPENSSH, COMPRESSION_NONE,
-    COMPRESSION_ZLIB_OPENSSH, CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256,
-    HMAC_SHA2_256, HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512, HMAC_SHA2_512_ETM_OPENSSH,
-    HOST_KEY_SSH_ED25519, KEX_DIFFIE_HELLMAN_GROUP16_SHA512, KEX_MLKEM768X25519_SHA256,
-    KEX_STRICT_S_V00_OPENSSH, KexInit, NegotiationError, SSH_MSG_KEXINIT,
-    SUPPORTED_HOST_KEY_ALGORITHMS, SUPPORTED_MAC_ALGORITHMS, kex_guess_matches,
+    CURVE25519_SHA256, CURVE25519_SHA256_LIBSSH, ECDH_SHA2_NISTP256, HMAC_SHA2_256,
+    HMAC_SHA2_256_ETM_OPENSSH, HMAC_SHA2_512, HMAC_SHA2_512_ETM_OPENSSH, HOST_KEY_SSH_ED25519,
+    KEX_DIFFIE_HELLMAN_GROUP16_SHA512, KEX_MLKEM768X25519_SHA256, KEX_STRICT_S_V00_OPENSSH,
+    KexInit, NegotiationError, SSH_MSG_KEXINIT, SUPPORTED_HOST_KEY_ALGORITHMS,
+    SUPPORTED_MAC_ALGORITHMS, kex_guess_matches,
 };
 use crate::sequence::{
     Direction, PacketDisposition, PacketObservation, RekeyPhase, SSH_MSG_KEX_METHOD_FIRST,
@@ -181,8 +181,9 @@ pub enum ServerTransportError {
     NotEstablished,
     /// A packet was received before the SSH-009 authentication state machine.
     ///
-    /// Only `SSH_MSG_SERVICE_REQUEST` and `SSH_MSG_USERAUTH_REQUEST` are
-    /// accepted by [`ServerTransport::read_auth_packet`].
+    /// Only service requests, userauth requests and method responses are
+    /// accepted by [`ServerTransport::read_auth_packet`]. The authenticator
+    /// requires an outstanding exchange before handling method responses.
     UnauthenticatedMessage,
     /// A post-establishment KEX proposal or exchange failed.
     Kex(KexError),
@@ -305,6 +306,7 @@ pub type ServerError = ServerTransportError;
 #[derive(Debug)]
 pub struct ServerConfig {
     signer: Arc<Ed25519Signer>,
+    additional_signers: Vec<Arc<HostSigner>>,
     server_version: String,
     kexinit: KexInit,
 }
@@ -315,6 +317,7 @@ impl ServerConfig {
     pub fn new(signer: Ed25519Signer) -> Self {
         Self {
             signer: Arc::new(signer),
+            additional_signers: Vec::new(),
             server_version: DEFAULT_SERVER_IDENTIFICATION.to_owned(),
             kexinit: supported_server_kexinit([0; 16]),
         }
@@ -330,6 +333,79 @@ impl ServerConfig {
     #[must_use]
     pub fn from_signer(signer: Ed25519Signer) -> Self {
         Self::new(signer)
+    }
+
+    /// Offers an Ed25519 host certificate for this configuration's primary key.
+    /// This parses and matches the subject, but clients decide CA/time trust.
+    ///
+    /// # Errors
+    /// Rejects other certificate algorithms/roles or a subject-key mismatch.
+    pub fn with_host_certificate(mut self, blob: &[u8]) -> Result<Self, HostKeyError> {
+        let certificate = neotales_ssh::cert::parse_certificate(blob)
+            .map_err(|_| HostKeyError::InvalidPublicKey)?;
+        if certificate.algorithm() != neotales_ssh::cert::SSH_ED25519_CERT_V01
+            || certificate.certificate_type() != neotales_ssh::cert::CertificateType::Host
+            || certificate.subject_public_key_blob() != self.signer.public_key_blob()?
+        {
+            return Err(HostKeyError::InvalidPublicKey);
+        }
+        self.additional_signers
+            .push(Arc::new(HostSigner::Certificate {
+                signer: Arc::clone(&self.signer),
+                blob: blob.to_vec(),
+            }));
+        self.kexinit
+            .server_host_key_algorithms
+            .insert(0, neotales_ssh::cert::SSH_ED25519_CERT_V01.to_owned());
+        Ok(self)
+    }
+
+    /// Adds an RSA host key and offers both RSA SHA-2 signature algorithms.
+    #[must_use]
+    pub fn with_rsa_host_key(mut self, signer: neotales_ssh::rsa_hostkey::RsaHostSigner) -> Self {
+        self.additional_signers
+            .push(Arc::new(HostSigner::Rsa(Box::new(signer))));
+        for algorithm in ["rsa-sha2-512", "rsa-sha2-256"] {
+            if !self
+                .kexinit
+                .server_host_key_algorithms
+                .iter()
+                .any(|name| name == algorithm)
+            {
+                self.kexinit
+                    .server_host_key_algorithms
+                    .push(algorithm.to_owned());
+            }
+        }
+        self
+    }
+
+    /// Adds a NIST P-256 ECDSA host key. Other ECDSA curves are not offered.
+    #[must_use]
+    pub fn with_ecdsa_host_key(mut self, signer: neotales_ssh::ecdsa_hostkey::EcdsaSigner) -> Self {
+        self.additional_signers
+            .push(Arc::new(HostSigner::Ecdsa(Box::new(signer))));
+        if !self
+            .kexinit
+            .server_host_key_algorithms
+            .iter()
+            .any(|name| name == "ecdsa-sha2-nistp256")
+        {
+            self.kexinit
+                .server_host_key_algorithms
+                .push("ecdsa-sha2-nistp256".to_owned());
+        }
+        self
+    }
+
+    fn select_signer(&self, algorithm: &str) -> Option<Arc<HostSigner>> {
+        if algorithm == HOST_KEY_SSH_ED25519 {
+            return Some(Arc::new(HostSigner::Ed25519(Arc::clone(&self.signer))));
+        }
+        self.additional_signers
+            .iter()
+            .find(|signer| signer.supports(algorithm))
+            .cloned()
     }
 
     /// Replaces the server identification software string.
@@ -351,9 +427,10 @@ impl ServerConfig {
 
     /// Replaces the server KEXINIT proposal while retaining the caller's cookie.
     ///
-    /// Unsupported selected algorithms and invalid reserved fields are rejected
-    /// when a connection starts rather than removed from the transcript. The
-    /// server never advertises a guessed first KEX packet.
+    /// Host-key names are intersected with configured signers before the
+    /// proposal is sent. Other unsupported selected algorithms and invalid
+    /// reserved fields are rejected. The server never advertises a guessed
+    /// first KEX packet.
     #[must_use]
     pub fn with_kexinit(mut self, kexinit: KexInit) -> Self {
         self.kexinit = kexinit;
@@ -378,7 +455,8 @@ impl ServerConfig {
         &self.kexinit
     }
 
-    /// Returns the configured host key's public point.
+    /// Returns the primary Ed25519 public point. Additional negotiated host
+    /// keys do not change this compatibility accessor.
     #[must_use]
     pub fn host_key(&self) -> &Ed25519PublicKey {
         self.signer.public_key()
@@ -470,6 +548,8 @@ pub struct ServerHandshake<'a, S> {
     server_kex: Option<ServerKex<BoxedKeyExchange>>,
     group16_server_kex: Option<Group16ServerKex>,
     group16_completion: Option<Group16KexCompletion>,
+    modern: Option<crate::kex::modern::Server>,
+    modern_hash: Option<Vec<u8>>,
     mlkem_server_kex: Option<MlKemServerKex>,
     mlkem_completion: Option<crate::kex::mlkem768_x25519::HybridCompletion>,
     negotiated_algorithm: Option<String>,
@@ -478,6 +558,8 @@ pub struct ServerHandshake<'a, S> {
     read_protector: Option<PacketProtector>,
     write_protector: Option<PacketProtector>,
     completion: Option<KexCompletion>,
+    selected_signer: Option<Arc<HostSigner>>,
+    host_algorithm: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -515,6 +597,9 @@ where
         let client_version = read_peer_identification(&mut stream)?;
         write_identification(&mut stream, &config.server_version)?;
         let mut server_kexinit = config.kexinit.clone();
+        server_kexinit
+            .server_host_key_algorithms
+            .retain(|algorithm| config.select_signer(algorithm).is_some());
         getrandom::fill(&mut server_kexinit.cookie)
             .map_err(|_error| HandshakeError::EntropyFailure)?;
         let server_kexinit_payload = server_kexinit.encode()?;
@@ -538,6 +623,10 @@ where
             read_protector: None,
             write_protector: None,
             completion: None,
+            modern: None,
+            modern_hash: None,
+            selected_signer: None,
+            host_algorithm: String::new(),
         };
         handshake.write_plain_packet(&server_kexinit_payload, SSH_MSG_KEXINIT)?;
         Ok(handshake)
@@ -604,7 +693,9 @@ where
         if !self.is_complete() {
             return Err(HandshakeError::InvalidConfiguration);
         }
-        let session_id = if let Some(completion) = self.group16_completion.as_ref() {
+        let session_id = if let Some(hash) = self.modern_hash.as_ref() {
+            hash.clone()
+        } else if let Some(completion) = self.group16_completion.as_ref() {
             completion.exchange_hash().to_vec()
         } else if let Some(completion) = self.mlkem_completion.as_ref() {
             completion.session_id.to_vec()
@@ -621,15 +712,19 @@ where
         let write_protector = self
             .write_protector
             .ok_or(HandshakeError::InvalidConfiguration)?;
-        let signer = Arc::clone(&self.config.signer);
+        let signer = self
+            .selected_signer
+            .ok_or(HandshakeError::InvalidConfiguration)?;
         let host_key_blob = signer.public_key_blob()?;
-        let host_key = *signer.public_key();
+        let host_key = *self.config.signer.public_key();
         let client_version = self.client_version;
         let server_version = self.config.server_version.clone();
-        let rekey_proposal = self.config.kexinit.clone();
+        let mut rekey_proposal = self.config.kexinit.clone();
+        rekey_proposal.server_host_key_algorithms = vec![self.host_algorithm.clone()];
         let initial_algorithm = self
             .negotiated_algorithm
             .ok_or(HandshakeError::InvalidConfiguration)?;
+        let initial_outbound_sequence = self.sequence.outbound_sequence();
         Ok(ServerTransport {
             stream: self.stream,
             sequence: self.sequence,
@@ -637,6 +732,19 @@ where
             client_version,
             server_version,
             signer,
+            host_algorithm: self.host_algorithm,
+            ext_info: if self.client_kexinit.as_ref().is_some_and(|proposal| {
+                proposal
+                    .kex_algorithms
+                    .iter()
+                    .any(|name| name == "ext-info-c")
+            }) {
+                crate::transport::ExtensionState::Awaiting
+            } else {
+                crate::transport::ExtensionState::Disabled
+            },
+            pending_transport_reply: None,
+            initial_outbound_sequence,
             host_key,
             host_key_blob,
             initial_algorithm,
@@ -669,8 +777,27 @@ where
         self.client_guess_is_correct = client_guess_is_correct;
         let strict_kex = client_kexinit.strict_kex_enabled(&self.server_kexinit);
         self.sequence.set_strict_kex(strict_kex)?;
-        let host_key_blob = self.config.signer.public_key_blob()?;
-        if algorithms.kex == KEX_DIFFIE_HELLMAN_GROUP16_SHA512 {
+        self.host_algorithm.clone_from(&algorithms.host_key);
+        self.selected_signer = self.config.select_signer(&algorithms.host_key);
+        let host_key_blob = self
+            .selected_signer
+            .as_ref()
+            .ok_or(HandshakeError::UnsupportedAlgorithm)?
+            .public_key_blob()?;
+        if crate::kex::modern::supported(&algorithms.kex) {
+            let context = crate::kex::modern::Context::new(
+                &self.client_version,
+                &self.config.server_version,
+                &payload,
+                &self.server_kexinit_payload,
+                &algorithms.kex,
+            )?;
+            self.modern = Some(crate::kex::modern::Server::new(
+                context,
+                &host_key_blob,
+                client_kexinit.first_kex_packet_follows && !client_guess_is_correct,
+            ));
+        } else if algorithms.kex == KEX_DIFFIE_HELLMAN_GROUP16_SHA512 {
             let context = Group16KexContext::new(
                 &self.client_version,
                 &self.config.server_version,
@@ -703,6 +830,9 @@ where
         self.sequence
             .observe_kexinit(Direction::Inbound, client_kexinit.first_kex_packet_follows)?;
         self.sequence.commit_inbound()?;
+        if algorithms.kex == crate::kex::modern::GEX {
+            self.sequence.configure_group_exchange()?;
+        }
         self.client_kexinit = Some(client_kexinit);
         self.protection = Some(protection);
         self.phase = ServerHandshakePhase::ClientKex;
@@ -711,6 +841,9 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn accept_client_kex(&mut self) -> Result<(), HandshakeError> {
+        if self.modern.is_some() {
+            return self.accept_modern_kex();
+        }
         let guessed = self
             .client_kexinit
             .as_ref()
@@ -736,9 +869,10 @@ where
                 self.sequence.commit_inbound()?;
                 let prepared = server_kex.prepare_exchange()?.clone();
                 let signature = self
-                    .config
-                    .signer
-                    .sign_exchange_hash(prepared.exchange_hash())?;
+                    .selected_signer
+                    .as_ref()
+                    .ok_or(HandshakeError::InvalidConfiguration)?
+                    .sign(prepared.exchange_hash(), &self.host_algorithm)?;
                 let reply = server_kex.reply_message(&signature)?;
                 let completion = server_kex
                     .completion()
@@ -796,9 +930,10 @@ where
                 prepared
             };
             let signature = self
-                .config
-                .signer
-                .sign_exchange_hash(prepared.exchange_hash())?;
+                .selected_signer
+                .as_ref()
+                .ok_or(HandshakeError::InvalidConfiguration)?
+                .sign(prepared.exchange_hash(), &self.host_algorithm)?;
             let reply = prepared.reply_message(&signature)?;
             self.write_plain_packet(&reply, SSH_MSG_KEX_ECDH_REPLY)?;
             let protection = self
@@ -854,9 +989,10 @@ where
 
         let completion = server_kex.prepare_exchange()?.clone();
         let signature = self
-            .config
-            .signer
-            .sign_exchange_hash(completion.exchange_hash())?;
+            .selected_signer
+            .as_ref()
+            .ok_or(HandshakeError::InvalidConfiguration)?
+            .sign(completion.exchange_hash(), &self.host_algorithm)?;
         let reply = server_kex.reply_message(&signature)?;
         self.write_plain_packet(&reply, SSH_MSG_KEX_ECDH_REPLY)?;
 
@@ -895,6 +1031,82 @@ where
         self.completion = Some(completion);
         self.phase = ServerHandshakePhase::ClientNewKeys;
         Ok(())
+    }
+
+    fn accept_modern_kex(&mut self) -> Result<(), HandshakeError> {
+        use crate::kex::modern::{self, ServerStep};
+        if self
+            .modern
+            .as_ref()
+            .is_some_and(|state| state.discard_guess)
+        {
+            self.read_handshake_packet(true)?;
+            self.modern
+                .as_mut()
+                .ok_or(HandshakeError::InvalidConfiguration)?
+                .discard_guess = false;
+        }
+        let payload = self.read_handshake_packet(false)?;
+        let step = self
+            .modern
+            .as_mut()
+            .ok_or(HandshakeError::InvalidConfiguration)?
+            .accept(&payload)?;
+        self.sequence.observe_inbound(payload[0])?;
+        self.sequence.commit_inbound()?;
+        match step {
+            ServerStep::Group(group) => self.write_plain_packet(&group, 31),
+            ServerStep::Ready(prepared) => {
+                let signature = self
+                    .selected_signer
+                    .as_ref()
+                    .ok_or(HandshakeError::InvalidConfiguration)?
+                    .sign(&prepared.completion.hash, &self.host_algorithm)?;
+                let reply = prepared.reply(&signature)?;
+                self.write_plain_packet(&reply, reply[0])?;
+                let protection = self
+                    .protection
+                    .ok_or(HandshakeError::InvalidConfiguration)?;
+                let algorithm = self
+                    .negotiated_algorithm
+                    .as_deref()
+                    .ok_or(HandshakeError::InvalidConfiguration)?;
+                let completion = prepared.completion;
+                let derived = modern::derive(
+                    algorithm,
+                    &completion.shared,
+                    &completion.hash,
+                    &completion.hash,
+                    protection.lengths,
+                )?;
+                let read = PacketProtector::new_with_compression(
+                    protection.read_suite,
+                    material_for(
+                        protection.read_suite,
+                        &derived.iv_client_to_server,
+                        &derived.encryption_key_client_to_server,
+                        Some(&derived.integrity_key_client_to_server),
+                    )?,
+                    protection.read_compression,
+                )?;
+                let write = PacketProtector::new_with_compression(
+                    protection.write_suite,
+                    material_for(
+                        protection.write_suite,
+                        &derived.iv_server_to_client,
+                        &derived.encryption_key_server_to_client,
+                        Some(&derived.integrity_key_server_to_client),
+                    )?,
+                    protection.write_compression,
+                )?;
+                self.write_plain_packet(&[SSH_MSG_NEWKEYS], SSH_MSG_NEWKEYS)?;
+                self.read_protector = Some(read);
+                self.write_protector = Some(write);
+                self.modern_hash = Some(completion.hash);
+                self.phase = ServerHandshakePhase::ClientNewKeys;
+                Ok(())
+            }
+        }
     }
 
     fn accept_client_newkeys(&mut self) -> Result<(), HandshakeError> {
@@ -979,14 +1191,21 @@ where
 /// rekey API with [`Self::begin_rekey`], while peer KEXINIT packets are
 /// consumed by [`Self::read_auth_packet`] and [`Self::read_payload`] before
 /// application dispatch.
+/// An integrity or unrecoverable protected-framing failure discards both key
+/// contexts and pending packets. Subsequent reads and writes fail without
+/// touching the stream. Short reads and `WouldBlock` preserve resumable state.
 pub struct ServerTransport<S> {
     stream: S,
     sequence: SequenceState,
     session_id: Vec<u8>,
     client_version: String,
     server_version: String,
-    signer: Arc<Ed25519Signer>,
+    signer: Arc<HostSigner>,
+    host_algorithm: String,
     host_key: Ed25519PublicKey,
+    ext_info: crate::transport::ExtensionState,
+    initial_outbound_sequence: u32,
+    pending_transport_reply: Option<Vec<u8>>,
     host_key_blob: Vec<u8>,
     initial_algorithm: String,
     rekey_proposal: KexInit,
@@ -1039,10 +1258,59 @@ where
         &self.session_id
     }
 
-    /// Returns the configured and cryptographically used host public key.
+    /// Returns the primary Ed25519 key for compatibility, not necessarily the
+    /// negotiated key. Use [`Self::host_key_blob`] for the selected key.
     #[must_use]
     pub const fn host_key(&self) -> &Ed25519PublicKey {
         &self.host_key
+    }
+
+    /// Returns the exact negotiated host public key blob.
+    #[must_use]
+    pub fn host_key_blob(&self) -> &[u8] {
+        &self.host_key_blob
+    }
+
+    /// Returns the selected host-key signature algorithm.
+    #[must_use]
+    pub fn host_key_algorithm(&self) -> &str {
+        &self.host_algorithm
+    }
+
+    pub(crate) fn send_signature_algorithms(
+        &mut self,
+        algorithms: &[&str],
+    ) -> Result<(), ServerTransportError> {
+        if !matches!(self.ext_info, crate::transport::ExtensionState::Awaiting) {
+            return Ok(());
+        }
+        // Authentication policy is available here, before the first server
+        // authentication reply. Never inject EXT_INFO after other replies.
+        if self.outbound_sequence() != self.initial_outbound_sequence {
+            return Ok(());
+        }
+        let extension = neotales_ssh::ext_info::Extension::from_server_sig_algs(algorithms)
+            .map_err(TransportError::from)?;
+        let payload = neotales_ssh::ext_info::ExtInfo::new(vec![extension])
+            .and_then(|info| info.encode())
+            .map_err(TransportError::from)?;
+        self.write_payload(&payload)?;
+        self.ext_info = crate::transport::ExtensionState::Complete;
+        Ok(())
+    }
+
+    /// Sends an OpenSSH transport ping without starting a timer.
+    ///
+    /// # Errors
+    /// Returns a payload bound, transport, or protection error.
+    pub fn send_ping(&mut self, payload: &[u8]) -> Result<(), ServerTransportError> {
+        if payload.len() > neotales_ssh::MAX_PACKET_CONTENT - 5 {
+            return Err(TransportError::Wire(neotales_ssh::Error::LimitExceeded).into());
+        }
+        let packet = neotales_ssh::keepalive::TransportPing::Ping(payload.to_vec())
+            .encode()
+            .map_err(TransportError::from)?;
+        self.write_payload(&packet)
     }
 
     /// Returns whether protected packet exchange is available.
@@ -1258,7 +1526,7 @@ where
     /// Reads one protected authentication-boundary packet.
     ///
     /// The only application message numbers returned before authentication are
-    /// `SSH_MSG_SERVICE_REQUEST` (5) and `SSH_MSG_USERAUTH_REQUEST` (50). A
+    /// service request (5), userauth request (50), or method response (61/63/66). A
     /// peer KEXINIT and the complete rekey exchange are consumed internally
     /// before either authentication or channel dispatch can observe a packet.
     ///
@@ -1486,6 +1754,14 @@ where
             return Err(ServerTransportError::NotEstablished);
         }
         loop {
+            if let Some(reply) = self.pending_transport_reply.take()
+                && let Err(error) = self.write_payload(&reply)
+            {
+                if self.established {
+                    self.pending_transport_reply = Some(reply);
+                }
+                return Err(error);
+            }
             if self.rekey.is_some() {
                 match self.resume_pending_rekey_write() {
                     Ok(true) => continue,
@@ -1510,6 +1786,33 @@ where
                     error
                 });
             };
+            if self.rekey.is_none() && message_type == neotales_ssh::keepalive::SSH_MSG_PING {
+                let ping = match neotales_ssh::keepalive::TransportPing::decode(&payload) {
+                    Ok(ping) => ping,
+                    Err(error) => {
+                        return Err(self.fail_protected_write(TransportError::Wire(error).into()));
+                    }
+                };
+                let neotales_ssh::keepalive::TransportPing::Ping(data) = ping else {
+                    return Err(self.fail_protected_write(TransportError::InvalidMessage.into()));
+                };
+                self.sequence.commit_inbound()?;
+                if self.authenticated {
+                    self.pending_transport_reply = Some(
+                        neotales_ssh::keepalive::TransportPing::Pong(data)
+                            .encode()
+                            .map_err(TransportError::from)?,
+                    );
+                }
+                continue;
+            }
+            if self.rekey.is_none() && message_type == neotales_ssh::keepalive::SSH_MSG_PONG {
+                if let Err(error) = neotales_ssh::keepalive::TransportPing::decode(&payload) {
+                    return Err(self.fail_protected_write(TransportError::Wire(error).into()));
+                }
+                self.sequence.commit_inbound()?;
+                return Ok(payload);
+            }
             if message_type == SSH_MSG_KEXINIT {
                 match self.accept_rekey_kexinit(&payload) {
                     Ok(()) => {}
@@ -1531,12 +1834,7 @@ where
             {
                 return Err(self.fail_rekey_closed(TransportError::UnexpectedMessage.into()));
             }
-            if !allow_application
-                && !matches!(
-                    message_type,
-                    SSH_MSG_SERVICE_REQUEST | SSH_MSG_USERAUTH_REQUEST
-                )
-            {
+            if !allow_application && !is_authentication_message(message_type) {
                 self.established = false;
                 let _ = self.sequence.fail_rekey();
                 return Err(ServerTransportError::UnauthenticatedMessage);
@@ -1708,7 +2006,9 @@ where
             &self.session_id,
             protection.lengths,
         )?;
-        let signature = self.signer.sign_exchange_hash(prepared.exchange_hash())?;
+        let signature = self
+            .signer
+            .sign(prepared.exchange_hash(), &self.host_algorithm)?;
         let reply = prepared.reply_message(&signature)?;
         self.observe_inbound_rekey_method(peer_guessed)?;
         self.sequence.commit_inbound()?;
@@ -1955,12 +2255,27 @@ where
         if sequence == u32::MAX {
             return Err(SequenceError::CounterExhausted.into());
         }
-        read_protected_packet_buffered(&mut self.stream, &mut self.read_buffer, protector, sequence)
-            .map_err(ServerTransportError::from)
+        match read_protected_packet_buffered(
+            &mut self.stream,
+            &mut self.read_buffer,
+            protector,
+            sequence,
+        ) {
+            Ok(payload) => Ok(payload),
+            Err(error) if matches!(error, TransportError::Io(_) | TransportError::Truncated) => {
+                Err(error.into())
+            }
+            Err(error) => Err(self.fail_protected_write(error.into())),
+        }
     }
 
     fn fail_protected_write(&mut self, error: ServerTransportError) -> ServerTransportError {
+        self.pending_transport_reply = None;
         self.write_buffer.abort();
+        self.read_buffer.clear();
+        self.read_protector = None;
+        self.write_protector = None;
+        self.rekey = None;
         self.established = false;
         error
     }
@@ -2036,6 +2351,11 @@ impl ProtectionPlan {
         if !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&algorithms.host_key.as_str()) {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
+        if algorithms.compression_client_to_server != COMPRESSION_NONE
+            || algorithms.compression_server_to_client != COMPRESSION_NONE
+        {
+            return Err(HandshakeError::UnsupportedAlgorithm);
+        }
         let read_compression =
             CompressionAlgorithm::from_name(&algorithms.compression_client_to_server)
                 .ok_or(HandshakeError::UnsupportedAlgorithm)?;
@@ -2075,6 +2395,17 @@ impl ProtectionPlan {
     }
 }
 
+fn is_authentication_message(message: u8) -> bool {
+    matches!(
+        message,
+        SSH_MSG_SERVICE_REQUEST
+            | SSH_MSG_USERAUTH_REQUEST
+            | neotales_ssh::auth::SSH_MSG_USERAUTH_INFO_RESPONSE
+            | neotales_ssh::gssapi::SSH_MSG_USERAUTH_GSSAPI_EXCHANGE_COMPLETE
+            | neotales_ssh::gssapi::SSH_MSG_USERAUTH_GSSAPI_MIC
+    )
+}
+
 fn supported_server_kexinit(cookie: [u8; 16]) -> KexInit {
     KexInit::from_lists(
         cookie,
@@ -2084,6 +2415,9 @@ fn supported_server_kexinit(cookie: [u8; 16]) -> KexInit {
             CURVE25519_SHA256_LIBSSH.to_owned(),
             ECDH_SHA2_NISTP256.to_owned(),
             KEX_DIFFIE_HELLMAN_GROUP16_SHA512.to_owned(),
+            crate::kex::modern::P384.to_owned(),
+            crate::kex::modern::P521.to_owned(),
+            crate::kex::modern::GEX.to_owned(),
             KEX_STRICT_S_V00_OPENSSH.to_owned(),
         ],
         vec![HOST_KEY_SSH_ED25519.to_owned()],
@@ -2113,14 +2447,8 @@ fn supported_server_kexinit(cookie: [u8; 16]) -> KexInit {
             HMAC_SHA2_256_ETM_OPENSSH.to_owned(),
             HMAC_SHA2_512_ETM_OPENSSH.to_owned(),
         ],
-        vec![
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned(),
-        ],
-        vec![
-            COMPRESSION_NONE.to_owned(),
-            COMPRESSION_ZLIB_OPENSSH.to_owned(),
-        ],
+        vec![COMPRESSION_NONE.to_owned()],
+        vec![COMPRESSION_NONE.to_owned()],
         Vec::new(),
         Vec::new(),
         false,
