@@ -299,7 +299,18 @@ pub mod mldsa_hostkey;
 pub mod openssh_key;
 pub mod private_key;
 pub mod proxy;
-pub mod recipes;
+#[path = "recipes.rs"]
+mod recipes_impl;
+pub use recipes_impl::{ClientError, SessionStream, SshClient, SshSession};
+
+/// Deprecated compatibility exports; use [`SshClient`] for common client operations.
+#[deprecated(note = "use SshClient for common client operations")]
+pub mod recipes {
+    pub use crate::recipes_impl::{
+        ClientError, SessionStream, SshClient as Client, copy_down, copy_up, jump, run_command,
+        run_script, serve, sftp_session,
+    };
+}
 #[allow(clippy::missing_errors_doc)]
 pub mod rsa_hostkey;
 pub mod scp;

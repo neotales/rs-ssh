@@ -18,20 +18,20 @@ use crate::{
 
 /// An authenticated connection for sequential common-case operations.
 /// No background reader is started; operations may block on the peer.
-pub struct Client<T: ChannelTransport = crate::ClientTransport<TcpStream>> {
+pub struct SshClient<T: ChannelTransport = crate::ClientTransport<TcpStream>> {
     sessions: ClientSessions<T>,
 }
 
-impl<T: ChannelTransport> std::fmt::Debug for Client<T> {
+impl<T: ChannelTransport> std::fmt::Debug for SshClient<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Client").finish_non_exhaustive()
+        formatter.debug_struct("SshClient").finish_non_exhaustive()
     }
 }
 
 /// Error returned by the convenience client.
 pub type ClientError = Box<dyn std::error::Error>;
 
-impl Client<crate::ClientTransport<TcpStream>> {
+impl SshClient<crate::ClientTransport<TcpStream>> {
     /// Dials and authenticates with a required SSH-format Ed25519 key blob.
     /// `None` selects port 22. No configuration or credentials are loaded.
     /// The pin is checked only after the server signature has been verified.
@@ -63,43 +63,26 @@ impl Client<crate::ClientTransport<TcpStream>> {
     }
 }
 
-impl<T: ChannelTransport> Client<T> {
-    /// Executes exact command bytes, discarding stderr, and returns stdout and status.
-    /// Output is buffered without a size limit. Repeating runs the command again.
+impl<T: ChannelTransport> SshClient<T> {
+    /// Opens a session channel borrowing this connection.
+    ///
+    /// # Errors
+    /// Returns session or transport errors.
+    pub fn session(&mut self) -> Result<SshSession<'_, T>, SessionError> {
+        let session = open_session(&mut self.sessions)?;
+        Ok(SshSession {
+            sessions: &mut self.sessions,
+            session,
+            closed: false,
+        })
+    }
+
+    /// Executes command bytes, discarding stderr, and returns buffered stdout and status.
     ///
     /// # Errors
     /// Returns session, request or transport errors.
     pub fn exec(&mut self, command: &[u8]) -> Result<(Vec<u8>, u32), SessionError> {
-        let session = open_session(&mut self.sessions)?;
-        self.sessions.request_exec(session, command, true)?;
-        let mut output = Vec::new();
-        let status = loop {
-            match self.sessions.dispatch_one()? {
-                SessionEvent::Data { session: id, data } if id == session => {
-                    return_credit(&mut self.sessions, session, data.len())?;
-                    output.extend(data);
-                }
-                SessionEvent::ExtendedData {
-                    session: id, data, ..
-                } if id == session => {
-                    return_credit(&mut self.sessions, session, data.len())?;
-                }
-                SessionEvent::ExitStatus {
-                    session: id,
-                    status,
-                } if id == session => break status,
-                SessionEvent::RequestSucceeded { session: id }
-                | SessionEvent::WindowAdjusted { session: id, .. }
-                | SessionEvent::Eof { session: id }
-                    if id == session => {}
-                SessionEvent::RequestFailed { session: id } if id == session => {
-                    return Err(SessionError::RequestRejected);
-                }
-                _ => return Err(SessionError::UnexpectedMessage),
-            }
-        };
-        close_session(&mut self.sessions, session)?;
-        Ok((output, status))
+        self.session()?.exec(command)
     }
 
     /// Executes the exact script bytes without selecting an interpreter.
@@ -159,6 +142,68 @@ impl<T: ChannelTransport> Client<T> {
             &mut self.sessions,
             session,
         ))?)
+    }
+}
+
+/// A single session channel borrowing an authenticated client.
+/// Dropping an unused session closes it and may block on the peer.
+pub struct SshSession<'a, T: ChannelTransport = crate::ClientTransport<TcpStream>> {
+    sessions: &'a mut ClientSessions<T>,
+    session: ChannelId,
+    closed: bool,
+}
+
+impl<T: ChannelTransport> std::fmt::Debug for SshSession<'_, T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SshSession").finish_non_exhaustive()
+    }
+}
+
+impl<T: ChannelTransport> SshSession<'_, T> {
+    /// Executes one command and closes the session, returning stdout and status.
+    ///
+    /// # Errors
+    /// Returns session, request or transport errors.
+    pub fn exec(mut self, command: &[u8]) -> Result<(Vec<u8>, u32), SessionError> {
+        let session = self.session;
+        self.sessions.request_exec(session, command, true)?;
+        let mut output = Vec::new();
+        let status = loop {
+            match self.sessions.dispatch_one()? {
+                SessionEvent::Data { session: id, data } if id == session => {
+                    return_credit(self.sessions, session, data.len())?;
+                    output.extend(data);
+                }
+                SessionEvent::ExtendedData {
+                    session: id, data, ..
+                } if id == session => {
+                    return_credit(self.sessions, session, data.len())?;
+                }
+                SessionEvent::ExitStatus {
+                    session: id,
+                    status,
+                } if id == session => break status,
+                SessionEvent::RequestSucceeded { session: id }
+                | SessionEvent::WindowAdjusted { session: id, .. }
+                | SessionEvent::Eof { session: id }
+                    if id == session => {}
+                SessionEvent::RequestFailed { session: id } if id == session => {
+                    return Err(SessionError::RequestRejected);
+                }
+                _ => return Err(SessionError::UnexpectedMessage),
+            }
+        };
+        self.closed = true;
+        close_session(self.sessions, session)?;
+        Ok((output, status))
+    }
+}
+
+impl<T: ChannelTransport> Drop for SshSession<'_, T> {
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = close_session(self.sessions, self.session);
+        }
     }
 }
 
@@ -531,7 +576,7 @@ mod tests {
 
     #[test]
     fn owned_client_rejects_empty_auth_before_dial() {
-        assert!(Client::open("invalid.invalid", None, "user", &[], b"").is_err());
+        assert!(SshClient::open("invalid.invalid", None, "user", &[], b"").is_err());
     }
 
     // Public-contract fixtures: scripted protocol peers avoid a network/server.
@@ -580,6 +625,26 @@ mod tests {
         })
     }
 
+    #[test]
+    fn client_and_session_exec_close_the_channel() -> Result<(), Box<dyn std::error::Error>> {
+        for explicit_session in [false, true] {
+            let mut peer = peer()?;
+            peer.incoming.push_back(vec![97, 0, 0, 0, 0]);
+            let mut client = SshClient {
+                sessions: ClientSessions::new(peer),
+            };
+            let result = if explicit_session {
+                client.session()?.exec(b"hello")?
+            } else {
+                client.exec(b"hello")?
+            };
+            assert_eq!(result, (b"hello\0".to_vec(), 23));
+            let peer = client.sessions.into_inner();
+            assert_eq!(peer.outgoing.last(), Some(&vec![97, 0, 0, 0, 42]));
+        }
+        Ok(())
+    }
+
     // A full authenticated SSH peer is an unreasonable fixture for this adapter.
     #[test]
     fn owned_client_scp_round_trip_over_scripted_channels() -> Result<(), Box<dyn std::error::Error>>
@@ -596,7 +661,7 @@ mod tests {
             Ok(peer)
         }
         let counts = RefCell::new(Vec::new());
-        let mut upload = Client {
+        let mut upload = SshClient {
             sessions: ClientSessions::new(scripted(&[0, 0, 0])?),
         };
         upload.upload("file", b"abc", |n| counts.borrow_mut().push(n))?;
@@ -607,7 +672,7 @@ mod tests {
                 .any(|part| part == b"C0644 3 file\n")
         );
         assert!(wire.windows(3).any(|part| part == b"abc"));
-        let mut download = Client {
+        let mut download = SshClient {
             sessions: ClientSessions::new(scripted(b"C0644 3 file\nabc\0")?),
         };
         assert_eq!(

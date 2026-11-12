@@ -1,6 +1,6 @@
 # neotales-ssh
 
-SSH-2 building blocks meant to be forked and patched. `recipes` covers common
+SSH-2 building blocks meant to be forked and patched. `SshClient` covers common
 paths; every low-level API and policy hook remains public. Helpers do not read
 `~/.ssh`, execute local commands, or accept a host key by default.
 
@@ -15,9 +15,9 @@ lower level when needed.
 ## Command
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, recipes::Client};
+use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
     let (stdout, status) = client.exec(b"printf hello")?;
     assert_eq!((stdout.as_slice(), status), (b"hello".as_slice(), 0));
     Ok(())
@@ -27,9 +27,9 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 ## Script
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, recipes::Client};
+use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
     let (stdout, status) = client.script(b"printf one\nprintf two\n")?;
     assert_eq!((stdout.as_slice(), status), (b"onetwo".as_slice(), 0));
     Ok(())
@@ -39,9 +39,9 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 ## Upload
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, recipes::Client};
+use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
     client.upload("report.txt", b"report", |bytes| println!("uploaded {bytes}"))?;
     Ok(())
 }
@@ -50,9 +50,9 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 ## Download
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, recipes::Client};
+use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
     let bytes = client.download("report.txt", |bytes| println!("downloaded {bytes}"))?;
     assert_eq!(bytes, b"report");
     Ok(())
@@ -62,9 +62,9 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 ## SFTP
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, recipes::Client};
+use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
     let mut sftp = client.sftp()?;
     let handle = sftp.open("report.txt", neotales_ssh::sftp::SSH_FXF_READ | neotales_ssh::sftp::SSH_FXF_WRITE | neotales_ssh::sftp::SSH_FXF_CREAT)?;
     sftp.write(&handle, 0, b"report")?;
@@ -81,31 +81,10 @@ remain available through the low-level `ClientConfig` APIs.
 
 ## One extra hop
 
-`recipes::jump` wraps `proxy::connect`, requiring exactly one `ProxyJump` entry.
-The trust callback is cloned per hop, including the destination. Supply explicit
-authentication for both. No `ProxyCommand` is accepted or executed by this helper.
-
-```rust,no_run
-use neotales_ssh::{ClientConfig, ClientAuthMethod, hostkey::Ed25519PublicKey, recipes};
-use neotales_ssh::proxy::{ProxyClient, ProxyTarget};
-use std::net::TcpStream;
-
-fn through_jump(pins: Vec<Ed25519PublicKey>, methods: &[ClientAuthMethod],
-    hop_methods: Vec<ClientAuthMethod>) -> Result<ProxyClient<'static>, Box<dyn std::error::Error>>
-{
-    let target = ProxyTarget::new("destination.example", 22, "user", None, None);
-    let mut hop_methods = Some(hop_methods);
-    Ok(recipes::jump(&ClientConfig::new(), &target, "user@jump.example:22", methods,
-        |host, port| TcpStream::connect((host, port)),
-        move |_| hop_methods.take(),
-        move |key| if pins.contains(key) { Ok(()) } else { Err("host key mismatch") },
-    )?)
-}
-```
-
-The lower-level `proxy::connect` also supports multiple hops and an explicit
-caller-supplied `ProxyCommand` byte-stream opener. It does not execute a command
-implicitly. `spawn_proxy_command` is a separate, explicit process-launch hook.
+Use `proxy::connect` for explicit proxy routes and trust callbacks. It supports
+multiple hops and a caller-supplied `ProxyCommand` byte-stream opener; it does
+not execute a command implicitly. `spawn_proxy_command` is a separate,
+explicit process-launch hook.
 
 ## Local and reverse TCP tunnels
 
@@ -142,12 +121,12 @@ local-forward metadata and policy.
 
 ## Server
 
-`recipes::serve` is `ServerConfig::connect` plus
+Combine `ServerConfig::connect` with
 `ServerSessions::with_policy`. Policy is required; no shell, child process or
 `sshd` starts. User authentication remains explicit before channel dispatch.
 
 ```rust,no_run
-use neotales_ssh::{ServerConfig, ServerAuthPolicy, authenticate_server, recipes};
+use neotales_ssh::{ServerConfig, ServerAuthPolicy, ServerSessions, authenticate_server};
 use neotales_ssh::hostkey::Ed25519Signer;
 use neotales_ssh::session::SessionDecision;
 use std::net::TcpListener;
@@ -158,9 +137,9 @@ fn server(signer: Ed25519Signer, auth_policy: &ServerAuthPolicy)
     let listener = TcpListener::bind(("127.0.0.1", 2222))?;
     let (stream, _) = listener.accept()?;
     let config = ServerConfig::new(signer);
-    let mut sessions = recipes::serve(&config, stream, |_request| {
+    let mut sessions = ServerSessions::with_policy(config.connect(stream)?, |_request| {
         SessionDecision::reject() // Replace with application policy, never a host shell.
-    })?;
+    });
     authenticate_server(sessions.connection_mut().transport_mut(), auth_policy)?;
     let event = sessions.dispatch_one()?;
     // Application interprets events and sends data/status/EOF/CLOSE explicitly.
@@ -184,7 +163,7 @@ there is no USB/device access.
 
 ## Fork, patch, verify
 
-Start at `src/recipes.rs` for orchestration, `session.rs` / `channel.rs` for
+Start at `SshClient` for orchestration, `session.rs` / `channel.rs` for
 dispatch, `client/` and `server/` for handshakes, `auth.rs` for authentication,
 and `scp.rs` / `sftp.rs` for transfer codecs. Keep low-level hooks public and
 test trust and wire behavior, not only paired codec round-trips. See
