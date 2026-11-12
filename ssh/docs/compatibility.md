@@ -186,10 +186,16 @@ claimed by these in-process tests.
 
 ## Not verified or not claimed
 
-- Default proposals offer only `none` compression. Both handshakes reject an
-  explicit zlib selection until the continuous, delayed-authentication
-  lifecycle is implemented. The standalone zlib primitives are not an SSH
-  streaming implementation.
+- Default proposals, including both handshake builders, offer only `none`.
+  `ClientConfig::with_delayed_compression` and
+  `ServerConfig::with_delayed_compression` explicitly offer and permit
+  `zlib@openssh.com`. Merely overriding KEXINIT does not opt in. Authentication
+  packets, including USERAUTH_SUCCESS, remain uncompressed; subsequent packets
+  use one continuous zlib context per direction, reset at that direction's
+  NEWKEYS boundary. Legacy immediate `zlib` remains unsupported, even with opt-in.
+  The standalone `compress_payload` / `decompress_payload` helpers handle finished
+  streams, not SSH packet streams. Live OpenSSH compression interoperability is
+  not verified here.
 
 - **Reverse interoperability is not verified.** There is no current live test
   demonstrating a system OpenSSH client connecting to this crate's server.

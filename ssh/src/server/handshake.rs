@@ -305,6 +305,7 @@ pub type ServerError = ServerTransportError;
 /// baseline SSH-008 transport and uses a fresh KEXINIT cookie per connection.
 #[derive(Debug)]
 pub struct ServerConfig {
+    delayed_compression: bool,
     signer: Arc<Ed25519Signer>,
     additional_signers: Vec<Arc<HostSigner>>,
     server_version: String,
@@ -317,10 +318,23 @@ impl ServerConfig {
     pub fn new(signer: Ed25519Signer) -> Self {
         Self {
             signer: Arc::new(signer),
+            delayed_compression: false,
             additional_signers: Vec::new(),
             server_version: DEFAULT_SERVER_IDENTIFICATION.to_owned(),
             kexinit: supported_server_kexinit([0; 16]),
         }
+    }
+
+    /// Offers and permits `zlib@openssh.com`, activated only after authentication.
+    /// Default configurations offer only `none`. Legacy immediate `zlib` is unsupported.
+    #[must_use]
+    pub fn with_delayed_compression(mut self) -> Self {
+        self.delayed_compression = true;
+        self.kexinit.compression_algorithms_client_to_server =
+            vec!["zlib@openssh.com".to_owned(), COMPRESSION_NONE.to_owned()];
+        self.kexinit.compression_algorithms_server_to_client =
+            self.kexinit.compression_algorithms_client_to_server.clone();
+        self
     }
 
     /// Creates a server configuration from an explicit Ed25519 host signer.
@@ -799,6 +813,7 @@ where
             write_buffer: ProtectedWriteBuffer::default(),
             established: true,
             authenticated: false,
+            delayed_compression: self.config.delayed_compression,
             rekey: None,
         })
     }
@@ -816,7 +831,8 @@ where
         let algorithms = client_kexinit.negotiate(&self.server_kexinit)?;
         let client_guess_is_correct = !client_kexinit.first_kex_packet_follows
             || kex_guess_matches(&client_kexinit, &algorithms);
-        let protection = ProtectionPlan::from_algorithms(&algorithms)?;
+        let protection =
+            ProtectionPlan::from_algorithms(&algorithms, self.config.delayed_compression)?;
         self.negotiated_algorithm = Some(algorithms.kex.clone());
         self.client_guess_is_correct = client_guess_is_correct;
         let strict_kex = client_kexinit.strict_kex_enabled(&self.server_kexinit);
@@ -935,7 +951,7 @@ where
                 completion.session_id(),
                 protection.lengths,
             )?;
-            let read_protector = PacketProtector::new_with_compression(
+            let read_protector = PacketProtector::new_with_delayed_compression(
                 protection.read_suite,
                 material_for(
                     protection.read_suite,
@@ -945,7 +961,7 @@ where
                 )?,
                 protection.read_compression,
             )?;
-            let write_protector = PacketProtector::new_with_compression(
+            let write_protector = PacketProtector::new_with_delayed_compression(
                 protection.write_suite,
                 material_for(
                     protection.write_suite,
@@ -990,7 +1006,7 @@ where
                 prepared.session_id(),
                 protection.lengths,
             )?;
-            let read_protector = PacketProtector::new_with_compression(
+            let read_protector = PacketProtector::new_with_delayed_compression(
                 protection.read_suite,
                 material_for(
                     protection.read_suite,
@@ -1000,7 +1016,7 @@ where
                 )?,
                 protection.read_compression,
             )?;
-            let write_protector = PacketProtector::new_with_compression(
+            let write_protector = PacketProtector::new_with_delayed_compression(
                 protection.write_suite,
                 material_for(
                     protection.write_suite,
@@ -1049,7 +1065,7 @@ where
             completion.session_id(),
             protection.lengths,
         )?;
-        let read_protector = PacketProtector::new_with_compression(
+        let read_protector = PacketProtector::new_with_delayed_compression(
             protection.read_suite,
             material_for(
                 protection.read_suite,
@@ -1059,7 +1075,7 @@ where
             )?,
             protection.read_compression,
         )?;
-        let write_protector = PacketProtector::new_with_compression(
+        let write_protector = PacketProtector::new_with_delayed_compression(
             protection.write_suite,
             material_for(
                 protection.write_suite,
@@ -1123,7 +1139,7 @@ where
                     &completion.hash,
                     protection.lengths,
                 )?;
-                let read = PacketProtector::new_with_compression(
+                let read = PacketProtector::new_with_delayed_compression(
                     protection.read_suite,
                     material_for(
                         protection.read_suite,
@@ -1133,7 +1149,7 @@ where
                     )?,
                     protection.read_compression,
                 )?;
-                let write = PacketProtector::new_with_compression(
+                let write = PacketProtector::new_with_delayed_compression(
                     protection.write_suite,
                     material_for(
                         protection.write_suite,
@@ -1239,6 +1255,7 @@ where
 /// contexts and pending packets. Subsequent reads and writes fail without
 /// touching the stream. Short reads and `WouldBlock` preserve resumable state.
 pub struct ServerTransport<S> {
+    delayed_compression: bool,
     stream: S,
     sequence: SequenceState,
     session_id: Vec<u8>,
@@ -1383,6 +1400,12 @@ where
     pub(crate) fn mark_authenticated(&mut self) {
         if self.established {
             self.authenticated = true;
+            for protector in [&mut self.read_protector, &mut self.write_protector]
+                .into_iter()
+                .flatten()
+            {
+                protector.activate_compression();
+            }
         }
     }
 
@@ -1968,7 +1991,7 @@ where
                 peer_guess_is_correct,
             )
         };
-        let protection = ProtectionPlan::from_algorithms(&algorithms)?;
+        let protection = ProtectionPlan::from_algorithms(&algorithms, self.delayed_compression)?;
         self.sequence
             .observe_rekey_kexinit(Direction::Inbound, peer_guessed)?;
         self.sequence.commit_inbound()?;
@@ -2391,12 +2414,14 @@ struct ProtectionPlan {
 impl ProtectionPlan {
     fn from_algorithms(
         algorithms: &crate::msg::kexinit::NegotiatedAlgorithms,
+        delayed_compression: bool,
     ) -> Result<Self, HandshakeError> {
         if !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&algorithms.host_key.as_str()) {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
-        if algorithms.compression_client_to_server != COMPRESSION_NONE
-            || algorithms.compression_server_to_client != COMPRESSION_NONE
+        if !delayed_compression
+            && (algorithms.compression_client_to_server != COMPRESSION_NONE
+                || algorithms.compression_server_to_client != COMPRESSION_NONE)
         {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }

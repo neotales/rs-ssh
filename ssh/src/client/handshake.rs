@@ -156,6 +156,7 @@ impl From<NegotiationError> for HandshakeError {
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     kexinit: KexInit,
+    delayed_compression: bool,
 }
 
 impl Default for ClientConfig {
@@ -170,6 +171,7 @@ impl ClientConfig {
     pub fn new() -> Self {
         Self {
             kexinit: supported_client_kexinit([0; 16]),
+            delayed_compression: false,
         }
     }
 
@@ -181,7 +183,22 @@ impl ClientConfig {
     /// transcript. Guessed first-KEX packets are not offered by this client.
     #[must_use]
     pub fn with_kexinit(kexinit: KexInit) -> Self {
-        Self { kexinit }
+        Self {
+            kexinit,
+            delayed_compression: false,
+        }
+    }
+
+    /// Offers and permits `zlib@openssh.com`, activated only after authentication.
+    /// Default configurations offer only `none`. Legacy immediate `zlib` is unsupported.
+    #[must_use]
+    pub fn with_delayed_compression(mut self) -> Self {
+        self.delayed_compression = true;
+        self.kexinit.compression_algorithms_client_to_server =
+            vec!["zlib@openssh.com".to_owned(), COMPRESSION_NONE.to_owned()];
+        self.kexinit.compression_algorithms_server_to_client =
+            self.kexinit.compression_algorithms_client_to_server.clone();
+        self
     }
 
     /// Requests RFC 8308 signature negotiation by advertising `ext-info-c`.
@@ -263,6 +280,7 @@ impl ClientConfig {
             crate::transport::ExtensionState::Disabled
         };
         transport.configure_rekey_proposal(self.kexinit.clone());
+        transport.delayed_compression = self.delayed_compression;
         let client_payload = client_kexinit.encode()?;
 
         transport.write_handshake_packet(&client_payload, SSH_MSG_KEXINIT)?;
@@ -275,7 +293,7 @@ impl ClientConfig {
         let server_guess_is_correct = !server_kexinit.first_kex_packet_follows
             || kex_guess_matches(&server_kexinit, &algorithms);
         transport.configure_initial_algorithm(algorithms.kex.clone());
-        let protection = ProtectionPlan::from_algorithms(&algorithms)?;
+        let protection = ProtectionPlan::from_algorithms(&algorithms, self.delayed_compression)?;
         let strict_kex = client_kexinit.strict_kex_enabled(&server_kexinit);
         transport.configure_strict_kex(strict_kex)?;
         transport.accept_handshake_packet(
@@ -864,7 +882,10 @@ where
         if algorithms.kex != KEX_MLKEM768X25519_SHA256 {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
-        let protection = rekey_protection(ProtectionPlan::from_algorithms(&algorithms)?);
+        let protection = rekey_protection(ProtectionPlan::from_algorithms(
+            &algorithms,
+            self.delayed_compression,
+        )?);
         self.accept_rekey_kexinit(sequence)?;
         let client = MlKemClientKex::generate()?;
         let state = self.rekey.as_mut().ok_or(TransportError::RekeyInProgress)?;
@@ -1287,12 +1308,14 @@ struct ProtectionPlan {
 impl ProtectionPlan {
     fn from_algorithms(
         algorithms: &crate::msg::kexinit::NegotiatedAlgorithms,
+        delayed_compression: bool,
     ) -> Result<Self, HandshakeError> {
         if !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&algorithms.host_key.as_str()) {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
-        if algorithms.compression_client_to_server != COMPRESSION_NONE
-            || algorithms.compression_server_to_client != COMPRESSION_NONE
+        if !delayed_compression
+            && (algorithms.compression_client_to_server != COMPRESSION_NONE
+                || algorithms.compression_server_to_client != COMPRESSION_NONE)
         {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
@@ -1369,7 +1392,7 @@ impl ProtectionPlan {
         keys: &crate::kex::DerivedKeys,
     ) -> Result<PacketProtector, HandshakeError> {
         let material = self.write_material(keys)?;
-        Ok(PacketProtector::new_with_compression(
+        Ok(PacketProtector::new_with_delayed_compression(
             self.write_suite,
             material,
             self.write_compression,
@@ -1381,7 +1404,7 @@ impl ProtectionPlan {
         keys: &crate::kex::DerivedKeys,
     ) -> Result<PacketProtector, HandshakeError> {
         let material = self.read_material(keys)?;
-        Ok(PacketProtector::new_with_compression(
+        Ok(PacketProtector::new_with_delayed_compression(
             self.read_suite,
             material,
             self.read_compression,

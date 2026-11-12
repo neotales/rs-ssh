@@ -3325,6 +3325,15 @@ where
             match self.authenticate_method(method)? {
                 MethodOutcome::Success => {
                     self.transport.authenticated = true;
+                    for protector in [
+                        &mut self.transport.read_protector,
+                        &mut self.transport.write_protector,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        protector.activate_compression();
+                    }
                     return Ok(ClientAuthSuccess {
                         method: method.kind(),
                     });

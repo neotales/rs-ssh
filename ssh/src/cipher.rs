@@ -14,7 +14,7 @@ use neotales_ssh::chacha_cipher::{ChaChaCipher, ChaChaCipherError};
 use crate::MAX_PACKET_CONTENT;
 use crate::kex::wipes_itself_on_drop;
 use neotales_ssh::compression::{
-    CompressionAlgorithm, CompressionError, compress_payload, decompress_payload,
+    CompressionAlgorithm, CompressionError, CompressionStream, DecompressionStream,
     padding_for_payload,
 };
 
@@ -646,6 +646,9 @@ pub(crate) struct PacketProtector {
     seal_input: PlaintextBytes,
     suite: PacketSuite,
     compression: CompressionAlgorithm,
+    compression_active: bool,
+    compressor: Option<CompressionStream>,
+    decompressor: Option<DecompressionStream>,
     state: ProtectorState,
     last_chacha_seal: Option<u32>,
 }
@@ -698,8 +701,29 @@ impl PacketProtector {
             state: ProtectorState::new(suite, key_material)?,
             suite,
             compression,
+            compression_active: true,
+            compressor: None,
+            decompressor: None,
             last_chacha_seal: None,
         })
+    }
+
+    /// Creates a handshake context whose compression waits for `USERAUTH_SUCCESS`.
+    #[cfg_attr(test, allow(dead_code))] // Some source-borrowing harnesses only test active contexts.
+    pub(crate) fn new_with_delayed_compression(
+        suite: PacketSuite,
+        key_material: PacketKeyMaterial,
+        compression: CompressionAlgorithm,
+    ) -> Result<Self, PacketProtectionError> {
+        let mut protector = Self::new_with_compression(suite, key_material, compression)?;
+        protector.compression_active = false;
+        Ok(protector)
+    }
+
+    /// Enables negotiated compression after the uncompressed authentication success.
+    #[cfg_attr(test, allow(dead_code))] // Not every source-borrowing harness drives userauth.
+    pub(crate) fn activate_compression(&mut self) {
+        self.compression_active = true;
     }
 
     /// Returns the negotiated compression mode.
@@ -796,6 +820,8 @@ impl PacketProtector {
         let state = ProtectorState::new(suite, key_material)?;
         self.suite = suite;
         self.compression = compression;
+        self.compressor = None;
+        self.decompressor = None;
         self.state = state;
         self.last_chacha_seal = None;
         self.seal_input.bytes.clear();
@@ -836,10 +862,19 @@ impl PacketProtector {
         {
             return Err(PacketProtectionError::InvalidPacket);
         }
-        let (payload, padding) = match self.compression {
+        let selected = if self.compression_active {
+            self.compression
+        } else {
+            CompressionAlgorithm::None
+        };
+        let (payload, padding) = match selected {
             CompressionAlgorithm::None => (self.stage_seal_input(payload), padding.to_vec()),
             CompressionAlgorithm::Zlib => {
-                let mut compressed = compress_payload(payload).map_err(map_compression_error)?;
+                let mut compressed = self
+                    .compressor
+                    .get_or_insert_with(CompressionStream::default)
+                    .compress(payload)
+                    .map_err(map_compression_error)?;
                 let staged = self.stage_seal_input(&compressed);
                 compressed.zeroize();
                 // Compression changes the payload length after the transport
@@ -976,7 +1011,12 @@ impl PacketProtector {
         sequence_number: u32,
         input: &[u8],
     ) -> Result<Vec<u8>, PacketProtectionError> {
-        let compression = self.compression;
+        let compression = (self.compression_active
+            && self.compression == CompressionAlgorithm::Zlib)
+            .then(|| {
+                self.decompressor
+                    .get_or_insert_with(DecompressionStream::default)
+            });
         let alignment = PacketAlignment::for_suite(self.suite);
         match &mut self.state {
             ProtectorState::Ctr(state) if state.integrity.encrypt_then_mac() => {
@@ -1279,7 +1319,7 @@ fn open_chacha(
     state: &mut ChachaState,
     sequence_number: u32,
     input: &[u8],
-    compression: CompressionAlgorithm,
+    compression: Option<&mut DecompressionStream>,
     alignment: PacketAlignment,
 ) -> Result<Vec<u8>, PacketProtectionError> {
     let clear = PlaintextBytes::new(
@@ -1298,13 +1338,13 @@ fn open_chacha(
 
 fn decompress_if_selected(
     payload: Vec<u8>,
-    compression: CompressionAlgorithm,
+    compression: Option<&mut DecompressionStream>,
 ) -> Result<Vec<u8>, PacketProtectionError> {
     match compression {
-        CompressionAlgorithm::None => Ok(payload),
-        CompressionAlgorithm::Zlib => {
+        None => Ok(payload),
+        Some(stream) => {
             let payload = Zeroizing::new(payload);
-            decompress_payload(&payload).map_err(map_compression_error)
+            stream.decompress(&payload).map_err(map_compression_error)
         }
     }
 }
@@ -1333,7 +1373,7 @@ fn open_eam(
     state: &mut CtrState,
     sequence_number: u32,
     input: &[u8],
-    compression: CompressionAlgorithm,
+    compression: Option<&mut DecompressionStream>,
     alignment: PacketAlignment,
 ) -> Result<Vec<u8>, PacketProtectionError> {
     let tag_size = state.integrity.tag_size();
@@ -1385,7 +1425,7 @@ fn open_etm(
     state: &mut CtrState,
     sequence_number: u32,
     input: &[u8],
-    compression: CompressionAlgorithm,
+    compression: Option<&mut DecompressionStream>,
     alignment: PacketAlignment,
 ) -> Result<Vec<u8>, PacketProtectionError> {
     let packet = parse_clear_packet(input, state.integrity.tag_size(), alignment)?;
@@ -1412,7 +1452,7 @@ fn open_etm(
 fn open_gcm(
     state: &mut GcmState,
     input: &[u8],
-    compression: CompressionAlgorithm,
+    compression: Option<&mut DecompressionStream>,
     alignment: PacketAlignment,
 ) -> Result<Vec<u8>, PacketProtectionError> {
     let packet = parse_clear_packet(input, GCM_TAG_SIZE, alignment)?;

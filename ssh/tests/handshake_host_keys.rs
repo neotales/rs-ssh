@@ -14,32 +14,92 @@ use std::{
 type Fixture = (Arc<ServerConfig>, [Vec<u8>; 4]);
 
 #[test]
-fn explicit_zlib_selection_is_rejected_by_both_handshakes() -> Result<(), Box<dyn std::error::Error>>
-{
-    let mut proposal = KexInit::new([0; 16]);
-    proposal.compression_algorithms_client_to_server = vec!["zlib@openssh.com".to_owned()];
-    proposal.compression_algorithms_server_to_client = vec!["zlib@openssh.com".to_owned()];
-    let server =
-        ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32])).with_kexinit(proposal.clone());
+fn compression_is_opt_in_and_authentication_activates_both_directions()
+-> Result<(), Box<dyn std::error::Error>> {
+    use neotales_ssh::auth::{
+        ClientAuthMethod, ClientAuthenticator, ServerAuthPolicy, authenticate_server,
+    };
+    let server = ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32]));
+    for proposal in [
+        ClientConfig::new().kexinit(),
+        server.kexinit(),
+        &KexInit::new([0; 16]),
+    ] {
+        assert_eq!(proposal.compression_algorithms_client_to_server, ["none"]);
+        assert_eq!(proposal.compression_algorithms_server_to_client, ["none"]);
+    }
+    let server = server.with_delayed_compression();
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let address = listener.local_addr()?;
-    let thread = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("loopback accept");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("timeout");
-        matches!(
-            server.accept(stream),
-            Err(neotales_ssh::server::HandshakeError::UnsupportedAlgorithm)
-        )
+    let payload = b"\x5eauthenticated dictionary traffic".repeat(128);
+    let expected = payload.clone();
+    let thread = std::thread::spawn(move || -> Result<(), String> {
+        let run = || -> Result<(), Box<dyn std::error::Error>> {
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut transport = server.accept(stream)?;
+            let policy = ServerAuthPolicy::new(2)?
+                .with_password_callback(|candidate| candidate == "fixture");
+            authenticate_server(&mut transport, &policy)?;
+            assert!(transport.is_authenticated());
+            for _ in 0..2 {
+                assert_eq!(transport.read_payload()?, expected);
+                transport.write_payload(&expected)?;
+            }
+            transport.rekey()?;
+            assert_eq!(transport.read_payload()?, expected);
+            transport.write_payload(&expected)?;
+            Ok(())
+        };
+        run().map_err(|error| error.to_string())
     });
     let stream = TcpStream::connect(address)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    assert!(matches!(
-        ClientConfig::with_kexinit(proposal).connect(stream, |_| Ok::<(), ()>(())),
-        Err(neotales_ssh::client::HandshakeError::UnsupportedAlgorithm)
-    ));
-    assert!(thread.join().map_err(|_| "server panicked")?);
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut transport = ClientConfig::new()
+        .with_delayed_compression()
+        .connect(stream, |_| Ok::<(), ()>(()))?;
+    ClientAuthenticator::new(&mut transport, "fixture", 2)?
+        .authenticate(&[ClientAuthMethod::password("fixture")])?;
+    for _ in 0..2 {
+        transport.write_payload(&payload)?;
+        assert_eq!(transport.read_payload()?, payload);
+    }
+    transport.rekey()?;
+    transport.write_payload(&payload)?;
+    assert_eq!(transport.read_payload()?, payload);
+    thread.join().map_err(|_| "server panicked")??;
+    Ok(())
+}
+
+#[test]
+fn explicit_zlib_selection_is_rejected_by_both_handshakes() -> Result<(), Box<dyn std::error::Error>>
+{
+    for compression in ["zlib", "zlib@openssh.com"] {
+        let mut proposal = KexInit::new([0; 16]);
+        proposal.compression_algorithms_client_to_server = vec![compression.to_owned()];
+        proposal.compression_algorithms_server_to_client = vec![compression.to_owned()];
+        let server = ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32]))
+            .with_kexinit(proposal.clone());
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let address = listener.local_addr()?;
+        let thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("loopback accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            matches!(
+                server.accept(stream),
+                Err(neotales_ssh::server::HandshakeError::UnsupportedAlgorithm)
+            )
+        });
+        let stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        assert!(matches!(
+            ClientConfig::with_kexinit(proposal).connect(stream, |_| Ok::<(), ()>(())),
+            Err(neotales_ssh::client::HandshakeError::UnsupportedAlgorithm)
+        ));
+        assert!(thread.join().map_err(|_| "server panicked")?);
+    }
     Ok(())
 }
 

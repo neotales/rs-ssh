@@ -8,6 +8,7 @@ use std::fmt;
 use std::io::Write;
 
 use flate2::{Compression, Decompress, FlushDecompress, Status, write::ZlibEncoder};
+use zeroize::Zeroizing;
 
 use neotales_ssh::MAX_PACKET_CONTENT;
 
@@ -74,7 +75,109 @@ impl CompressionAlgorithm {
     }
 }
 
-/// Compresses one bounded payload with the OpenSSH zlib stream.
+/// One outbound SSH zlib context, retained until NEWKEYS.
+pub struct CompressionStream(ZlibEncoder<Vec<u8>>);
+
+impl fmt::Debug for CompressionStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompressionStream")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for CompressionStream {
+    fn default() -> Self {
+        Self(ZlibEncoder::new(Vec::new(), Compression::default()))
+    }
+}
+
+impl CompressionStream {
+    /// Compresses a packet with a sync flush, never finishing the stream.
+    ///
+    /// # Errors
+    /// Rejects oversized payloads or encoder failures. Discard the context on error.
+    pub fn compress(&mut self, payload: &[u8]) -> Result<Vec<u8>, CompressionError> {
+        if payload.len() > MAX_COMPRESSED_PAYLOAD {
+            return Err(CompressionError::LimitExceeded);
+        }
+        self.0
+            .write_all(payload)
+            .map_err(|_| CompressionError::CompressionFailed)?;
+        self.0
+            .flush()
+            .map_err(|_| CompressionError::CompressionFailed)?;
+        let output = Zeroizing::new(std::mem::take(self.0.get_mut()));
+        if output.len() > MAX_COMPRESSED_PAYLOAD {
+            return Err(CompressionError::LimitExceeded);
+        }
+        let mut output = output;
+        Ok(std::mem::take(&mut *output))
+    }
+}
+
+/// One inbound SSH zlib context, retained until NEWKEYS.
+pub struct DecompressionStream(Decompress);
+
+impl fmt::Debug for DecompressionStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecompressionStream")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DecompressionStream {
+    fn default() -> Self {
+        Self(Decompress::new(true))
+    }
+}
+
+impl DecompressionStream {
+    /// Inflates one packet without requiring a stream-end marker.
+    ///
+    /// # Errors
+    /// Rejects invalid streams and bounds each packet's output. Discard on error.
+    pub fn decompress(&mut self, payload: &[u8]) -> Result<Vec<u8>, CompressionError> {
+        if payload.is_empty() {
+            return Err(CompressionError::InvalidStream);
+        }
+        if payload.len() > MAX_COMPRESSED_PAYLOAD {
+            return Err(CompressionError::LimitExceeded);
+        }
+        let mut output = Zeroizing::new(Vec::new());
+        let mut chunk = Zeroizing::new([0; 8192]);
+        let mut offset = 0;
+        loop {
+            let before_in = self.0.total_in();
+            let before_out = self.0.total_out();
+            let status = self
+                .0
+                .decompress(&payload[offset..], chunk.as_mut(), FlushDecompress::Sync)
+                .map_err(|_| CompressionError::InvalidStream)?;
+            let consumed = usize::try_from(self.0.total_in() - before_in)
+                .map_err(|_| CompressionError::InvalidStream)?;
+            let produced = usize::try_from(self.0.total_out() - before_out)
+                .map_err(|_| CompressionError::InvalidStream)?;
+            offset += consumed;
+            if output.len() + produced > MAX_COMPRESSED_PAYLOAD {
+                return Err(CompressionError::LimitExceeded);
+            }
+            output.extend_from_slice(&chunk[..produced]);
+            if status == Status::StreamEnd {
+                return Err(CompressionError::InvalidStream);
+            }
+            if offset == payload.len() && produced < chunk.len() {
+                return Ok(std::mem::take(&mut *output));
+            }
+            if consumed == 0 && produced == 0 {
+                return Err(CompressionError::InvalidStream);
+            }
+        }
+    }
+}
+
+/// Compresses a standalone, finished zlib stream (not an SSH packet stream).
 ///
 /// # Errors
 ///
@@ -97,7 +200,7 @@ pub fn compress_payload(payload: &[u8]) -> Result<Vec<u8>, CompressionError> {
     Ok(compressed)
 }
 
-/// Decompresses one bounded OpenSSH zlib stream.
+/// Decompresses a standalone, finished zlib stream (not an SSH packet stream).
 ///
 /// # Errors
 ///

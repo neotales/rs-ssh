@@ -10,6 +10,8 @@ use neotales_ssh::compression::{
     compress_payload, decompress_payload, padding_for_payload,
 };
 
+use std::io::{Read, Write};
+
 #[test]
 fn names_and_algorithms_are_explicit() {
     assert_eq!(
@@ -24,12 +26,19 @@ fn names_and_algorithms_are_explicit() {
 }
 
 #[test]
-fn zlib_round_trips_and_rejects_trailing_data() {
+fn standalone_zlib_matches_independent_readers_and_rejects_trailing_data() {
     let payload = b"neotales ssh compression payload".repeat(32);
     let compressed = compress_payload(&payload).expect("payload compresses");
     assert!(compressed.len() < payload.len());
+    let mut decoded = Vec::new();
+    flate2::read::ZlibDecoder::new(compressed.as_slice())
+        .read_to_end(&mut decoded)
+        .expect("independent reader");
+    assert_eq!(decoded, payload);
+    let mut oracle = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    oracle.write_all(&payload).expect("independent writer");
     assert_eq!(
-        decompress_payload(&compressed).expect("payload decompresses"),
+        decompress_payload(&oracle.finish().expect("finish")).expect("decode"),
         payload
     );
 
@@ -37,6 +46,42 @@ fn zlib_round_trips_and_rejects_trailing_data() {
     trailing.push(0);
     assert_eq!(
         decompress_payload(&trailing),
+        Err(CompressionError::InvalidStream)
+    );
+}
+
+#[test]
+fn streaming_decode_bounds_each_packet_and_rejects_finished_or_malformed_streams() {
+    use neotales_ssh::compression::{DecompressionStream, MAX_COMPRESSED_PAYLOAD};
+    let mut oracle = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    oracle
+        .write_all(&vec![b'a'; MAX_COMPRESSED_PAYLOAD])
+        .expect("first packet");
+    oracle.flush().expect("flush");
+    let first = std::mem::take(oracle.get_mut());
+    let mut decoder = DecompressionStream::default();
+    assert_eq!(
+        decoder.decompress(&first).expect("at bound").len(),
+        MAX_COMPRESSED_PAYLOAD
+    );
+    oracle
+        .write_all(&vec![b'a'; MAX_COMPRESSED_PAYLOAD + 1])
+        .expect("oversized second packet");
+    oracle.flush().expect("flush");
+    assert_eq!(
+        decoder.decompress(oracle.get_ref()),
+        Err(CompressionError::LimitExceeded)
+    );
+
+    let mut oracle = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    oracle.write_all(b"finished stream").expect("write");
+    let finished = oracle.finish().expect("finish");
+    assert_eq!(
+        DecompressionStream::default().decompress(&finished),
+        Err(CompressionError::InvalidStream)
+    );
+    assert_eq!(
+        DecompressionStream::default().decompress(b"invalid"),
         Err(CompressionError::InvalidStream)
     );
 }

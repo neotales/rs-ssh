@@ -40,6 +40,127 @@ const BODY_PADDING: &[u8] = &[0xa5; 8];
 const SEQUENCE: u32 = 7;
 
 #[test]
+fn delayed_compression_leaves_authentication_uncompressed() {
+    let suite = PacketSuite::new(AES128_GCM_OPENSSH, None).expect("suite");
+    let material = || PacketKeyMaterial::gcm(&[0x56; 12], &[0x45; 16]);
+    let mut sender = PacketProtector::new_with_delayed_compression(
+        suite,
+        material(),
+        CompressionAlgorithm::Zlib,
+    )
+    .expect("sender");
+    let mut receiver = PacketProtector::new(suite, material()).expect("receiver");
+    // Both an authentication request and success travel as literal payload bytes.
+    for (sequence, payload) in [b"\x32authentication request".as_slice(), &[52]]
+        .into_iter()
+        .enumerate()
+    {
+        let padding = PacketAlignment::for_suite(suite)
+            .padding_pattern(payload.len(), &[0xa5])
+            .expect("padding");
+        let sequence = u32::try_from(sequence).expect("sequence");
+        let packet = sender.seal(sequence, payload, &padding).expect("seal");
+        assert_eq!(
+            receiver.open(sequence, &packet).expect("uncompressed auth"),
+            payload
+        );
+    }
+    sender.activate_compression();
+    let payload = b"authenticated traffic".repeat(64);
+    let packet = sender.seal(2, &payload, &[0xa5; 8]).expect("seal");
+    let compressed = receiver.open(2, &packet).expect("open framing");
+    let mut output = Vec::with_capacity(payload.len() + 64);
+    let mut oracle = flate2::Decompress::new(true);
+    oracle
+        .decompress_vec(&compressed, &mut output, flate2::FlushDecompress::Sync)
+        .expect("independent decode");
+    assert_eq!(output, payload);
+}
+
+#[test]
+fn zlib_packets_share_an_independent_stream_and_rekey_resets_it() {
+    use flate2::{Compression, Decompress, FlushDecompress, write::ZlibEncoder};
+    use std::io::Write;
+    let suite = PacketSuite::new(AES128_GCM_OPENSSH, None).expect("suite");
+    let material = || PacketKeyMaterial::gcm(&[0x56; 12], &[0x45; 16]);
+    let mut sender =
+        PacketProtector::new_with_compression(suite, material(), CompressionAlgorithm::Zlib)
+            .expect("sender");
+    let mut clear_receiver = PacketProtector::new(suite, material()).expect("receiver");
+    let payload = b"a shared dictionary across SSH packet boundaries".repeat(128);
+    let mut oracle = Decompress::new(true);
+    let mut encoded = Vec::new();
+    for sequence in 0..2 {
+        let packet = sender.seal(sequence, &payload, &[0xa5; 8]).expect("seal");
+        let compressed = clear_receiver
+            .open(sequence, &packet)
+            .expect("open framing");
+        let mut decoded = Vec::with_capacity(payload.len() + 64);
+        oracle
+            .decompress_vec(&compressed, &mut decoded, FlushDecompress::Sync)
+            .expect("independent decode");
+        assert_eq!(decoded, payload);
+        encoded.push(compressed);
+    }
+    assert!(encoded[1].len() < encoded[0].len());
+    let mut fresh = Decompress::new(true);
+    assert!(
+        fresh
+            .decompress_vec(
+                &encoded[1],
+                &mut Vec::with_capacity(payload.len() + 64),
+                FlushDecompress::Sync
+            )
+            .is_err()
+    );
+
+    // A separate writer supplies inbound bytes; it is not this crate's encoder.
+    let mut oracle = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut receiver =
+        PacketProtector::new_with_compression(suite, material(), CompressionAlgorithm::Zlib)
+            .expect("receiver");
+    let mut clear_sender = PacketProtector::new(suite, material()).expect("sender");
+    for sequence in 0..2 {
+        oracle.write_all(&payload).expect("encode");
+        oracle.flush().expect("sync flush");
+        let compressed = std::mem::take(oracle.get_mut());
+        let padding = PacketAlignment::for_suite(suite)
+            .padding_pattern(compressed.len(), &[0xa5])
+            .expect("padding");
+        let packet = clear_sender
+            .seal(sequence, &compressed, &padding)
+            .expect("seal framing");
+        let mut tampered = packet.clone();
+        *tampered.last_mut().expect("tag") ^= 1;
+        assert!(receiver.open(sequence, &tampered).is_err());
+        assert_eq!(
+            receiver.open(sequence, &packet).expect("stream decode"),
+            payload
+        );
+    }
+    sender.rekey(suite, material()).expect("rekey");
+    clear_receiver.rekey(suite, material()).expect("rekey");
+    let packet = sender.seal(2, &payload, &[0xa5; 8]).expect("seal");
+    assert_eq!(clear_receiver.open(2, &packet).expect("open"), encoded[0]);
+    receiver.rekey(suite, material()).expect("inbound rekey");
+    clear_sender
+        .rekey(suite, material())
+        .expect("framing rekey");
+    let mut oracle = ZlibEncoder::new(Vec::new(), Compression::default());
+    oracle.write_all(&payload).expect("fresh stream");
+    oracle.flush().expect("flush");
+    let compressed = oracle.get_ref();
+    let padding = PacketAlignment::for_suite(suite)
+        .padding_pattern(compressed.len(), &[0xa5])
+        .expect("padding");
+    let packet = clear_sender.seal(2, compressed, &padding).expect("seal");
+    assert_eq!(
+        receiver.open(2, &packet).expect("fresh inbound dictionary"),
+        payload
+    );
+}
+
+#[test]
 fn suite_names_and_invalid_combinations_are_explicit() {
     let cases = [
         (AES128_CTR, Some(HMAC_SHA2_256), Some(HMAC_SHA2_256)),
@@ -192,7 +313,8 @@ fn every_ctr_and_etm_variant_round_trips_multiple_lengths() -> Result<(), Packet
 }
 
 #[test]
-fn owned_seal_input_reuses_capacity_for_short_maximum_and_failed_packets() -> Result<(), Box<dyn std::error::Error>> {
+fn owned_seal_input_reuses_capacity_for_short_maximum_and_failed_packets()
+-> Result<(), Box<dyn std::error::Error>> {
     for (cipher, integrity) in [
         (AES128_CTR, Some(HMAC_SHA2_256)),
         (AES256_CTR, Some(HMAC_SHA2_512_ETM_OPENSSH)),
@@ -202,36 +324,69 @@ fn owned_seal_input_reuses_capacity_for_short_maximum_and_failed_packets() -> Re
         let suite = PacketSuite::new(cipher, integrity)?;
         let (mut sender, mut receiver) = if suite.is_chacha() {
             let material = || PacketKeyMaterial::new(&[0_u8; 8], &[0x61_u8; 64], None);
-            (PacketProtector::new(suite, material())?, PacketProtector::new(suite, material())?)
-        } else { protectors(suite, 0x61)? };
+            (
+                PacketProtector::new(suite, material())?,
+                PacketProtector::new(suite, material())?,
+            )
+        } else {
+            protectors(suite, 0x61)?
+        };
         // Largest legal payload for this suite, including mandatory padding.
-        let size = (MAX_PACKET_CONTENT - 255..MAX_PACKET_CONTENT).rev().find(|size| size + padding_length(suite, *size) <= MAX_PACKET_CONTENT).ok_or("no maximum packet")?;
+        let size = (MAX_PACKET_CONTENT - 255..MAX_PACKET_CONTENT)
+            .rev()
+            .find(|size| size + padding_length(suite, *size) <= MAX_PACKET_CONTENT)
+            .ok_or("no maximum packet")?;
         let maximum = vec![0x73; size];
         let _ = take_plaintext_drop(PlaintextSlot::SealInput);
         let _ = take_plaintext_drop(PlaintextSlot::ClearPacket);
         let short = b"short secret";
         let packet = sender.seal(0, short, &padding_for(suite, short.len()))?;
         assert_eq!(receiver.open(0, &packet)?, short);
-        assert!(sender.seal_input_allocation().1 >= short.len(), "seal must retain its input allocation, not allocate/discard a Vec per packet");
-        for (sequence, payload) in [(1, maximum.as_slice()), (2, short.as_slice()), (3, maximum.as_slice())] {
+        assert!(
+            sender.seal_input_allocation().1 >= short.len(),
+            "seal must retain its input allocation, not allocate/discard a Vec per packet"
+        );
+        for (sequence, payload) in [
+            (1, maximum.as_slice()),
+            (2, short.as_slice()),
+            (3, maximum.as_slice()),
+        ] {
             let before = sender.seal_input_allocation();
             let packet = sender.seal(sequence, payload, &padding_for(suite, payload.len()))?;
             assert_eq!(receiver.open(sequence, &packet)?, payload);
             let after = sender.seal_input_allocation();
             assert_eq!(after.2, 0, "no live plaintext remains between seals");
-            if before.1 >= payload.len() { assert_eq!(after, before, "capacity sufficient: allocation must be reused"); }
-            assert_eq!(take_plaintext_drop(PlaintextSlot::SealInput), Some(PlaintextDrop::Wiped));
+            if before.1 >= payload.len() {
+                assert_eq!(
+                    after, before,
+                    "capacity sufficient: allocation must be reused"
+                );
+            }
+            assert_eq!(
+                take_plaintext_drop(PlaintextSlot::SealInput),
+                Some(PlaintextDrop::Wiped)
+            );
             let _ = take_plaintext_drop(PlaintextSlot::ClearPacket);
         }
         let allocation = sender.seal_input_allocation();
-        assert!(matches!(sender.seal(4, short, &[0; 3]), Err(PacketProtectionError::InvalidPadding)));
-        assert_eq!(take_plaintext_drop(PlaintextSlot::SealInput), Some(PlaintextDrop::Wiped), "failure must wipe the owned buffer before clearing it");
+        assert!(matches!(
+            sender.seal(4, short, &[0; 3]),
+            Err(PacketProtectionError::InvalidPadding)
+        ));
+        assert_eq!(
+            take_plaintext_drop(PlaintextSlot::SealInput),
+            Some(PlaintextDrop::Wiped),
+            "failure must wipe the owned buffer before clearing it"
+        );
         assert_eq!(sender.seal_input_allocation(), allocation);
         // A failed seal must leave both the allocation and cipher state usable.
         let packet = sender.seal(4, short, &padding_for(suite, short.len()))?;
         assert_eq!(receiver.open(4, &packet)?, short);
         assert_eq!(sender.seal_input_allocation(), allocation);
-        assert_eq!(take_plaintext_drop(PlaintextSlot::SealInput), Some(PlaintextDrop::Wiped));
+        assert_eq!(
+            take_plaintext_drop(PlaintextSlot::SealInput),
+            Some(PlaintextDrop::Wiped)
+        );
         let _ = take_plaintext_drop(PlaintextSlot::ClearPacket);
     }
     Ok(())
