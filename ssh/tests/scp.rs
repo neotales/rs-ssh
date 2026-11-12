@@ -41,7 +41,8 @@ use std::error::Error;
 use std::io::{self, Cursor, Read, Write};
 
 use scp::{
-    MAX_SCP_FILE_SIZE, ScpError, ScpFile, download, download_command, upload, upload_command,
+    MAX_SCP_FILE_SIZE, ScpDirectoryEntry, ScpError, ScpFile, download, download_command,
+    download_directory, upload, upload_command, upload_directory,
 };
 
 struct ScriptedStream {
@@ -120,6 +121,200 @@ fn a_directory_header_is_rejected_without_reading_a_body() {
     assert!(matches!(error, ScpError::DirectoryRecord));
     assert_eq!(stream.output, vec![0]);
     assert!(stream.read_lengths.iter().all(|length| *length == 1));
+}
+
+#[test]
+fn in_memory_directory_upload_download_preserves_file_names_and_bytes() -> Result<(), Box<dyn Error>>
+{
+    let entries = vec![
+        ScpDirectoryEntry {
+            path: b"one.txt".to_vec(),
+            data: b"first".to_vec(),
+        },
+        ScpDirectoryEntry {
+            path: b"two.txt".to_vec(),
+            data: b"second".to_vec(),
+        },
+    ];
+    // Initial readiness, D, two acknowledgements per C, then E.
+    let mut sender = ScriptedStream::new(vec![0; 7]);
+    upload_directory(&mut sender, b"tree", &entries)?;
+    assert_eq!(sender.input.position(), 7);
+    assert_eq!(
+        sender.output,
+        b"D0755 0 tree\nC0644 5 one.txt\nfirst\0C0644 6 two.txt\nsecond\0E\n"
+    );
+
+    let mut receiver = ScriptedStream::new(sender.output);
+    let result = download_directory(&mut receiver)?;
+    assert_eq!(result.basename, b"tree");
+    assert_eq!(result.entries, entries);
+    assert_eq!(receiver.output, vec![0; 7]);
+    Ok(())
+}
+
+#[test]
+fn directory_transport_exchanges_acknowledgements_without_scripted_peer()
+-> Result<(), Box<dyn Error>> {
+    // A bounded, in-memory duplex transport. Reads time out so a framing
+    // regression fails rather than leaving the suite blocked on an extra ACK.
+    struct MemoryStream {
+        input: std::sync::mpsc::Receiver<u8>,
+        output: std::sync::mpsc::SyncSender<u8>,
+    }
+    impl Read for MemoryStream {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let Some(first) = bytes.first_mut() else {
+                return Ok(0);
+            };
+            *first = self
+                .input
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+            Ok(1)
+        }
+    }
+    impl Write for MemoryStream {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            for byte in bytes {
+                self.output
+                    .send(*byte)
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let (a_tx, a_rx) = std::sync::mpsc::sync_channel(1024);
+    let (b_tx, b_rx) = std::sync::mpsc::sync_channel(1024);
+    let mut sender = MemoryStream {
+        input: a_rx,
+        output: b_tx,
+    };
+    let mut receiver = MemoryStream {
+        input: b_rx,
+        output: a_tx,
+    };
+    let entries = vec![
+        ScpDirectoryEntry {
+            path: b"nested/one".to_vec(),
+            data: vec![0, 1, 255],
+        },
+        ScpDirectoryEntry {
+            path: b"two".to_vec(),
+            data: b"second".to_vec(),
+        },
+    ];
+    let directory = std::thread::scope(|scope| {
+        let sending = scope.spawn(|| upload_directory(&mut sender, b"tree", &entries));
+        let result = download_directory(&mut receiver);
+        sending.join().expect("in-memory sender must not panic")?;
+        result
+    })?;
+    assert_eq!(directory.basename, b"tree");
+    assert_eq!(directory.entries, entries);
+    Ok(())
+}
+
+#[test]
+fn directory_paths_reject_escape_and_collisions_before_upload_io() {
+    for paths in [
+        vec![b"../outside".as_slice()],
+        vec![b"/absolute".as_slice()],
+        vec![b"dir/../../outside".as_slice()],
+        vec![b"dir//file".as_slice()],
+        vec![b"dir/./file".as_slice()],
+        vec![b"C:outside".as_slice()],
+        vec![br"dir\outside".as_slice()],
+        vec![b"same".as_slice(), b"same"],
+        vec![b"dir".as_slice(), b"dir/file"],
+        vec![b"dir/file".as_slice(), b"dir"],
+    ] {
+        let entries: Vec<_> = paths
+            .into_iter()
+            .map(|path| ScpDirectoryEntry {
+                path: path.to_vec(),
+                data: Vec::new(),
+            })
+            .collect();
+        let mut stream = ScriptedStream::new(Vec::new());
+        assert!(upload_directory(&mut stream, b"tree", &entries).is_err());
+        assert!(stream.output.is_empty());
+        assert!(stream.read_lengths.is_empty());
+    }
+}
+
+#[test]
+fn directory_download_rejects_escape_collisions_and_bad_records() {
+    for wire in [
+        b"D0755 0 ..\n".as_slice(),
+        b"D0755 0 tree\nD0755 0 ..\n",
+        b"D0755 0 tree\nC0644 0 ../outside\n",
+        b"D0755 0 tree\nC0644 0 C:outside\n",
+        b"D0755 0 tree\nC0644 0 same\n\0C0644 0 same\n",
+        b"D0755 0 tree\nC0644 0 dir\n\0D0755 0 dir\n",
+        b"D0755 0 tree\nD0755 0 dir\nE\nC0644 0 dir\n",
+        b"D0755 1 tree\n",
+        b"D0755 0 tree\nE extra\n",
+        b"D0755 0 tree\nC0644 1 file\nx!",
+        b"D0755 0 tree\nD0755 0 child\nE\n", // Missing root E.
+    ] {
+        assert!(download_directory(&mut ScriptedStream::new(wire.to_vec())).is_err());
+    }
+}
+
+#[test]
+fn directory_depth_and_total_record_limits_apply_in_both_directions() -> Result<(), Box<dyn Error>>
+{
+    // Root plus seven child directories: exactly eight D levels.
+    let path = b"a/b/c/d/e/f/g/file";
+    let entries = vec![ScpDirectoryEntry {
+        path: path.to_vec(),
+        data: vec![0, 255],
+    }];
+    let mut sender = ScriptedStream::new(vec![0; 19]);
+    upload_directory(&mut sender, b"r", &entries)?;
+    let result = download_directory(&mut ScriptedStream::new(sender.output))?;
+    assert_eq!(result.entries, entries);
+    let too_deep = vec![ScpDirectoryEntry {
+        path: b"a/b/c/d/e/f/g/h/file".to_vec(),
+        data: Vec::new(),
+    }];
+    assert!(upload_directory(&mut ScriptedStream::new(Vec::new()), b"r", &too_deep).is_err());
+    let mut deep_wire = b"D0700 0 r\n".to_vec();
+    for _ in 0..8 {
+        deep_wire.extend_from_slice(b"D0700 0 d\n");
+    }
+    assert!(download_directory(&mut ScriptedStream::new(deep_wire)).is_err());
+
+    // The root is a record too, leaving room for 63 files.
+    let mut entries: Vec<_> = (0..63)
+        .map(|i| ScpDirectoryEntry {
+            path: format!("file{i:02}").into_bytes(),
+            data: Vec::new(),
+        })
+        .collect();
+    let mut sender = ScriptedStream::new(vec![0; 129]);
+    upload_directory(&mut sender, b"r", &entries)?;
+    assert_eq!(
+        download_directory(&mut ScriptedStream::new(sender.output))?.entries,
+        entries
+    );
+    entries.push(ScpDirectoryEntry {
+        path: b"extra".to_vec(),
+        data: Vec::new(),
+    });
+    assert!(upload_directory(&mut ScriptedStream::new(Vec::new()), b"r", &entries).is_err());
+    // Empty directories must consume the count as well as files.
+    let mut wire = b"D0700 0 r\n".to_vec();
+    for i in 0..64 {
+        wire.extend_from_slice(format!("D0700 0 d{i}\nE\n").as_bytes());
+    }
+    wire.extend_from_slice(b"E\n");
+    assert!(download_directory(&mut ScriptedStream::new(wire)).is_err());
+    Ok(())
 }
 
 #[test]

@@ -54,9 +54,11 @@ host PTY. Malformed controls do not reach that callback.
 `SendEnv` and `SetEnv` are applied by `EnvironmentPlan` and sent as RFC 4254
 `env` requests. `subsystem`, including the `sftp` name, and the `scp -t` /
 `scp -f` exec requests are covered by in-process session tests. Those tests do
-not start `sshd`. SCP remains single-file. SFTP version 3 supports an
-in-process server over a caller-supplied byte stream and memory map. It is not
-a host filesystem server.
+not start `sshd`. SCP supports bounded in-memory directory records alongside
+single-file transfers, with at most 8 directory levels and 64 file/directory
+records including the root; it does not access host directories. SFTP version 3
+supports an in-process server over a caller-supplied byte stream and memory map.
+It is not a host filesystem server.
 
 ### Additional in-process protocol coverage
 
@@ -93,7 +95,8 @@ interoperability evidence:
   rejected and ProxyCommand remains inert text.
 - SCP's `RemoteShell::PowerShell` preserves Windows backslashes and doubles
   literal quotes. POSIX quoting remains the default; neither detects a shell.
-  SCP directory records remain rejected.
+  SCP directory records (`D`/`E`) support bounded in-memory directory transfers;
+  no host directory is opened.
 - Agent forwarding requires an explicit session request and separate default-deny
   server policy. The client application must confirm offered agent channels.
   Traffic is opaque; no local agent or process environment is accessed.

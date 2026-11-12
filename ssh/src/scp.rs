@@ -1,4 +1,4 @@
-//! Bounded single-file transfers using the historical SCP/RCP byte protocol.
+//! Bounded in-memory file and directory transfers using the historical SCP/RCP byte protocol.
 //!
 //! This module only operates on a caller-supplied byte stream.  It does not
 //! create a process, open a socket, or send an SSH `exec` request.  The
@@ -7,12 +7,12 @@
 //! and [`crate::session::ClientSessions::request_scp_download`] send that text
 //! as an `exec` request.
 //!
-//! The implementation handles one regular file and deliberately rejects the
-//! legacy `D` and `E` directory records.  Header lines and materialized file
+//! Header lines and materialized file
 //! bodies are bounded before they are parsed or retained.
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read, Write};
 
@@ -24,6 +24,11 @@ pub const MAX_SCP_FILE_SIZE: usize = 64 * 1024 * 1024;
 
 /// The maximum number of bytes in an SCP file basename.
 pub const MAX_SCP_BASENAME_SIZE: usize = 255;
+
+/// Maximum directory nesting, including the transferred root.
+pub const MAX_SCP_DIRECTORY_DEPTH: usize = 8;
+/// Maximum file and directory records, including the root, in one transfer.
+pub const MAX_SCP_DIRECTORY_ENTRIES: usize = 64;
 
 /// The default mode used when an upload does not specify one.
 pub const DEFAULT_SCP_MODE: u32 = 0o644;
@@ -52,7 +57,7 @@ pub const MAX_BASENAME_SIZE: usize = MAX_SCP_BASENAME_SIZE;
 /// A descriptive alias for [`SCP_ACK`].
 pub const SCP_ACKNOWLEDGEMENT: u8 = SCP_ACK;
 
-/// A safe error produced by the single-file SCP protocol implementation.
+/// A safe error produced by the SCP protocol implementation.
 ///
 /// Error values retain no file bytes, paths, peer warning text, or other
 /// untrusted diagnostic content.  Both formatting implementations use fixed
@@ -250,6 +255,25 @@ pub struct ScpFile {
     pub mtime: Option<u64>,
     /// Access seconds when a preceding `T` header was present.
     pub atime: Option<u64>,
+}
+
+/// One file in an in-memory directory transfer. `path` is relative to the
+/// transferred root and may contain validated slash-separated directories.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScpDirectoryEntry {
+    /// Relative path below the transferred root.
+    pub path: Vec<u8>,
+    /// File bytes.
+    pub data: Vec<u8>,
+}
+
+/// A downloaded directory and its files, represented without host filesystem access.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScpDirectory {
+    /// Root directory basename.
+    pub basename: Vec<u8>,
+    /// Files beneath the root.
+    pub entries: Vec<ScpDirectoryEntry>,
 }
 
 impl ScpFile {
@@ -509,18 +533,7 @@ where
     let header = parse_file_header(&file_line)?;
     write_ack(stream)?;
 
-    let mut data = Vec::new();
-    data.try_reserve_exact(header.size)
-        .map_err(|_| ScpError::AllocationFailed)?;
-    data.resize(header.size, 0);
-    stream.read_exact(&mut data)?;
-
-    let mut trailer = [0_u8; 1];
-    stream.read_exact(&mut trailer)?;
-    if trailer[0] != SCP_ACK {
-        return Err(ScpError::InvalidTrailer);
-    }
-    write_ack(stream)?;
+    let data = read_file_body(stream, header.size)?;
 
     Ok(ScpFile {
         basename: header.basename,
@@ -529,6 +542,199 @@ where
         mtime: time.map(|value| value.mtime_seconds),
         atime: time.map(|value| value.atime_seconds),
     })
+}
+
+/// Uploads an in-memory directory with slash-separated relative file paths.
+///
+/// Validates the entire tree before writing. The root counts toward the depth
+/// limit of 8 and record limit of 64. Duplicate paths and file/directory
+/// collisions are rejected. Files are sent in component-byte order. The stream
+/// must already be connected to a recursive SCP sink. I/O errors may leave a
+/// partial transfer; no host filesystem is accessed.
+///
+/// # Errors
+/// Rejects unsafe names, excessive entries, and stream/protocol failures.
+pub fn upload_directory<S: Read + Write>(
+    stream: &mut S,
+    name: &[u8],
+    entries: &[ScpDirectoryEntry],
+) -> Result<(), ScpError> {
+    validate_tree_component(name)?;
+    let mut tree = BTreeMap::new();
+    let mut count = 1;
+    for entry in entries {
+        if entry.data.len() > MAX_SCP_FILE_SIZE {
+            return Err(ScpError::FileTooLarge);
+        }
+        let components: Vec<_> = entry.path.split(|byte| *byte == b'/').collect();
+        if components.len() > MAX_SCP_DIRECTORY_DEPTH {
+            return Err(ScpError::InvalidHeader);
+        }
+        for component in &components {
+            validate_tree_component(component)?;
+        }
+        insert_tree_file(&mut tree, &components, &entry.data, &mut count)?;
+    }
+    read_ack(stream)?;
+    send_tree(stream, name, &tree)
+}
+
+/// Downloads one directory into relative in-memory file paths, in wire order.
+///
+/// Enforces the same depth, record, path, and collision limits as
+/// [`upload_directory`]. Empty directories count toward the limits but are not
+/// retained in the file-only result. Metadata is validated but not retained.
+/// The stream must already be connected to a recursive SCP source. On failure
+/// no partial tree is returned; no host filesystem is accessed.
+///
+/// # Errors
+/// Rejects unsafe paths, nested depth beyond the bound, malformed records, or I/O failures.
+pub fn download_directory<S: Read + Write>(stream: &mut S) -> Result<ScpDirectory, ScpError> {
+    write_ack(stream)?;
+    let line = read_header_line(stream)?;
+    let name = parse_directory_line(&line)?;
+    write_ack(stream)?;
+    let mut entries = Vec::new();
+    let mut directories = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut count = 1;
+    loop {
+        let line = read_header_line(stream)?;
+        if line == b"E\n" {
+            write_ack(stream)?;
+            if directories.pop().is_none() {
+                break;
+            }
+            continue;
+        }
+        count_record(&mut count)?;
+        if line.first() == Some(&b'D') {
+            let child = parse_directory_line(&line)?;
+            if directories.len() + 1 >= MAX_SCP_DIRECTORY_DEPTH {
+                return Err(ScpError::InvalidHeader);
+            }
+            let path = tree_path(&directories, &child);
+            if !seen.insert(path) {
+                return Err(ScpError::InvalidPath);
+            }
+            directories.push(child);
+            write_ack(stream)?;
+            continue;
+        }
+        let header = parse_file_header(&line)?;
+        validate_tree_component(&header.basename)?;
+        let path = tree_path(&directories, &header.basename);
+        if !seen.insert(path.clone()) {
+            return Err(ScpError::InvalidPath);
+        }
+        write_ack(stream)?;
+        let data = read_file_body(stream, header.size)?;
+        entries.push(ScpDirectoryEntry { path, data });
+    }
+    Ok(ScpDirectory {
+        basename: name,
+        entries,
+    })
+}
+
+fn directory_line(name: &[u8]) -> Result<Vec<u8>, ScpError> {
+    validate_tree_component(name)?;
+    let mut line = Vec::with_capacity(name.len() + 16);
+    line.push(b'D');
+    line.extend_from_slice(b"0755 0 ");
+    line.extend_from_slice(name);
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn parse_directory_line(line: &[u8]) -> Result<Vec<u8>, ScpError> {
+    if line.first() != Some(&b'D') {
+        return Err(ScpError::InvalidHeader);
+    }
+    let mut file_line = line.to_vec();
+    file_line[0] = b'C';
+    let header = parse_file_header(&file_line)?;
+    if header.size != 0 {
+        return Err(ScpError::InvalidHeader);
+    }
+    validate_tree_component(&header.basename)?;
+    Ok(header.basename)
+}
+
+enum TreeNode<'a> {
+    File(&'a [u8]),
+    Directory(BTreeMap<Vec<u8>, TreeNode<'a>>),
+}
+
+fn count_record(count: &mut usize) -> Result<(), ScpError> {
+    if *count >= MAX_SCP_DIRECTORY_ENTRIES {
+        return Err(ScpError::InvalidHeader);
+    }
+    *count += 1;
+    Ok(())
+}
+
+fn validate_tree_component(name: &[u8]) -> Result<(), ScpError> {
+    validate_basename(name)?;
+    if matches!(name, b"." | b"..") || name.contains(&b':') {
+        return Err(ScpError::InvalidPath);
+    }
+    Ok(())
+}
+
+fn insert_tree_file<'a>(
+    tree: &mut BTreeMap<Vec<u8>, TreeNode<'a>>,
+    components: &[&[u8]],
+    data: &'a [u8],
+    count: &mut usize,
+) -> Result<(), ScpError> {
+    let (name, rest) = components.split_first().ok_or(ScpError::InvalidPath)?;
+    if rest.is_empty() {
+        if tree.contains_key(*name) {
+            return Err(ScpError::InvalidPath);
+        }
+        count_record(count)?;
+        tree.insert(name.to_vec(), TreeNode::File(data));
+        return Ok(());
+    }
+    if !tree.contains_key(*name) {
+        count_record(count)?;
+        tree.insert(name.to_vec(), TreeNode::Directory(BTreeMap::new()));
+    }
+    match tree.get_mut(*name) {
+        Some(TreeNode::Directory(children)) => insert_tree_file(children, rest, data, count),
+        _ => Err(ScpError::InvalidPath),
+    }
+}
+
+fn send_tree<S: Read + Write>(
+    stream: &mut S,
+    name: &[u8],
+    tree: &BTreeMap<Vec<u8>, TreeNode<'_>>,
+) -> Result<(), ScpError> {
+    stream.write_all(&directory_line(name)?)?;
+    read_ack(stream)?;
+    for (name, node) in tree {
+        match node {
+            TreeNode::File(data) => {
+                let line = encode_file_line(name, data.len(), DEFAULT_SCP_MODE)?;
+                send_file_record(stream, &line, data)?;
+            }
+            TreeNode::Directory(children) => send_tree(stream, name, children)?,
+        }
+    }
+    stream.write_all(b"E\n")?;
+    read_ack(stream)
+}
+
+fn tree_path(directories: &[Vec<u8>], name: &[u8]) -> Vec<u8> {
+    let mut path = Vec::new();
+    for directory in directories {
+        path.extend_from_slice(directory);
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    path
 }
 
 /// A reusable SCP byte-stream endpoint.
@@ -722,12 +928,37 @@ where
         stream.write_all(&line)?;
         read_ack(stream)?;
     }
-    stream.write_all(&file_line)?;
+    send_file_record(stream, &file_line, data)
+}
+
+// The initial sink readiness acknowledgement belongs to the transfer, not
+// each C record. Directory transfers have already consumed it before D.
+fn send_file_record<S: Read + Write>(
+    stream: &mut S,
+    file_line: &[u8],
+    data: &[u8],
+) -> Result<(), ScpError> {
+    stream.write_all(file_line)?;
     read_ack(stream)?;
     stream.write_all(data)?;
     stream.write_all(&[SCP_ACK])?;
     read_ack(stream)?;
     Ok(())
+}
+
+fn read_file_body<S: Read + Write>(stream: &mut S, size: usize) -> Result<Vec<u8>, ScpError> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(size)
+        .map_err(|_| ScpError::AllocationFailed)?;
+    data.resize(size, 0);
+    stream.read_exact(&mut data)?;
+    let mut trailer = [0];
+    stream.read_exact(&mut trailer)?;
+    if trailer[0] != SCP_ACK {
+        return Err(ScpError::InvalidTrailer);
+    }
+    write_ack(stream)?;
+    Ok(data)
 }
 
 fn validate_mode(mode: u32) -> Result<(), ScpError> {
