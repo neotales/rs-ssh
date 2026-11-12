@@ -3420,7 +3420,15 @@ where
         &mut self,
         methods: &[ClientAuthMethod],
     ) -> Result<ClientAuthSuccess, AuthError> {
-        if methods.is_empty() {
+        self.authenticate_refs(methods.iter())
+    }
+
+    pub(crate) fn authenticate_refs<'method>(
+        &mut self,
+        methods: impl IntoIterator<Item = &'method ClientAuthMethod>,
+    ) -> Result<ClientAuthSuccess, AuthError> {
+        let mut methods = methods.into_iter().peekable();
+        if methods.peek().is_none() {
             return Err(AuthError::NoMethods);
         }
         self.ensure_service()?;

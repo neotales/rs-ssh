@@ -1,28 +1,59 @@
 # neotales-ssh
 
 SSH-2 building blocks meant to be forked and patched. `SshClient` covers common
-paths; every low-level API and policy hook remains public. The string form reads
-the default agent and existing `~/.ssh/known_hosts`, and fails closed for unknown
-keys. Helpers do not execute local commands or accept a host key by default.
+paths; every low-level API and policy hook remains public. Helpers do not execute
+local commands or accept a host key by default.
 
-The pinned form requires a username, authentication methods, and a trusted Ed25519 SSH
-public-key blob supplied by the application. `None` selects port 22. Signature
-verification precedes the pin check; no host key is accepted by default. The
-script is sent as exact command bytes, without selecting an interpreter. Output
-is buffered; stderr is discarded. Upload progress counts payload bytes only and
-failed uploads may leave partial files. Set appropriate network deadlines at the
-lower level when needed.
+`SshClient::open` takes a destination string. No user means the current process
+user, no port means 22, authentication tries the default `ssh-agent`, and an
+unknown host key is rejected.
 
 ## Opening a connection
+
+The builder is for anything the destination string cannot express: an explicit
+pin, or a port you set per copy.
 
 ```rust,no_run
 use neotales_ssh::SshClient;
 fn example() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open("example.org")?;
-    let _ = client.exec(b"hostname")?;
+    let _client = SshClient::open("example.org")?;
     Ok(())
 }
 ```
+
+Password and host pin:
+
+```rust,no_run
+use neotales_ssh::SshClient;
+fn example(pin: &[u8], password: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let _client = SshClient::builder().host("example.org").username("user").pin(pin).password(password).build()?;
+    Ok(())
+}
+```
+
+Identity file:
+
+```rust,no_run
+use neotales_ssh::SshClient;
+use std::path::Path;
+fn example(pin: &[u8], path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let _client = SshClient::builder().host("example.org").username("user").pin(pin).identity_file(path)?.build()?;
+    Ok(())
+}
+```
+
+Encrypted identity file:
+
+```rust,no_run
+use neotales_ssh::SshClient;
+use std::path::Path;
+fn example(pin: &[u8], path: &Path, passphrase: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let _client = SshClient::builder().host("example.org").username("user").pin(pin).identity_file_with_passphrase(path, passphrase)?.build()?;
+    Ok(())
+}
+```
+
+Clone and change only the port:
 
 ```rust,no_run
 use neotales_ssh::SshClient;
@@ -37,58 +68,79 @@ fn example(pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
 ## Command
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, SshClient};
-fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
-    let (stdout, status) = client.exec(b"printf hello")?;
+use neotales_ssh::SshClient;
+
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    // example.org is port 22 and the current user.
+    // user@example.org:2222 sets both.
+    let mut ssh = SshClient::open("user@example.org:2222")?;
+    let (stdout, status) = ssh.exec(b"printf hello")?;
     assert_eq!((stdout.as_slice(), status), (b"hello".as_slice(), 0));
     Ok(())
 }
 ```
 
+Output is buffered and stderr is discarded; `status` is the remote exit code. Set
+network deadlines at the lower level when you need them.
+
 ## Script
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, SshClient};
-fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
-    let (stdout, status) = client.script(b"printf one\nprintf two\n")?;
+use neotales_ssh::SshClient;
+
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ssh = SshClient::open("user@example.org:2222")?;
+    let (stdout, status) = ssh.script(b"printf one\nprintf two\n")?;
     assert_eq!((stdout.as_slice(), status), (b"onetwo".as_slice(), 0));
     Ok(())
 }
 ```
 
+The bytes are sent as an exact command string: no interpreter is selected and no
+local shell runs.
+
 ## Upload
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, SshClient};
-fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
-    client.upload("report.txt", b"report", |bytes| println!("uploaded {bytes}"))?;
+use neotales_ssh::SshClient;
+
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ssh = SshClient::open("user@example.org:2222")?;
+    ssh.upload("report.txt", b"report", |bytes| println!("uploaded {bytes}"))?;
     Ok(())
 }
 ```
 
+Progress counts payload bytes only, and a failed upload may leave a partial
+remote file.
+
 ## Download
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, SshClient};
-fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
-    let bytes = client.download("report.txt", |bytes| println!("downloaded {bytes}"))?;
+use neotales_ssh::SshClient;
+
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ssh = SshClient::open("user@example.org:2222")?;
+    let bytes = ssh.download("report.txt", |bytes| println!("downloaded {bytes}"))?;
     assert_eq!(bytes, b"report");
     Ok(())
 }
 ```
 
+The file is held in memory; the whole payload arrives before the call returns.
+
 ## SFTP
 
 ```rust,no_run
-use neotales_ssh::{ClientAuthMethod, SshClient};
-fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
-    let mut sftp = client.sftp()?;
-    let handle = sftp.open("report.txt", neotales_ssh::sftp::SSH_FXF_READ | neotales_ssh::sftp::SSH_FXF_WRITE | neotales_ssh::sftp::SSH_FXF_CREAT)?;
+use neotales_ssh::{sftp, SshClient};
+
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ssh = SshClient::open("user@example.org:2222")?;
+    let mut sftp = ssh.sftp()?;
+    let handle = sftp.open(
+        "report.txt",
+        sftp::SSH_FXF_READ | sftp::SSH_FXF_WRITE | sftp::SSH_FXF_CREAT,
+    )?;
     sftp.write(&handle, 0, b"report")?;
     let data = sftp.read(&handle, 0, 6_u32)?;
     sftp.close(&handle)?;
@@ -97,9 +149,24 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 }
 ```
 
-`ClientSessions`, `dispatch_one`, and the channel types remain public hooks for
-custom protocols and policies. Other host-key types and known-hosts documents
-remain available through the low-level `ClientConfig` APIs.
+The returned client borrows the connection, and one client cannot hold an SFTP
+client and a session at the same time. Use `SshClient::session` for one channel
+you drive yourself:
+
+```rust,no_run
+use neotales_ssh::SshClient;
+
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ssh = SshClient::open("user@example.org:2222")?;
+    // The session borrows the connection; exec consumes it and closes the channel.
+    let (stdout, status) = ssh.session()?.exec(b"printf hello")?;
+    let _ = (stdout, status);
+    Ok(())
+}
+```
+
+`ClientSessions` and `dispatch_one` remain public. Other host-key types and
+known-hosts documents remain available through the low-level `ClientConfig` APIs.
 
 ## One extra hop
 
@@ -195,10 +262,10 @@ and exclusions. README Rust examples are included in the crate's doctests.
 From the Cargo workspace `rs/lib`:
 
 ```sh
-cargo test -p neotales-ssh --lib recipes --offline
+cargo test -p neotales-ssh --lib --offline
 cargo test -p neotales-ssh --doc --offline
 cargo clippy -p neotales-ssh --all-targets --all-features --offline -- -D warnings
 ```
 
-Opt-in interoperability tests require `NEOTALES_SSH_E2E=1`; the checks above
-do not require or enable them.
+Opt-in interoperability tests require `NEOTALES_SSH_E2E=1`; the checks above do
+not require or enable them.

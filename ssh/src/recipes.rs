@@ -38,11 +38,16 @@ pub struct SshClientBuilder {
     host: Option<String>,
     username: Option<String>,
     port: Option<u16>,
-    methods: Option<Rc<Vec<ClientAuthMethod>>>,
-    agent: bool,
+    methods: Vec<AuthChoice>,
     pin: Option<Vec<u8>>,
     known_hosts: Option<String>,
     known_hosts_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+enum AuthChoice {
+    Method(Rc<ClientAuthMethod>),
+    Agent,
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -118,19 +123,93 @@ impl SshClientBuilder {
         self.port = Some(port);
         self
     }
-    /// Sets explicit authentication methods.
+    /// Appends an explicit authentication method.
     #[must_use]
-    pub fn methods(mut self, methods: Vec<ClientAuthMethod>) -> Self {
-        self.methods = Some(Rc::new(methods));
-        self.agent = false;
+    pub fn method(mut self, method: ClientAuthMethod) -> Self {
+        self.methods.push(AuthChoice::Method(Rc::new(method)));
         self
     }
-    /// Enables or disables default-agent authentication.
+
+    /// Appends authentication methods in iteration order.
+    #[must_use]
+    pub fn methods(mut self, methods: impl IntoIterator<Item = ClientAuthMethod>) -> Self {
+        self.methods
+            .extend(methods.into_iter().map(|m| AuthChoice::Method(Rc::new(m))));
+        self
+    }
+
+    /// Appends a password method whose value is redacted and zeroized.
+    #[must_use]
+    pub fn password(self, secret: impl Into<String>) -> Self {
+        self.method(ClientAuthMethod::password(secret))
+    }
+
+    /// Reads one unencrypted OpenSSH or PKCS#8 DER identity.
+    ///
+    /// # Errors
+    /// Returns an I/O or invalid-key error.
+    pub fn identity_file(self, path: impl AsRef<std::path::Path>) -> Result<Self, ClientError> {
+        self.import_identity(path.as_ref(), &mut [])
+    }
+
+    /// Reads one encrypted OpenSSH identity, wiping the passphrase copy.
+    ///
+    /// # Errors
+    /// Returns an I/O or invalid-key error, including for a wrong passphrase.
+    pub fn identity_file_with_passphrase(
+        self,
+        path: impl AsRef<std::path::Path>,
+        passphrase: impl AsRef<[u8]>,
+    ) -> Result<Self, ClientError> {
+        let mut passphrase = zeroize::Zeroizing::new(passphrase.as_ref().to_vec());
+        self.import_identity(path.as_ref(), &mut passphrase)
+    }
+
+    fn import_identity(
+        self,
+        path: &std::path::Path,
+        passphrase: &mut [u8],
+    ) -> Result<Self, ClientError> {
+        let bytes = zeroize::Zeroizing::new(std::fs::read(path)?);
+        let decoded = if bytes.starts_with(b"-----BEGIN OPENSSH PRIVATE KEY-----") {
+            let text = std::str::from_utf8(&bytes).map_err(|_| invalid("invalid OpenSSH key"))?;
+            let body = text
+                .strip_prefix("-----BEGIN OPENSSH PRIVATE KEY-----")
+                .and_then(|s| s.trim().strip_suffix("-----END OPENSSH PRIVATE KEY-----"))
+                .ok_or_else(|| invalid("invalid OpenSSH key"))?;
+            let encoded = zeroize::Zeroizing::new(
+                body.chars()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect::<String>(),
+            );
+            Some(zeroize::Zeroizing::new(
+                crate::known_hosts::decode_base64(&encoded)
+                    .map_err(|_| invalid("invalid OpenSSH key"))?,
+            ))
+        } else {
+            None
+        };
+        let key = decoded
+            .as_deref()
+            .map_or(bytes.as_slice(), |v| v.as_slice());
+        let signer = if key.starts_with(b"openssh-key-v1\0") || decoded.is_some() {
+            crate::private_key::import_openssh(key, passphrase)?
+        } else {
+            crate::private_key::import_pkcs8_der(key)?
+        };
+        Ok(self.method(ClientAuthMethod::public_key(signer)))
+    }
+
+    /// Enables or disables default-agent authentication without removing other methods.
+    /// If the agent is unavailable, explicitly supplied methods remain usable.
     #[must_use]
     pub fn agent(mut self, enabled: bool) -> Self {
-        self.agent = enabled;
         if enabled {
-            self.methods = None;
+            if !self.methods.iter().any(|m| matches!(m, AuthChoice::Agent)) {
+                self.methods.push(AuthChoice::Agent);
+            }
+        } else {
+            self.methods.retain(|m| !matches!(m, AuthChoice::Agent));
         }
         self
     }
@@ -174,14 +253,24 @@ impl SshClientBuilder {
         if port == 0 {
             return Err(invalid("invalid port").into());
         }
-        if !self.agent && self.methods.as_ref().is_none_or(|m| m.is_empty()) {
+        if self.methods.is_empty() {
             return Err(invalid("authentication methods required").into());
         }
-        let agent_methods = if self.agent {
-            default_agent_methods()?
-        } else {
-            Vec::new()
-        };
+        let mut resolved = Vec::new();
+        let has_explicit = self
+            .methods
+            .iter()
+            .any(|m| matches!(m, AuthChoice::Method(_)));
+        for choice in &self.methods {
+            match choice {
+                AuthChoice::Method(method) => resolved.push(Rc::clone(method)),
+                AuthChoice::Agent => match default_agent_methods() {
+                    Ok(methods) => resolved.extend(methods.into_iter().map(Rc::new)),
+                    Err(_) if has_explicit => {}
+                    Err(error) => return Err(error),
+                },
+            }
+        }
         let pin = self
             .pin
             .as_deref()
@@ -214,21 +303,12 @@ impl SshClientBuilder {
         };
         // Public-key authentication consumes one attempt for the query and one
         // for the signed request, including for the last agent identity.
-        if let Some(methods) = self.methods.as_ref().filter(|m| !m.is_empty()) {
-            crate::authenticate_client(
-                &mut transport,
-                username,
-                methods,
-                methods.len().saturating_mul(2),
-            )?;
-        } else {
-            crate::authenticate_client(
-                &mut transport,
-                username,
-                &agent_methods,
-                agent_methods.len().saturating_mul(2),
-            )?;
-        }
+        let mut authenticator = crate::auth::ClientAuthenticator::new(
+            &mut transport,
+            username,
+            resolved.len().saturating_mul(2),
+        )?;
+        authenticator.authenticate_refs(resolved.iter().map(Rc::as_ref))?;
         Ok(SshClient {
             sessions: ClientSessions::new(transport),
         })
@@ -909,6 +989,47 @@ mod tests {
         assert_eq!(changed.port, Some(2222));
         assert_eq!(original.pin, changed.pin);
         assert_eq!(original.host, changed.host);
+    }
+
+    #[test]
+    fn builder_password_is_redacted_and_clone_appends_independently() {
+        let original = SshClient::builder().password("test-secret").agent(true);
+        let changed = original.clone().password("other-secret");
+        assert_eq!(original.methods.len(), 2);
+        assert_eq!(changed.methods.len(), 3);
+        assert!(
+            matches!(&original.methods[0], AuthChoice::Method(m) if matches!(m.as_ref(), ClientAuthMethod::Password(_)))
+        );
+        assert!(matches!(&original.methods[1], AuthChoice::Agent));
+        assert!(!format!("{changed:?}").contains("secret"));
+    }
+
+    #[test]
+    fn identity_file_missing_fails() {
+        let path = std::env::temp_dir()
+            .join(format!("neotales-missing-{}", std::process::id()))
+            .join("identity");
+        let result = SshClient::builder().identity_file(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn agent_order_and_explicit_methods_are_preserved() {
+        let builder = SshClient::builder()
+            .agent(true)
+            .password("a")
+            .agent(true)
+            .method(ClientAuthMethod::None)
+            .methods(vec![ClientAuthMethod::password("b")]);
+        assert!(matches!(builder.methods[0], AuthChoice::Agent));
+        assert!(
+            matches!(&builder.methods[1], AuthChoice::Method(m) if matches!(m.as_ref(), ClientAuthMethod::Password(_)))
+        );
+        assert!(
+            matches!(&builder.methods[2], AuthChoice::Method(m) if matches!(m.as_ref(), ClientAuthMethod::None))
+        );
+        assert_eq!(builder.methods.len(), 4);
+        assert_eq!(builder.agent(false).methods.len(), 3);
     }
 
     #[test]
