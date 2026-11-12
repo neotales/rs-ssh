@@ -26,6 +26,59 @@ use std::fmt;
 
 use neotales_ssh::{Error, Reader, Writer};
 
+// These lists are deliberately separate from the default/supported catalogs.
+pub(crate) const LEGACY_KEX: &[&str] = &[
+    "diffie-hellman-group1-sha1",
+    "diffie-hellman-group-exchange-sha1",
+];
+pub(crate) const LEGACY_CIPHERS: &[&str] = &["aes128-cbc", "aes256-cbc", "3des-cbc", "arcfour"];
+pub(crate) const LEGACY_MACS: &[&str] = &["hmac-sha1", "hmac-sha1-etm@openssh.com"];
+
+pub(crate) fn has_legacy_algorithms(proposal: &KexInit) -> bool {
+    proposal
+        .kex_algorithms
+        .iter()
+        .any(|n| LEGACY_KEX.contains(&n.as_str()))
+        || proposal
+            .server_host_key_algorithms
+            .iter()
+            .any(|n| n == "ssh-rsa")
+        || [
+            &proposal.encryption_algorithms_client_to_server,
+            &proposal.encryption_algorithms_server_to_client,
+        ]
+        .iter()
+        .any(|list| list.iter().any(|n| LEGACY_CIPHERS.contains(&n.as_str())))
+        || [
+            &proposal.mac_algorithms_client_to_server,
+            &proposal.mac_algorithms_server_to_client,
+        ]
+        .iter()
+        .any(|list| list.iter().any(|n| LEGACY_MACS.contains(&n.as_str())))
+}
+
+pub(crate) fn enable_legacy_algorithms(proposal: &mut KexInit) {
+    fn append(list: &mut Vec<String>, names: &[&str]) {
+        for name in names {
+            if !list.iter().any(|n| n == name) {
+                list.push((*name).to_owned());
+            }
+        }
+    }
+    append(&mut proposal.kex_algorithms, LEGACY_KEX);
+    append(&mut proposal.server_host_key_algorithms, &["ssh-rsa"]);
+    append(
+        &mut proposal.encryption_algorithms_client_to_server,
+        LEGACY_CIPHERS,
+    );
+    append(
+        &mut proposal.encryption_algorithms_server_to_client,
+        LEGACY_CIPHERS,
+    );
+    append(&mut proposal.mac_algorithms_client_to_server, LEGACY_MACS);
+    append(&mut proposal.mac_algorithms_server_to_client, LEGACY_MACS);
+}
+
 /// The SSH message number for `SSH_MSG_KEXINIT`.
 pub(crate) const SSH_MSG_KEXINIT: u8 = 20;
 

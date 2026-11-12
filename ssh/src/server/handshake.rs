@@ -305,6 +305,7 @@ pub type ServerError = ServerTransportError;
 /// baseline SSH-008 transport and uses a fresh KEXINIT cookie per connection.
 #[derive(Debug)]
 pub struct ServerConfig {
+    legacy_algorithms: bool,
     delayed_compression: bool,
     signer: Arc<Ed25519Signer>,
     additional_signers: Vec<Arc<HostSigner>>,
@@ -318,11 +319,22 @@ impl ServerConfig {
     pub fn new(signer: Ed25519Signer) -> Self {
         Self {
             signer: Arc::new(signer),
+            legacy_algorithms: false,
             delayed_compression: false,
             additional_signers: Vec::new(),
             server_version: DEFAULT_SERVER_IDENTIFICATION.to_owned(),
             kexinit: supported_server_kexinit([0; 16]),
         }
+    }
+
+    /// Enables deprecated SHA-1, CBC, 3DES, RC4, and group1 algorithms.
+    /// Appends them after modern choices. RSA SHA-1 still requires an RSA host key.
+    /// Custom proposals containing these names are rejected without this call.
+    #[must_use]
+    pub fn with_legacy_algorithms(mut self) -> Self {
+        self.legacy_algorithms = true;
+        crate::msg::kexinit::enable_legacy_algorithms(&mut self.kexinit);
+        self
     }
 
     /// Offers and permits `zlib@openssh.com`, activated only after authentication.
@@ -890,7 +902,7 @@ where
         self.sequence
             .observe_kexinit(Direction::Inbound, client_kexinit.first_kex_packet_follows)?;
         self.sequence.commit_inbound()?;
-        if algorithms.kex == crate::kex::modern::GEX {
+        if crate::kex::modern::is_gex(&algorithms.kex) {
             self.sequence.configure_group_exchange()?;
         }
         self.client_kexinit = Some(client_kexinit);
@@ -1770,7 +1782,7 @@ where
         if !crate::kex::rekey::supported(&self.initial_algorithm) {
             return Err(ServerTransportError::UnsupportedAlgorithm);
         }
-        if !matches!(self.session_id.len(), 32 | 48 | 64) {
+        if !matches!(self.session_id.len(), 20 | 32 | 48 | 64) {
             return Err(ServerTransportError::Kex(KexError::InvalidSessionId));
         }
         if self.rekey_proposal.reserved != 0 || self.rekey_proposal.first_kex_packet_follows {
@@ -1997,7 +2009,7 @@ where
         self.sequence
             .observe_rekey_kexinit(Direction::Inbound, peer_guessed)?;
         self.sequence.commit_inbound()?;
-        if algorithms.kex == crate::kex::modern::GEX {
+        if crate::kex::modern::is_gex(&algorithms.kex) {
             self.sequence.configure_rekey_group_exchange()?;
         }
         let state = self
@@ -2443,7 +2455,9 @@ impl ProtectionPlan {
         algorithms: &crate::msg::kexinit::NegotiatedAlgorithms,
         delayed_compression: bool,
     ) -> Result<Self, HandshakeError> {
-        if !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&algorithms.host_key.as_str()) {
+        if !SUPPORTED_HOST_KEY_ALGORITHMS.contains(&algorithms.host_key.as_str())
+            && algorithms.host_key != "ssh-rsa"
+        {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
         if !delayed_compression
@@ -2459,9 +2473,13 @@ impl ProtectionPlan {
             CompressionAlgorithm::from_name(&algorithms.compression_server_to_client)
                 .ok_or(HandshakeError::UnsupportedAlgorithm)?;
         if (!is_chacha_cipher(&algorithms.cipher_client_to_server)
-            && !SUPPORTED_MAC_ALGORITHMS.contains(&algorithms.mac_client_to_server.as_str()))
+            && !SUPPORTED_MAC_ALGORITHMS.contains(&algorithms.mac_client_to_server.as_str())
+            && !crate::msg::kexinit::LEGACY_MACS
+                .contains(&algorithms.mac_client_to_server.as_str()))
             || (!is_chacha_cipher(&algorithms.cipher_server_to_client)
-                && !SUPPORTED_MAC_ALGORITHMS.contains(&algorithms.mac_server_to_client.as_str()))
+                && !SUPPORTED_MAC_ALGORITHMS.contains(&algorithms.mac_server_to_client.as_str())
+                && !crate::msg::kexinit::LEGACY_MACS
+                    .contains(&algorithms.mac_server_to_client.as_str()))
         {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
@@ -2573,14 +2591,16 @@ fn suite_for(cipher: &str, mac: &str) -> Result<PacketSuite, HandshakeError> {
     ) {
         return Ok(PacketSuite::new(cipher, None)?);
     }
-    Ok(PacketSuite::new(cipher, Some(mac))?)
+    // Initial proposals were policy-gated; rekeys retain that exact local template.
+    Ok(PacketSuite::new_with_legacy(cipher, Some(mac), true)?)
 }
 
 fn iv_length(suite: PacketSuite) -> usize {
     match suite.encryption_name() {
         // OpenSSH derives no IV for ChaCha; the protector receives two zero
         // words through the existing key-material API instead.
-        CHACHA20_POLY1305_OPENSSH_NAME => 0,
+        CHACHA20_POLY1305_OPENSSH_NAME | "arcfour" => 0,
+        "3des-cbc" => 8,
         _ if suite.integrity_name().is_none() => GCM_IV_LENGTH,
         _ => CTR_IV_LENGTH,
     }
@@ -2588,8 +2608,9 @@ fn iv_length(suite: PacketSuite) -> usize {
 
 fn encryption_key_length(suite: PacketSuite) -> Result<usize, HandshakeError> {
     match suite.encryption_name() {
-        AES128_CTR | AES128_GCM_OPENSSH => Ok(AES128_KEY_LENGTH),
-        AES256_CTR | AES256_GCM_OPENSSH => Ok(AES256_KEY_LENGTH),
+        AES128_CTR | AES128_GCM_OPENSSH | "aes128-cbc" | "arcfour" => Ok(AES128_KEY_LENGTH),
+        AES256_CTR | AES256_GCM_OPENSSH | "aes256-cbc" => Ok(AES256_KEY_LENGTH),
+        "3des-cbc" => Ok(24),
         CHACHA20_POLY1305_OPENSSH_NAME => Ok(CHACHA_KEY_LENGTH),
         _ => Err(HandshakeError::UnsupportedAlgorithm),
     }
@@ -2598,6 +2619,7 @@ fn encryption_key_length(suite: PacketSuite) -> Result<usize, HandshakeError> {
 fn integrity_key_length(suite: PacketSuite) -> usize {
     match suite.integrity_name() {
         None => 0,
+        Some("hmac-sha1" | "hmac-sha1-etm@openssh.com") => 20,
         Some(name) if name.contains("sha2-512") => SHA512_INTEGRITY_LENGTH,
         Some(_) => SHA256_INTEGRITY_LENGTH,
     }
@@ -2634,6 +2656,9 @@ fn is_would_block_error(error: &ServerTransportError) -> bool {
 }
 
 fn validate_config(config: &ServerConfig) -> Result<(), HandshakeError> {
+    if !config.legacy_algorithms && crate::msg::kexinit::has_legacy_algorithms(&config.kexinit) {
+        return Err(HandshakeError::UnsupportedAlgorithm);
+    }
     let version_length = config.server_version.len().saturating_add(2);
     if !config.server_version.starts_with("SSH-2.0-")
         || config.server_version.is_empty()

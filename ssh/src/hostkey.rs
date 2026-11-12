@@ -97,11 +97,16 @@ where
                 Some(verified),
             )
         }
-        "rsa-sha2-256" | "rsa-sha2-512" => {
+        "rsa-sha2-256" | "rsa-sha2-512" | "ssh-rsa" => {
             let key = neotales_ssh::rsa_hostkey::RsaPublicKey::from_blob(blob)
                 .map_err(|_| HostKeyError::InvalidPublicKey)?;
-            neotales_ssh::rsa_hostkey::verify_host_key_signature(&key, signature, hash)
-                .map_err(|_| HostKeyError::InvalidSignature)?;
+            // The handshake admits this name only from a policy-gated proposal.
+            let verify = if algorithm == "ssh-rsa" {
+                neotales_ssh::rsa_hostkey::verify_legacy_host_key_signature
+            } else {
+                neotales_ssh::rsa_hostkey::verify_host_key_signature
+            };
+            verify(&key, signature, hash).map_err(|_| HostKeyError::InvalidSignature)?;
             (HostPublicKey::Rsa(key), None)
         }
         "ecdsa-sha2-nistp256" => {
@@ -159,7 +164,7 @@ impl HostSigner {
                 Self::Certificate { .. },
                 neotales_ssh::cert::SSH_ED25519_CERT_V01
             ) | (Self::Ed25519(_), SSH_ED25519)
-                | (Self::Rsa(_), "rsa-sha2-256" | "rsa-sha2-512")
+                | (Self::Rsa(_), "rsa-sha2-256" | "rsa-sha2-512" | "ssh-rsa")
                 | (Self::Ecdsa(_), "ecdsa-sha2-nistp256")
                 | (Self::EcdsaP384(_), "ecdsa-sha2-nistp384")
                 | (Self::EcdsaP521(_), "ecdsa-sha2-nistp521")
@@ -194,7 +199,15 @@ impl HostSigner {
                 signer.sign_exchange_hash(hash)
             }
             Self::Rsa(signer) => signer
-                .sign_with_algorithm(hash, algorithm)
+                .sign_with_algorithm(
+                    hash,
+                    if algorithm == "ssh-rsa" {
+                        neotales_ssh::rsa_hostkey::RsaHostKeyAlgorithm::LegacySha1
+                    } else {
+                        neotales_ssh::rsa_hostkey::RsaHostKeyAlgorithm::from_name(algorithm)
+                            .map_err(|_| HostKeyError::UnsupportedAlgorithm)?
+                    },
+                )
                 .map_err(|_| HostKeyError::SigningFailed),
             Self::Ecdsa(signer) => signer
                 .sign_exchange_hash(hash)

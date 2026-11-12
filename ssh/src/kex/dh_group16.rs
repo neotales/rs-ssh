@@ -166,6 +166,37 @@ const _: () = {
 pub(crate) struct DhGroup16;
 
 impl DhGroup16 {
+    /// Reuses the wiping DH private-key owner for RFC 4253's legacy group1.
+    pub(crate) fn group1_public(ephemeral: &EphemeralKey) -> Result<Vec<u8>, KexError> {
+        let private =
+            ephemeral.material_ref::<Group16Private>(KEX_DIFFIE_HELLMAN_GROUP16_SHA512)?;
+        let exponent = Zeroizing::new(BigUint::from_bytes_be(&private.0));
+        Ok(BigUint::from(2_u8)
+            .modpow(&exponent, &group1_prime()?)
+            .to_bytes_be())
+    }
+
+    /// Validates the peer against the trusted group1 prime before agreement.
+    pub(crate) fn group1_agree(
+        ephemeral: EphemeralKey,
+        peer: &[u8],
+    ) -> Result<SharedSecret, KexError> {
+        if peer.is_empty() || peer.len() > 128 || peer[0] == 0 {
+            return Err(KexError::InvalidPublicKey);
+        }
+        let prime = group1_prime()?;
+        let peer = BigUint::from_bytes_be(peer);
+        if peer <= one() || peer >= &prime - one() {
+            return Err(KexError::InvalidPublicKey);
+        }
+        let private =
+            ephemeral.into_material::<Group16Private>(KEX_DIFFIE_HELLMAN_GROUP16_SHA512)?;
+        let exponent = Zeroizing::new(BigUint::from_bytes_be(&private.0));
+        let shared = Zeroizing::new(peer.modpow(&exponent, &prime));
+        let magnitude = Zeroizing::new(shared.to_bytes_be());
+        SharedSecret::from_raw(&magnitude)
+    }
+
     /// Creates the group 16 mechanism.
     #[must_use]
     pub(crate) const fn new() -> Self {
@@ -1152,6 +1183,23 @@ pub(crate) fn derive_group16_keys(
 
 fn group16_prime() -> Result<BigUint, KexError> {
     BigUint::parse_bytes(DH_GROUP16_PRIME_HEX.as_bytes(), 16).ok_or(KexError::InvalidProposal)
+}
+
+fn group1_prime() -> Result<BigUint, KexError> {
+    // RFC 4253 section 8.1 (Oakley group 2), not RFC 2409's 768-bit group.
+    BigUint::parse_bytes(
+        concat!(
+            "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1",
+            "29024E088A67CC74020BBEA63B139B22514A08798E3404DD",
+            "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245",
+            "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED",
+            "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381",
+            "FFFFFFFFFFFFFFFF"
+        )
+        .as_bytes(),
+        16,
+    )
+    .ok_or(KexError::InvalidProposal)
 }
 
 fn one() -> BigUint {

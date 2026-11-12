@@ -12,8 +12,8 @@ use std::io::{self, Read, Write};
 use neotales_ssh::{Error, MAX_PACKET_CONTENT, build_packet, decode_packet};
 
 use crate::cipher::{
-    AES_BLOCK_SIZE, AlignmentError, PacketAlignment, PacketProtectionError, PacketProtector,
-    PacketSuite, PlaintextBytes, PlaintextSlot,
+    AlignmentError, PacketAlignment, PacketProtectionError, PacketProtector, PacketSuite,
+    PlaintextBytes, PlaintextSlot,
 };
 use crate::hostkey::{HostPublicKey, VerifiedHostKey, VerifiedServerHostKey};
 use crate::kex::rekey::Client as RekeyClient;
@@ -610,12 +610,16 @@ fn read_eam_packet_buffered(
     protector: &mut PacketProtector,
     sequence: u32,
 ) -> Result<Vec<u8>, TransportError> {
-    if buffer.filled < 4 {
-        buffer.fill_to(stream, 4)?;
+    let probe_size = protector.suite().length_probe_size();
+    if buffer.filled < probe_size {
+        buffer.fill_to(stream, probe_size)?;
     }
     if buffer.expected_length.is_none() {
         let expected = (|| {
-            let encrypted_length = buffer.bytes.get(..4).ok_or(TransportError::Truncated)?;
+            let encrypted_length = buffer
+                .bytes
+                .get(..probe_size)
+                .ok_or(TransportError::Truncated)?;
             let packet_length =
                 usize::try_from(protector.decrypt_length(sequence, encrypted_length)?)
                     .map_err(|_error| PacketProtectionError::LimitExceeded)?;
@@ -1354,28 +1358,13 @@ pub(crate) fn read_protected_packet(
     stream: &mut impl Read,
     suite: PacketSuite,
 ) -> Result<Vec<u8>, TransportError> {
-    let alignment = PacketAlignment::for_suite(suite);
-    // Only a block cipher reaches this reader: the ChaCha length field is
-    // encrypted with the header key and has its own reader, and the AEADs
-    // authenticate the length in clear, so `AES_BLOCK_SIZE` here is a genuine
-    // first-block read rather than a stand-in for the suite's block size.
-    let mut encoded = [0_u8; AES_BLOCK_SIZE];
-    read_exact(stream, &mut encoded, AES_BLOCK_SIZE)?;
-    let packet_length = packet_length(&encoded)?;
-    let total_length = packet_length.checked_add(4).ok_or(Error::LimitExceeded)?;
-    if total_length < AES_BLOCK_SIZE {
-        return Err(PacketProtectionError::Truncated.into());
-    }
-    alignment.validate_packet_length(packet_length)?;
-
-    let tag_length = tag_length(suite);
-    let remaining = total_length
-        .saturating_sub(AES_BLOCK_SIZE)
-        .checked_add(tag_length)
-        .ok_or(Error::LimitExceeded)?;
-    let mut packet = encoded.to_vec();
-    packet.resize(total_length.saturating_add(tag_length), 0);
-    read_exact(stream, &mut packet[AES_BLOCK_SIZE..], remaining)?;
+    // AEAD/ETM lengths are clear, independent of the cipher block size.
+    // Reading an AES-sized prefix rejects a valid minimum-sized 3DES packet.
+    let mut packet = vec![0; 4];
+    read_exact(stream, &mut packet, 4)?;
+    let total_length = protected_packet_wire_length(suite, &packet)?;
+    packet.resize(total_length, 0);
+    read_exact(stream, &mut packet[4..], total_length - 4)?;
     Ok(packet)
 }
 
@@ -1434,37 +1423,15 @@ pub(crate) fn read_eam_payload(
     protector: &mut PacketProtector,
     sequence_number: u32,
 ) -> Result<Vec<u8>, TransportError> {
-    let mut packet = vec![0_u8; AES_BLOCK_SIZE];
-    read_exact(stream, &mut packet, AES_BLOCK_SIZE)?;
-    let tag_length = tag_length(protector.suite());
-    let maximum_packet_length = MAX_PACKET_CONTENT
-        .checked_add(1)
-        .and_then(|length| length.checked_add(AES_BLOCK_SIZE - 1))
-        .map(|length| length / AES_BLOCK_SIZE * AES_BLOCK_SIZE)
-        .and_then(|length| length.checked_add(tag_length))
-        .ok_or(Error::LimitExceeded)?;
-    loop {
-        let error = match protector.open(sequence_number, &packet) {
-            Ok(payload) => return Ok(payload),
-            Err(PacketProtectionError::CounterExhausted) => {
-                return Err(PacketProtectionError::CounterExhausted.into());
-            }
-            Err(error) => error,
-        };
-
-        if packet.len() >= maximum_packet_length {
-            return Err(error.into());
-        }
-        let start = packet.len();
-        let next_length = AES_BLOCK_SIZE.min(maximum_packet_length.saturating_sub(start));
-        packet.resize(start.saturating_add(next_length), 0);
-        if let Err(read_error) = read_exact(stream, &mut packet[start..], next_length) {
-            if error == PacketProtectionError::AuthenticationFailed {
-                return Err(error.into());
-            }
-            return Err(read_error);
-        }
-    }
+    let prefix = protector.suite().length_probe_size();
+    let mut packet = vec![0; prefix];
+    read_exact(stream, &mut packet, prefix)?;
+    let length = usize::try_from(protector.decrypt_length(sequence_number, &packet)?)
+        .map_err(|_| PacketProtectionError::LimitExceeded)?;
+    let total = validate_eam_packet_length(protector.suite(), length)?;
+    packet.resize(total, 0);
+    read_exact(stream, &mut packet[prefix..], total - prefix)?;
+    Ok(protector.open(sequence_number, &packet)?)
 }
 
 fn packet_length(prefix: &[u8]) -> Result<usize, TransportError> {
@@ -1507,6 +1474,7 @@ fn read_exact(
 
 fn tag_length(suite: PacketSuite) -> usize {
     match suite.integrity_name() {
+        Some("hmac-sha1" | "hmac-sha1-etm@openssh.com") => 20,
         None => GCM_TAG_LENGTH,
         Some(name) if name.contains("sha2-512") => SHA512_KEY_LENGTH,
         Some(_) => SHA256_KEY_LENGTH,

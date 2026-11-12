@@ -22,6 +22,47 @@ use msg::kexinit::{
 };
 use neotales_ssh::{Error, Reader, Writer, encode_name_list};
 
+#[test]
+fn default_proposals_and_supported_catalogs_exclude_every_legacy_name() {
+    use neotales_ssh::{ClientConfig, ServerConfig, hostkey::Ed25519Signer};
+    let client = ClientConfig::new();
+    let server = ServerConfig::new(Ed25519Signer::from_seed(&mut [7; 32]));
+    let legacy = [
+        "ssh-rsa",
+        "hmac-sha1",
+        "hmac-sha1-etm@openssh.com",
+        "aes128-cbc",
+        "aes256-cbc",
+        "3des-cbc",
+        "arcfour",
+        "diffie-hellman-group1-sha1",
+        "diffie-hellman-group-exchange-sha1",
+    ];
+    for wire in [
+        client.kexinit().encode(),
+        server.kexinit().encode(),
+        KexInit::new([0; 16]).encode(),
+        KexInit::client_defaults([0; 16]).encode(),
+        KexInit::server_defaults([0; 16]).encode(),
+    ] {
+        let wire = wire.expect("encode");
+        let decoded = KexInit::decode(&wire).expect("decode");
+        for list in [
+            &decoded.kex_algorithms,
+            &decoded.server_host_key_algorithms,
+            &decoded.encryption_algorithms_client_to_server,
+            &decoded.encryption_algorithms_server_to_client,
+            &decoded.mac_algorithms_client_to_server,
+            &decoded.mac_algorithms_server_to_client,
+        ] {
+            assert!(!list.iter().any(|n| legacy.contains(&n.as_str())));
+        }
+    }
+    for name in legacy {
+        assert!(!SUPPORTED_ALGORITHMS.contains(&name), "{name}");
+    }
+}
+
 /// How many times `name` appears in `names`.
 fn occurrences(names: &[&str], name: &str) -> usize {
     names.iter().filter(|candidate| **candidate == name).count()

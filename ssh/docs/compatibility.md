@@ -39,7 +39,7 @@ and on Unix, real `ssh-agent` authentication.
 ## Protocol coverage that is not a live OpenSSH claim
 
 Both handshakes support `ssh-ed25519`, `rsa-sha2-256`, `rsa-sha2-512`, and
-ECDSA P-256/P-384/P-521 host keys. SHA-1 `ssh-rsa` is not offered.
+ECDSA P-256/P-384/P-521 host keys. SHA-1 `ssh-rsa` is not offered by default.
 `ServerConfig::with_rsa_host_key` and the ECDSA host-key builders add signing
 keys beside the primary Ed25519 key. The server filters proposals to available
 keys and signs with the negotiated algorithm. Use
@@ -190,14 +190,42 @@ All three names were added to supported/default catalogs only after both public
 handshake tests passed. Existing choices and their preference order remain ahead
 of the new names. Strict/non-strict tests cover protected traffic and exact GEX
 message order; independent fixed fixtures cover transcript hashes and multi-block
-key expansion. No SHA-1 group exchange, group1, CBC, 3DES, RC4, HMAC-SHA1, or
-sntrup was added. Post-establishment rekey supports curve25519-sha256,
+key expansion. Post-establishment rekey supports curve25519-sha256,
 ecdh-sha2-nistp256/384/521, diffie-hellman-group16-sha512,
 diffie-hellman-group-exchange-sha256 and mlkem768x25519-sha256. Rekey retains
 the initial algorithm and first exchange hash as the session identifier, and
 uses that algorithm's initial-handshake hash and key derivation. Other names
 remain rejected and failed exchanges are terminal. In-process tests cover
 repeated rekeys and protected traffic; no new live-peer evidence is claimed.
+
+### Deprecated algorithms: explicit opt-in only
+
+`ClientConfig::with_legacy_algorithms()` and
+`ServerConfig::with_legacy_algorithms()` explicitly enable these deprecated names:
+
+- `ssh-rsa` (RSA PKCS#1 v1.5 SHA-1 host signatures; requires an RSA host key)
+- `hmac-sha1` and `hmac-sha1-etm@openssh.com`
+- `aes128-cbc`, `aes256-cbc`, `3des-cbc`, and `arcfour`
+- `diffie-hellman-group1-sha1` (RFC 4253 1024-bit MODP group, generator 2)
+- `diffie-hellman-group-exchange-sha1` (only the same approved 4096-bit
+  group16 prime and generator 2 used by SHA-256 group exchange)
+
+Defaults and supported-by-default catalogs still exclude every name above.
+Merely overriding KEXINIT does not opt in: both configs reject a custom legacy
+proposal without the method call. Opt-in appends legacy names after existing
+choices; callers can supply a custom proposal to choose their order. The same
+policy-bound proposals govern subsequent rekeys. RSA SHA-2 remains unchanged;
+`server-sig-algs` preference never selects SHA-1 for authentication.
+
+CBC uses continuous chaining across SSH packets with SSH padding, not PKCS#7.
+`arcfour` is the original 128-bit-key RC4 (not arcfour128/256 with initial-byte
+discard), implemented in pure Rust inside this crate. These algorithms are
+cryptographically obsolete: use opt-in only for unavoidable legacy compatibility.
+Packet fixtures use independent OpenSSL cipher and Python HMAC-SHA1 outputs;
+loopback tests cover SHA-1 RSA host signatures, protected traffic, and client-
+and server-initiated rekeys. This is not new live OpenSSH interoperability evidence.
+No C library or new lockfile crate was added. sntrup, security keys, and ML-DSA
+are outside this change.
 
 ## Not verified or not claimed
 

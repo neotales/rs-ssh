@@ -12,12 +12,18 @@ use zeroize::Zeroizing;
 pub(crate) const P384: &str = "ecdh-sha2-nistp384";
 pub(crate) const P521: &str = "ecdh-sha2-nistp521";
 pub(crate) const GEX: &str = "diffie-hellman-group-exchange-sha256";
+pub(crate) const GEX_SHA1: &str = "diffie-hellman-group-exchange-sha1";
+pub(crate) const GROUP1: &str = "diffie-hellman-group1-sha1";
+
+pub(crate) fn is_gex(name: &str) -> bool {
+    matches!(name, GEX | GEX_SHA1)
+}
 // A deliberately narrow safe-prime policy, not arbitrary untrusted DH groups.
 const GROUP_BITS: u32 = 4096;
 const REQUEST: [u32; 3] = [4096, 4096, 4096];
 
 pub(crate) fn supported(name: &str) -> bool {
-    matches!(name, P384 | P521 | GEX)
+    matches!(name, P384 | P521 | GEX | GEX_SHA1 | GROUP1)
 }
 
 #[derive(Debug)]
@@ -70,6 +76,9 @@ impl Context {
             positive(&mut writer, &[2])?;
             positive(&mut writer, client)?;
             positive(&mut writer, server)?;
+        } else if self.algorithm == GROUP1 {
+            positive(&mut writer, client)?;
+            positive(&mut writer, server)?;
         } else {
             writer.write_string(client)?;
             writer.write_string(server)?;
@@ -85,10 +94,14 @@ enum Secret {
     P384(p384::SecretKey),
     P521(p521::SecretKey),
     Dh(EphemeralKey),
+    Group1(EphemeralKey),
 }
 impl Secret {
     fn generate(algorithm: &str) -> Result<Self, KexError> {
-        if algorithm == GEX {
+        if algorithm == GROUP1 {
+            return DhGroup16::new().generate_private().map(Self::Group1);
+        }
+        if is_gex(algorithm) {
             return DhGroup16::new().generate_private().map(Self::Dh);
         }
         for _ in 0..128 {
@@ -114,6 +127,7 @@ impl Secret {
             Self::P384(key) => Ok(key.public_key().to_sec1_point(false).to_bytes().to_vec()),
             Self::P521(key) => Ok(key.public_key().to_sec1_point(false).to_bytes().to_vec()),
             Self::Dh(key) => DhGroup16::new().public_key(key),
+            Self::Group1(key) => DhGroup16::group1_public(key),
         }
     }
     fn agree(self, peer: &[u8]) -> Result<SharedSecret, KexError> {
@@ -139,6 +153,7 @@ impl Secret {
             Self::P384(key) => curve!(key, p384, 97),
             Self::P521(key) => curve!(key, p521, 133),
             Self::Dh(key) => DhGroup16::new().agree(key, peer),
+            Self::Group1(key) => DhGroup16::group1_agree(key, peer),
         }
     }
 }
@@ -157,7 +172,7 @@ pub(crate) struct Completion {
 }
 impl Client {
     pub(crate) fn new(context: Context) -> Result<Self, KexError> {
-        let secret = if context.algorithm == GEX {
+        let secret = if is_gex(&context.algorithm) {
             None
         } else {
             Some(Secret::generate(&context.algorithm)?)
@@ -176,19 +191,23 @@ impl Client {
     }
     pub(crate) fn first(&self) -> Result<Vec<u8>, KexError> {
         let mut writer = Writer::new();
-        if self.context.algorithm == GEX {
+        if is_gex(&self.context.algorithm) {
             writer.write_byte(34);
             for value in REQUEST {
                 writer.write_uint32(value);
             }
         } else {
             writer.write_byte(30);
-            writer.write_string(&self.public)?;
+            if self.context.algorithm == GROUP1 {
+                positive(&mut writer, &self.public)?;
+            } else {
+                writer.write_string(&self.public)?;
+            }
         }
         Ok(writer.into_bytes())
     }
     pub(crate) fn accept_group(&mut self, packet: &[u8]) -> Result<Vec<u8>, KexError> {
-        if self.context.algorithm != GEX || self.secret.is_some() {
+        if !is_gex(&self.context.algorithm) || self.secret.is_some() {
             return Err(KexError::InvalidState);
         }
         let mut reader = Reader::new(packet);
@@ -213,7 +232,7 @@ impl Client {
     }
     pub(crate) fn complete(mut self, packet: &[u8]) -> Result<Completion, KexError> {
         let mut reader = Reader::new(packet);
-        let expected = if self.context.algorithm == GEX {
+        let expected = if is_gex(&self.context.algorithm) {
             33
         } else {
             31
@@ -222,7 +241,7 @@ impl Client {
             return Err(KexError::InvalidMessageType);
         }
         let host = reader.read_string()?.to_vec();
-        let peer = if expected == 33 {
+        let peer = if expected == 33 || self.context.algorithm == GROUP1 {
             magnitude(&mut reader)?
         } else {
             reader.read_string_with_limit(133)?
@@ -263,13 +282,14 @@ pub(crate) struct Prepared {
     pub(crate) completion: Completion,
     public: Vec<u8>,
     gex: bool,
+    group1: bool,
 }
 impl Prepared {
     pub(crate) fn reply(&self, signature: &[u8]) -> Result<Vec<u8>, KexError> {
         let mut writer = Writer::new();
         writer.write_byte(if self.gex { 33 } else { 31 });
         writer.write_string(&self.completion.host)?;
-        if self.gex {
+        if self.gex || self.group1 {
             positive(&mut writer, &self.public)?;
         } else {
             writer.write_string(&self.public)?;
@@ -294,7 +314,7 @@ impl Server {
         }
         let mut reader = Reader::new(packet);
         let message = reader.read_byte()?;
-        let gex = self.context.algorithm == GEX;
+        let gex = is_gex(&self.context.algorithm);
         if gex && self.bounds.is_none() {
             if message != 34 {
                 return Err(KexError::InvalidMessageType);
@@ -318,7 +338,7 @@ impl Server {
         if message != if gex { 32 } else { 30 } {
             return Err(KexError::InvalidMessageType);
         }
-        let client = if gex {
+        let client = if gex || self.context.algorithm == GROUP1 {
             magnitude(&mut reader)?
         } else {
             reader.read_string_with_limit(133)?
@@ -342,6 +362,7 @@ impl Server {
             },
             public,
             gex,
+            group1: self.context.algorithm == GROUP1,
         }))
     }
 }
@@ -388,6 +409,7 @@ fn positive(writer: &mut Writer, value: &[u8]) -> Result<(), KexError> {
 }
 fn hash(algorithm: &str, input: &[u8]) -> Vec<u8> {
     match algorithm {
+        GROUP1 | GEX_SHA1 => sha1::Sha1::digest(input).to_vec(),
         P384 => Sha384::digest(input).to_vec(),
         P521 => Sha512::digest(input).to_vec(),
         _ => Sha256::digest(input).to_vec(),
@@ -404,12 +426,13 @@ pub(crate) fn derive(
         P384 => 48,
         P521 => 64,
         GEX => 32,
+        GROUP1 | GEX_SHA1 => 20,
         _ => return Err(KexError::AlgorithmMismatch),
     };
     if h.len() != width {
         return Err(KexError::InvalidExchangeHash);
     }
-    if !matches!(sid.len(), 32 | 48 | 64) {
+    if !matches!(sid.len(), 20 | 32 | 48 | 64) {
         return Err(KexError::InvalidSessionId);
     }
     let key = |letter: u8, length: usize| -> Result<Zeroizing<Vec<u8>>, KexError> {
@@ -482,15 +505,27 @@ mod tests {
                 "41e64f83dca59987206aecd3d1bcb581c94c711cfaf2ec09c3d4b1d42896c352",
                 "c07d0c483bdf2195b6df2e9745542d7657d9142a3314e5a1841809067e8034962ca5f921cd865e1009cb3d4ec88e9ab0c0d888774d3cf3e2900481d38b199588b6cd9b59b8ff21c34158810652e871a512accdb860b04603b22e8f6c38240403ad065eb0",
             ),
+            (
+                GEX_SHA1,
+                "b309a7d04df197b17872d348f149de133238e6bd",
+                "d669912d7dea4d7d99dd94b60de2a43447bac320479074539e977e404b110fe1b4138eb39a32b5b5ee824f49d5a6869cea9a5c39f2ddc2bea964ba9282d8892c27e308f6a5e7685db2b247e4ee1247f9cf4bfa043203f2db5271898c40d0de9c6a4dcf25",
+            ),
+            (
+                GROUP1,
+                "112de0fae3a5220b5c31a014407ae80ba658d5f1",
+                "96fb9715c3df8ff234ac7a72ca8fbc3f2d2536976cc99ccfe51fd8377977a5bdab7c4ff8ad1afd3ef209fefe9277f2b3901c00b44d3ccf0e0f50196a2c9dcdc54254e8e0a92cc43e594441f016a788d7b0b5abb4db4b80987c8f8a8a4648feefcb56a7f6",
+            ),
         ];
         for (algorithm, expected_h, expected_a) in fixtures {
             let shared = SharedSecret::from_raw(&[0x80, 1]).unwrap();
-            let (client, server, bounds) = if algorithm == GEX {
+            let (client, server, bounds) = if is_gex(algorithm) {
                 (
                     b"\x03".as_slice(),
                     b"\x04".as_slice(),
                     Some([2048, 4096, 8192]),
                 )
+            } else if algorithm == GROUP1 {
+                (b"\x03".as_slice(), b"\x04".as_slice(), None)
             } else {
                 (b"client".as_slice(), b"server".as_slice(), None)
             };
@@ -524,6 +559,34 @@ mod tests {
     }
 
     #[test]
+    fn group1_modular_arithmetic_matches_python_pow_fixture() {
+        // Critical crypto boundary: Python pow(base, exponent, RFC4253_prime),
+        // not a second invocation of this implementation, is the oracle.
+        let private = || {
+            DhGroup16::new()
+                .from_private_bytes(std::array::from_fn(|i| u8::try_from(i).unwrap()))
+                .unwrap()
+        };
+        assert_eq!(
+            DhGroup16::group1_public(&private()).unwrap(),
+            decode_hex(
+                "0bd459e79b6c61d44a5b4a8093094433af58dd6760aea0c719dcfede25b8afb54772843d5fac44a9fed1a58f8cfa8396b8839a068acfe36001d0f2a61a015f8cb5f7511d3142010f107ebe8de54fcf363a817219e6b561cbf074d155285bdc98f00dda4ceaa736e5fcdf8b437f7d0d8d3f6b6c2eb6fa891b749f10c9ce27cc3a"
+            )
+        );
+        let peer = decode_hex(
+            "cc8e15e6a9f146e9efceeeec6c98f5fb3fd3a24ae507715971e7de646ab51f41ac9beddf465da9a8f1a12bb34dae0f25f9f9fc543946085ce35934d47b587b4f82e2c6c5781bd958abec87db04ea7562de6cec84ac2ea6af3cacc37fcd60ce9d31ee597c95668523bbee2d67a051934c5e3f24daa0c154f3bb8e6ce2ddfab438",
+        );
+        let shared = DhGroup16::group1_agree(private(), &peer).unwrap();
+        let expected = decode_hex(
+            "0000008039567faad8444a2dd3fa320e85d651839c6051aec89e4ad974e8db49d32ac7be42dc8cd10a5f3ee7e895601c2b231df9d483b46aa6300610282d973bca80732b684eab9ae2b21dce8547005284b317978646e49fea012d13c72c9f1a1ab2e2f2482f505d6ac49554d85f5e82ddcdb707d1e6ae58466cc9a5bec519fa8e1c3c86",
+        );
+        assert_eq!(shared.as_bytes(), expected);
+        for peer in [vec![], vec![0], vec![1], vec![0xff; 129], vec![0xff; 128]] {
+            assert!(DhGroup16::group1_agree(private(), &peer).is_err());
+        }
+    }
+
+    #[test]
     fn group_bounds_safe_prime_and_generator_reject_before_key_generation() {
         let prime = DhGroup16::new().prime_bytes().unwrap();
         let mut wrong = prime.clone();
@@ -539,10 +602,12 @@ mod tests {
             packet.write_byte(31);
             positive(&mut packet, &p).unwrap();
             positive(&mut packet, &g).unwrap();
-            let mut client = Client::new(context(GEX)).unwrap();
-            assert!(client.accept_group(packet.as_bytes()).is_err());
-            assert!(client.secret.is_none());
-            assert!(client.public.is_empty());
+            for algorithm in [GEX, GEX_SHA1] {
+                let mut client = Client::new(context(algorithm)).unwrap();
+                assert!(client.accept_group(packet.as_bytes()).is_err());
+                assert!(client.secret.is_none());
+                assert!(client.public.is_empty());
+            }
         }
         validate_group(&prime, &[2], REQUEST).unwrap();
         for bounds in [

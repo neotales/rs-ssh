@@ -14,6 +14,124 @@ use std::{
 type Fixture = (Arc<ServerConfig>, [Vec<u8>; 4]);
 
 #[test]
+fn custom_legacy_proposals_fail_closed_without_config_opt_in() {
+    for name in [
+        "ssh-rsa",
+        "hmac-sha1",
+        "hmac-sha1-etm@openssh.com",
+        "aes128-cbc",
+        "aes256-cbc",
+        "3des-cbc",
+        "arcfour",
+        "diffie-hellman-group1-sha1",
+        "diffie-hellman-group-exchange-sha1",
+    ] {
+        let mut proposal = KexInit::new([0; 16]);
+        if name == "ssh-rsa" {
+            proposal.server_host_key_algorithms = vec![name.to_owned()];
+        } else if name.starts_with("hmac-") {
+            proposal.mac_algorithms_client_to_server = vec![name.to_owned()];
+        } else if name.starts_with("diffie-") {
+            proposal.kex_algorithms = vec![name.to_owned()];
+        } else {
+            proposal.encryption_algorithms_server_to_client = vec![name.to_owned()];
+        }
+        assert!(
+            matches!(
+                ClientConfig::with_kexinit(proposal.clone())
+                    .connect_with_host_keys(std::io::Cursor::new(Vec::new()), |_| Ok::<(), ()>(())),
+                Err(neotales_ssh::client::HandshakeError::UnsupportedAlgorithm)
+            ),
+            "client: {name}"
+        );
+        assert!(
+            matches!(
+                ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32]))
+                    .with_kexinit(proposal)
+                    .accept(std::io::Cursor::new(Vec::new())),
+                Err(neotales_ssh::server::HandshakeError::UnsupportedAlgorithm)
+            ),
+            "server: {name}"
+        );
+    }
+}
+
+#[test]
+fn legacy_opt_in_completes_host_signature_packets_and_rekey()
+-> Result<(), Box<dyn std::error::Error>> {
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024)?;
+    let expected = RsaHostSigner::from_private_key(key.clone())?.public_key_blob()?;
+    for (kex, cipher, mac) in [
+        ("curve25519-sha256", "aes128-cbc", "hmac-sha1"),
+        (
+            "diffie-hellman-group1-sha1",
+            "aes256-cbc",
+            "hmac-sha1-etm@openssh.com",
+        ),
+        (
+            "diffie-hellman-group-exchange-sha1",
+            "3des-cbc",
+            "hmac-sha1",
+        ),
+        ("curve25519-sha256", "arcfour", "hmac-sha1"),
+        ("curve25519-sha256", "3des-cbc", "hmac-sha1-etm@openssh.com"),
+        ("curve25519-sha256", "aes128-ctr", "hmac-sha1"),
+    ] {
+        let mut proposal = KexInit::new([0; 16]);
+        proposal.kex_algorithms = vec![kex.to_owned()];
+        proposal.server_host_key_algorithms = vec!["ssh-rsa".to_owned()];
+        proposal.encryption_algorithms_client_to_server = vec![cipher.to_owned()];
+        proposal.encryption_algorithms_server_to_client = vec![cipher.to_owned()];
+        proposal.mac_algorithms_client_to_server = vec![mac.to_owned()];
+        proposal.mac_algorithms_server_to_client = vec![mac.to_owned()];
+        let server = ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32]))
+            .with_rsa_host_key(RsaHostSigner::from_private_key(key.clone())?)
+            .with_legacy_algorithms()
+            .with_kexinit(proposal.clone());
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let address = listener.local_addr()?;
+        let thread = std::thread::spawn(move || -> Result<(), String> {
+            let run = || -> Result<(), Box<dyn std::error::Error>> {
+                let (stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+                let mut transport = server.accept(stream)?;
+                assert_eq!(transport.host_key_algorithm(), "ssh-rsa");
+                assert_eq!(transport.read_auth_packet()?, [5]);
+                transport.write_payload(&[52])?;
+                // The next read services the client's rekey through the same policy.
+                assert_eq!(transport.read_auth_packet()?, [5, 1]);
+                transport.write_payload(&[52])?;
+                transport.rekey()?;
+                transport.write_payload(&[52])?;
+                Ok(())
+            };
+            run().map_err(|error| error.to_string())
+        });
+        let stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+        let mut client = ClientConfig::with_kexinit(proposal)
+            .with_legacy_algorithms()
+            .connect_with_host_keys(stream, |key| {
+                if key.to_blob().is_ok_and(|blob| blob == expected) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            })?;
+        client.write_payload(&[5])?;
+        assert_eq!(client.read_payload()?, [52]);
+        client.rekey()?;
+        client.write_payload(&[5, 1])?;
+        assert_eq!(client.read_payload()?, [52]);
+        assert_eq!(client.read_payload()?, [52]);
+        thread.join().map_err(|_| "server panicked")??;
+    }
+    Ok(())
+}
+
+#[test]
 fn compression_is_opt_in_and_authentication_activates_both_directions()
 -> Result<(), Box<dyn std::error::Error>> {
     use neotales_ssh::auth::{

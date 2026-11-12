@@ -42,6 +42,9 @@ pub const RSA_SHA512: &str = SSH_RSA_SHA2_512;
 /// The RSA host-key signature hash selected by a signer or verifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RsaHostKeyAlgorithm {
+    /// Deprecated RSA PKCS#1 v1.5 with SHA-1; explicit legacy use only.
+    /// Not parsed by `from_name` and never included in `supported`.
+    LegacySha1,
     /// RSA PKCS#1 v1.5 with a SHA-256 digest.
     Sha256,
     /// RSA PKCS#1 v1.5 with a SHA-512 digest.
@@ -53,6 +56,7 @@ impl RsaHostKeyAlgorithm {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::LegacySha1 => SSH_RSA,
             Self::Sha256 => SSH_RSA_SHA2_256,
             Self::Sha512 => SSH_RSA_SHA2_512,
         }
@@ -513,6 +517,9 @@ impl RsaHostSigner {
         algorithm: RsaHostKeyAlgorithm,
     ) -> Result<Vec<u8>, RsaHostKeyError> {
         let raw_signature = match algorithm {
+            RsaHostKeyAlgorithm::LegacySha1 => self
+                .key
+                .sign(legacy_sha1_padding(), &sha1::Sha1::digest(exchange_hash)),
             RsaHostKeyAlgorithm::Sha256 => {
                 let digest = sha2::Sha256::digest(exchange_hash);
                 self.key.sign(
@@ -574,12 +581,42 @@ pub fn verify_host_key_signature(
     signature_blob: &[u8],
     exchange_hash: &[u8],
 ) -> Result<(), RsaHostKeyError> {
-    let (algorithm, signature) = decode_signature_blob(signature_blob)?;
+    verify_signature(public_key, signature_blob, exchange_hash, false)
+}
+
+/// Verifies a deprecated SHA-1 RSA signature after an explicit legacy opt-in.
+/// Modern signatures are also accepted. Does not establish host trust.
+///
+/// # Errors
+/// Returns the same structural and signature errors as [`verify_host_key_signature`].
+pub fn verify_legacy_host_key_signature(
+    public_key: &RsaPublicKey,
+    signature_blob: &[u8],
+    exchange_hash: &[u8],
+) -> Result<(), RsaHostKeyError> {
+    verify_signature(public_key, signature_blob, exchange_hash, true)
+}
+
+fn verify_signature(
+    public_key: &RsaPublicKey,
+    signature_blob: &[u8],
+    exchange_hash: &[u8],
+    legacy: bool,
+) -> Result<(), RsaHostKeyError> {
+    let (algorithm, signature) = decode_signature_blob_with_legacy(signature_blob, legacy)?;
     if signature.len() != public_key.size() {
         return Err(RsaHostKeyError::InvalidFieldLength);
     }
 
     match algorithm {
+        RsaHostKeyAlgorithm::LegacySha1 => public_key
+            .public_key()
+            .verify(
+                legacy_sha1_padding(),
+                &sha1::Sha1::digest(exchange_hash),
+                signature,
+            )
+            .map_err(|_| RsaHostKeyError::InvalidSignature),
         RsaHostKeyAlgorithm::Sha256 => {
             let digest = sha2::Sha256::digest(exchange_hash);
             public_key
@@ -718,12 +755,18 @@ fn encode_signature_blob(
     Ok(writer.into_bytes())
 }
 
-fn decode_signature_blob(blob: &[u8]) -> Result<(RsaHostKeyAlgorithm, &[u8]), RsaHostKeyError> {
+fn decode_signature_blob_with_legacy(
+    blob: &[u8],
+    legacy: bool,
+) -> Result<(RsaHostKeyAlgorithm, &[u8]), RsaHostKeyError> {
     let mut reader = Reader::new(blob);
-    let algorithm = RsaHostKeyAlgorithm::from_name(
-        std::str::from_utf8(reader.read_string()?)
-            .map_err(|_error| RsaHostKeyError::UnsupportedAlgorithm)?,
-    )?;
+    let name = std::str::from_utf8(reader.read_string()?)
+        .map_err(|_| RsaHostKeyError::UnsupportedAlgorithm)?;
+    let algorithm = if legacy && name == SSH_RSA {
+        RsaHostKeyAlgorithm::LegacySha1
+    } else {
+        RsaHostKeyAlgorithm::from_name(name)?
+    };
     let signature = reader.read_string()?;
     if !reader.is_empty() {
         return Err(RsaHostKeyError::TrailingData);
@@ -732,4 +775,16 @@ fn decode_signature_blob(blob: &[u8]) -> Result<(RsaHostKeyAlgorithm, &[u8]), Rs
         return Err(RsaHostKeyError::InvalidFieldLength);
     }
     Ok((algorithm, signature))
+}
+
+fn legacy_sha1_padding() -> rsa::Pkcs1v15Sign {
+    // RFC 8017 Appendix B.1: DER DigestInfo for id-sha1, including NULL.
+    // rsa uses digest 0.10; the workspace SHA-1 implementation uses 0.11.
+    rsa::Pkcs1v15Sign {
+        hash_len: Some(20),
+        prefix: Box::new([
+            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
+            0x14,
+        ]),
+    }
 }

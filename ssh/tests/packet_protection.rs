@@ -40,6 +40,109 @@ const BODY_PADDING: &[u8] = &[0xa5; 8];
 const SEQUENCE: u32 = 7;
 
 #[test]
+fn legacy_cipher_and_sha1_packets_match_openssl_and_python_vectors() {
+    // Independent oracle: OpenSSL enc -nopad, and Python hmac/hashlib SHA-1.
+    // Clear packet 0000000c047061796c6f6164a5a5a5a5; MAC input prepends
+    // sequence 00000007. Keys and IVs are increasing bytes starting at zero.
+    for (name, key_size, iv_size, expected) in [
+        (
+            "aes128-cbc",
+            16,
+            16,
+            "cfe2eb0859f9f6586313aa41ba0a452c642d9de99bfcd83bced7bf5196ef5a0a29b0fb04",
+        ),
+        (
+            "aes256-cbc",
+            32,
+            16,
+            "9cb56585f9b70d47841f90efa1b876c5642d9de99bfcd83bced7bf5196ef5a0a29b0fb04",
+        ),
+        (
+            "3des-cbc",
+            24,
+            8,
+            "d4d3bc468b18b8ff2081ac11596126bb642d9de99bfcd83bced7bf5196ef5a0a29b0fb04",
+        ),
+        (
+            "arcfour",
+            16,
+            0,
+            "e99c40f5439278b56ab4f6a2ab788fea642d9de99bfcd83bced7bf5196ef5a0a29b0fb04",
+        ),
+    ] {
+        assert!(PacketSuite::new(name, Some("hmac-sha1")).is_err());
+        let suite = PacketSuite::new_with_legacy(name, Some("hmac-sha1"), true).expect("opt in");
+        let key: Vec<u8> = (0..key_size).collect();
+        let iv: Vec<u8> = (0..iv_size).collect();
+        let mac: Vec<u8> = (0..20).collect();
+        let material = || PacketKeyMaterial::hmac(&iv, &key, &mac);
+        let mut sender = PacketProtector::new(suite, material()).expect("sender");
+        let mut receiver = PacketProtector::new(suite, material()).expect("receiver");
+        let packet = sender.seal(SEQUENCE, PAYLOAD, EAM_PADDING).expect("seal");
+        assert_eq!(packet, hex(expected), "{name}");
+        let probe = suite.length_probe_size();
+        assert_eq!(
+            receiver
+                .decrypt_length(SEQUENCE, &packet[..probe])
+                .expect("probe"),
+            12
+        );
+        let mut corrupt = packet.clone();
+        *corrupt.last_mut().expect("tag") ^= 1;
+        assert_eq!(
+            receiver.open(SEQUENCE, &corrupt),
+            Err(PacketProtectionError::AuthenticationFailed)
+        );
+        assert_eq!(receiver.open(SEQUENCE, &packet).expect("open"), PAYLOAD);
+        // Chaining/RC4 position survives packets; failed opens above did not advance it.
+        let next = sender.seal(8, PAYLOAD, EAM_PADDING).expect("next");
+        assert_ne!(next[..16], packet[..16]);
+        assert_eq!(receiver.open(8, &next).expect("next open"), PAYLOAD);
+        sender.rekey(suite, material()).expect("rekey sender");
+        receiver.rekey(suite, material()).expect("rekey receiver");
+        assert_eq!(
+            sender.seal(SEQUENCE, PAYLOAD, EAM_PADDING).expect("fresh"),
+            packet
+        );
+        assert_eq!(
+            receiver.open(SEQUENCE, &packet).expect("fresh open"),
+            PAYLOAD
+        );
+    }
+}
+
+#[test]
+fn sha1_etm_and_eam_round_trip_with_modern_and_legacy_ciphers() {
+    for (cipher, key_size, iv_size) in [
+        ("aes128-ctr", 16, 16),
+        ("aes128-cbc", 16, 16),
+        ("aes256-cbc", 32, 16),
+        ("3des-cbc", 24, 8),
+        ("arcfour", 16, 0),
+    ] {
+        for mac in ["hmac-sha1", "hmac-sha1-etm@openssh.com"] {
+            let suite = PacketSuite::new_with_legacy(cipher, Some(mac), true).expect("suite");
+            let material =
+                || PacketKeyMaterial::hmac(&vec![1; iv_size], &vec![2; key_size], &[3; 20]);
+            let mut sender = PacketProtector::new(suite, material()).expect("sender");
+            let mut receiver = PacketProtector::new(suite, material()).expect("receiver");
+            for length in [0, 1, 7, 8, 16, 31, 64] {
+                let sequence = u32::try_from(length).expect("sequence");
+                let payload = vec![0x5e; length];
+                let padding = PacketAlignment::for_suite(suite)
+                    .padding_pattern(payload.len(), &[0xa5])
+                    .expect("padding");
+                let packet = sender.seal(sequence, &payload, &padding).expect("seal");
+                let mut corrupt = packet.clone();
+                corrupt[5] ^= 1;
+                assert!(receiver.open(sequence, &corrupt).is_err());
+                assert_eq!(receiver.open(sequence, &packet).expect("open"), payload);
+            }
+        }
+    }
+}
+
+#[test]
 fn delayed_compression_leaves_authentication_uncompressed() {
     let suite = PacketSuite::new(AES128_GCM_OPENSSH, None).expect("suite");
     let material = || PacketKeyMaterial::gcm(&[0x56; 12], &[0x45; 16]);

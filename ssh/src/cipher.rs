@@ -22,6 +22,10 @@ use aes::cipher::{InnerIvInit, KeyInit, StreamCipher, StreamCipherSeek};
 use aes_gcm::aead::AeadInOut;
 use hmac::Mac;
 
+#[path = "legacy_cipher.rs"]
+mod legacy_cipher;
+use legacy_cipher::LegacyCipher;
+
 const AES128_CTR_NAME: &str = "aes128-ctr";
 const AES256_CTR_NAME: &str = "aes256-ctr";
 const AES128_GCM_OPENSSH_NAME: &str = "aes128-gcm@openssh.com";
@@ -48,6 +52,7 @@ const CHACHA_KEY_SIZE: usize = 64;
 const CHACHA_IV_SIZE: usize = 8;
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+type HmacSha1 = hmac::Hmac<sha1::Sha1>;
 type HmacSha512 = hmac::Hmac<sha2::Sha512>;
 type GcmNonce = aes_gcm::Nonce<aes::cipher::consts::U12>;
 type GcmTag = aes_gcm::Tag<aes::cipher::consts::U16>;
@@ -105,6 +110,10 @@ impl std::error::Error for PacketProtectionError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CipherAlgorithm {
+    Aes128Cbc,
+    Aes256Cbc,
+    DesCbc,
+    Arcfour,
     Aes128Ctr,
     Aes256Ctr,
     Aes128Gcm,
@@ -115,6 +124,10 @@ enum CipherAlgorithm {
 impl CipherAlgorithm {
     const fn name(self) -> &'static str {
         match self {
+            Self::Aes128Cbc => "aes128-cbc",
+            Self::Aes256Cbc => "aes256-cbc",
+            Self::DesCbc => "3des-cbc",
+            Self::Arcfour => "arcfour",
             Self::Aes128Ctr => AES128_CTR_NAME,
             Self::Aes256Ctr => AES256_CTR_NAME,
             Self::Aes128Gcm => AES128_GCM_OPENSSH_NAME,
@@ -125,8 +138,9 @@ impl CipherAlgorithm {
 
     const fn key_size(self) -> usize {
         match self {
-            Self::Aes128Ctr | Self::Aes128Gcm => 16,
-            Self::Aes256Ctr | Self::Aes256Gcm => 32,
+            Self::Aes128Cbc | Self::Arcfour | Self::Aes128Ctr | Self::Aes128Gcm => 16,
+            Self::Aes256Cbc | Self::Aes256Ctr | Self::Aes256Gcm => 32,
+            Self::DesCbc => 24,
             Self::Chacha20Poly1305 => CHACHA_KEY_SIZE,
         }
     }
@@ -138,10 +152,19 @@ impl CipherAlgorithm {
     const fn is_chacha(self) -> bool {
         matches!(self, Self::Chacha20Poly1305)
     }
+
+    const fn is_legacy(self) -> bool {
+        matches!(
+            self,
+            Self::Aes128Cbc | Self::Aes256Cbc | Self::DesCbc | Self::Arcfour
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntegrityAlgorithm {
+    HmacSha1,
+    HmacSha1Etm,
     HmacSha256,
     HmacSha512,
     HmacSha256Etm,
@@ -151,6 +174,8 @@ enum IntegrityAlgorithm {
 impl IntegrityAlgorithm {
     const fn name(self) -> &'static str {
         match self {
+            Self::HmacSha1 => "hmac-sha1",
+            Self::HmacSha1Etm => "hmac-sha1-etm@openssh.com",
             Self::HmacSha256 => HMAC_SHA2_256_NAME,
             Self::HmacSha512 => HMAC_SHA2_512_NAME,
             Self::HmacSha256Etm => HMAC_SHA2_256_ETM_OPENSSH_NAME,
@@ -160,6 +185,7 @@ impl IntegrityAlgorithm {
 
     const fn key_size(self) -> usize {
         match self {
+            Self::HmacSha1 | Self::HmacSha1Etm => 20,
             Self::HmacSha256 | Self::HmacSha256Etm => SHA256_KEY_SIZE,
             Self::HmacSha512 | Self::HmacSha512Etm => SHA512_KEY_SIZE,
         }
@@ -167,13 +193,17 @@ impl IntegrityAlgorithm {
 
     const fn tag_size(self) -> usize {
         match self {
+            Self::HmacSha1 | Self::HmacSha1Etm => 20,
             Self::HmacSha256 | Self::HmacSha256Etm => SHA256_KEY_SIZE,
             Self::HmacSha512 | Self::HmacSha512Etm => SHA512_KEY_SIZE,
         }
     }
 
     const fn encrypt_then_mac(self) -> bool {
-        matches!(self, Self::HmacSha256Etm | Self::HmacSha512Etm)
+        matches!(
+            self,
+            Self::HmacSha1Etm | Self::HmacSha256Etm | Self::HmacSha512Etm
+        )
     }
 }
 
@@ -207,7 +237,20 @@ impl PacketSuite {
         encryption_name: &str,
         integrity_name: Option<&str>,
     ) -> Result<Self, PacketProtectionError> {
+        Self::new_with_legacy(encryption_name, integrity_name, false)
+    }
+
+    /// Validates a suite after an explicit caller legacy-policy decision.
+    pub(crate) fn new_with_legacy(
+        encryption_name: &str,
+        integrity_name: Option<&str>,
+        legacy: bool,
+    ) -> Result<Self, PacketProtectionError> {
         let cipher = match encryption_name {
+            "aes128-cbc" if legacy => CipherAlgorithm::Aes128Cbc,
+            "aes256-cbc" if legacy => CipherAlgorithm::Aes256Cbc,
+            "3des-cbc" if legacy => CipherAlgorithm::DesCbc,
+            "arcfour" if legacy => CipherAlgorithm::Arcfour,
             AES128_CTR_NAME => CipherAlgorithm::Aes128Ctr,
             AES256_CTR_NAME => CipherAlgorithm::Aes256Ctr,
             AES128_GCM_OPENSSH_NAME => CipherAlgorithm::Aes128Gcm,
@@ -216,6 +259,8 @@ impl PacketSuite {
             _ => return Err(PacketProtectionError::UnsupportedSuite),
         };
         let integrity = match integrity_name {
+            Some("hmac-sha1") if legacy => Some(IntegrityAlgorithm::HmacSha1),
+            Some("hmac-sha1-etm@openssh.com") if legacy => Some(IntegrityAlgorithm::HmacSha1Etm),
             Some(HMAC_SHA2_256_NAME) => Some(IntegrityAlgorithm::HmacSha256),
             Some(HMAC_SHA2_512_NAME) => Some(IntegrityAlgorithm::HmacSha512),
             Some(HMAC_SHA2_256_ETM_OPENSSH_NAME) => Some(IntegrityAlgorithm::HmacSha256Etm),
@@ -256,6 +301,15 @@ impl PacketSuite {
     #[must_use]
     pub(crate) const fn is_chacha(self) -> bool {
         self.cipher.is_chacha()
+    }
+
+    /// Bytes needed to probe an encrypted length without consuming cipher state.
+    pub(crate) const fn length_probe_size(self) -> usize {
+        match self.cipher {
+            CipherAlgorithm::Aes128Cbc | CipherAlgorithm::Aes256Cbc => 16,
+            CipherAlgorithm::DesCbc => 8,
+            _ => 4,
+        }
     }
 }
 
@@ -383,7 +437,11 @@ impl PacketAlignment {
             Some(name) => name.contains("-etm@openssh.com"),
         };
         Self {
-            block_size: if suite.is_chacha() {
+            block_size: if suite.is_chacha()
+                || matches!(
+                    suite.cipher,
+                    CipherAlgorithm::DesCbc | CipherAlgorithm::Arcfour
+                ) {
                 CHACHA_BLOCK_SIZE
             } else {
                 AES_BLOCK_SIZE
@@ -564,7 +622,14 @@ struct ChachaState {
     cipher: ChaChaCipher,
 }
 
+struct LegacyState {
+    cipher: LegacyCipher,
+    integrity: IntegrityAlgorithm,
+    integrity_key: Zeroizing<Vec<u8>>,
+}
+
 enum ProtectorState {
+    Legacy(LegacyState),
     Ctr(CtrState),
     Gcm(GcmState),
     Chacha(ChachaState),
@@ -574,6 +639,25 @@ impl ProtectorState {
     fn new(suite: PacketSuite, material: PacketKeyMaterial) -> Result<Self, PacketProtectionError> {
         if material.encryption_key.len() != suite.cipher.key_size() {
             return Err(PacketProtectionError::InvalidKeyMaterial);
+        }
+
+        if suite.cipher.is_legacy() {
+            let integrity = suite
+                .integrity
+                .ok_or(PacketProtectionError::InvalidKeyMaterial)?;
+            let integrity_key = material
+                .integrity_key
+                .as_ref()
+                .ok_or(PacketProtectionError::InvalidKeyMaterial)?;
+            if integrity_key.len() != integrity.key_size() {
+                return Err(PacketProtectionError::InvalidKeyMaterial);
+            }
+            let cipher = LegacyCipher::new(suite.cipher, &material.encryption_key, &material.iv)?;
+            return Ok(Self::Legacy(LegacyState {
+                cipher,
+                integrity,
+                integrity_key: integrity_key.clone(),
+            }));
         }
 
         if suite.cipher.is_chacha() {
@@ -763,6 +847,21 @@ impl PacketProtector {
         input: &[u8],
     ) -> Result<u32, PacketProtectionError> {
         match &self.state {
+            ProtectorState::Legacy(state) => {
+                if state.integrity.encrypt_then_mac() {
+                    return Err(PacketProtectionError::UnsupportedSuite);
+                }
+                if input.len() != self.suite.length_probe_size() {
+                    return Err(PacketProtectionError::Truncated);
+                }
+                let mut clear = Zeroizing::new(input.to_vec());
+                state.cipher.clone().apply(&mut clear, false)?;
+                Ok(u32::from_be_bytes(
+                    clear[..4]
+                        .try_into()
+                        .map_err(|_| PacketProtectionError::Truncated)?,
+                ))
+            }
             ProtectorState::Chacha(state) => state
                 .cipher
                 .decrypt_length(sequence_number, input)
@@ -946,6 +1045,29 @@ impl PacketProtector {
             return Ok(clear_packet.into_ciphertext());
         }
         match &mut self.state {
+            ProtectorState::Legacy(state) => {
+                let mut cipher = state.cipher.clone();
+                let tag = if state.integrity.encrypt_then_mac() {
+                    cipher.apply(&mut clear_packet.as_mut_slice()[4..], true)?;
+                    calculate_mac(
+                        state.integrity,
+                        &state.integrity_key,
+                        sequence_number,
+                        &[clear_packet.as_slice()],
+                    )?
+                } else {
+                    let tag = calculate_mac(
+                        state.integrity,
+                        &state.integrity_key,
+                        sequence_number,
+                        &[clear_packet.as_slice()],
+                    )?;
+                    cipher.apply(clear_packet.as_mut_slice(), true)?;
+                    tag
+                };
+                clear_packet.extend(tag.as_slice());
+                state.cipher = cipher;
+            }
             ProtectorState::Ctr(state) => {
                 if state.integrity.encrypt_then_mac() {
                     let (length, body) = clear_packet.as_mut_slice().split_at_mut(4);
@@ -1019,6 +1141,9 @@ impl PacketProtector {
             });
         let alignment = PacketAlignment::for_suite(self.suite);
         match &mut self.state {
+            ProtectorState::Legacy(state) => {
+                open_legacy(state, sequence_number, input, compression, alignment)
+            }
             ProtectorState::Ctr(state) if state.integrity.encrypt_then_mac() => {
                 open_etm(state, sequence_number, input, compression, alignment)
             }
@@ -1369,6 +1494,55 @@ fn map_chacha_error(error: ChaChaCipherError) -> PacketProtectionError {
     }
 }
 
+fn open_legacy(
+    state: &mut LegacyState,
+    sequence: u32,
+    input: &[u8],
+    compression: Option<&mut DecompressionStream>,
+    alignment: PacketAlignment,
+) -> Result<Vec<u8>, PacketProtectionError> {
+    let tag_size = state.integrity.tag_size();
+    if input.len() < alignment.block_size() + tag_size {
+        return Err(PacketProtectionError::Truncated);
+    }
+    let size = input.len() - tag_size;
+    if size > MAX_PACKET_CONTENT.saturating_add(5) {
+        return Err(PacketProtectionError::LimitExceeded);
+    }
+    let (encrypted, tag) = input.split_at(size);
+    let mut cipher = state.cipher.clone();
+    let payload = if state.integrity.encrypt_then_mac() {
+        let packet = parse_clear_packet(input, tag_size, alignment)?;
+        verify_mac(
+            state.integrity,
+            &state.integrity_key,
+            sequence,
+            &[encrypted],
+            tag,
+        )?;
+        let mut body = Zeroizing::new(packet.body.to_vec());
+        cipher.apply(&mut body, false)?;
+        extract_body_payload(&body, packet.content_size)?
+    } else {
+        if !size.is_multiple_of(alignment.block_size()) {
+            return Err(PacketProtectionError::InvalidAlignment);
+        }
+        let mut clear = Zeroizing::new(encrypted.to_vec());
+        cipher.apply(&mut clear, false)?;
+        verify_mac(
+            state.integrity,
+            &state.integrity_key,
+            sequence,
+            &[&clear],
+            tag,
+        )?;
+        extract_eam_payload(&clear, size - 5, alignment)?
+    };
+    let payload = decompress_if_selected(payload, compression)?;
+    state.cipher = cipher;
+    Ok(payload)
+}
+
 fn open_eam(
     state: &mut CtrState,
     sequence_number: u32,
@@ -1710,6 +1884,7 @@ impl StreamCipher for CtrStream<'_> {
 }
 
 enum CalculatedTag {
+    Sha1(Zeroizing<[u8; 20]>),
     Sha256(Zeroizing<[u8; SHA256_KEY_SIZE]>),
     Sha512(Zeroizing<[u8; SHA512_KEY_SIZE]>),
 }
@@ -1717,6 +1892,7 @@ enum CalculatedTag {
 impl CalculatedTag {
     fn as_slice(&self) -> &[u8] {
         match self {
+            Self::Sha1(tag) => tag.as_slice(),
             Self::Sha256(tag) => tag.as_slice(),
             Self::Sha512(tag) => tag.as_slice(),
         }
@@ -1731,6 +1907,19 @@ fn calculate_mac(
 ) -> Result<CalculatedTag, PacketProtectionError> {
     let sequence = sequence_number.to_be_bytes();
     match integrity {
+        IntegrityAlgorithm::HmacSha1 | IntegrityAlgorithm::HmacSha1Etm => {
+            let mut mac = <HmacSha1 as hmac::KeyInit>::new_from_slice(key)
+                .map_err(|_| PacketProtectionError::InvalidKeyMaterial)?;
+            mac.update(&sequence);
+            for part in parts {
+                mac.update(part);
+            }
+            let mut output = mac.finalize().into_bytes();
+            let mut tag = Zeroizing::new([0; 20]);
+            tag.copy_from_slice(&output);
+            output.as_mut_slice().zeroize();
+            Ok(CalculatedTag::Sha1(tag))
+        }
         IntegrityAlgorithm::HmacSha256 | IntegrityAlgorithm::HmacSha256Etm => {
             let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key)
                 .map_err(|_error| PacketProtectionError::InvalidKeyMaterial)?;
@@ -1771,6 +1960,16 @@ fn verify_mac(
 ) -> Result<(), PacketProtectionError> {
     let sequence = sequence_number.to_be_bytes();
     match integrity {
+        IntegrityAlgorithm::HmacSha1 | IntegrityAlgorithm::HmacSha1Etm => {
+            let mut mac = <HmacSha1 as hmac::KeyInit>::new_from_slice(key)
+                .map_err(|_| PacketProtectionError::InvalidKeyMaterial)?;
+            mac.update(&sequence);
+            for part in parts {
+                mac.update(part);
+            }
+            mac.verify_slice(tag)
+                .map_err(|_| PacketProtectionError::AuthenticationFailed)
+        }
         IntegrityAlgorithm::HmacSha256 | IntegrityAlgorithm::HmacSha256Etm => {
             let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key)
                 .map_err(|_error| PacketProtectionError::InvalidKeyMaterial)?;
