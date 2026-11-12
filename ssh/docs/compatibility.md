@@ -254,3 +254,8 @@ Testing the e2e package without the runtime gate skips all peer bodies.
 Missing Docker skips locally. The dispatch-only `rs-ssh-e2e` workflow runs
 `docker info` first, so a missing daemon fails that dedicated job. The ordinary
 SSH unit workflow is unchanged.
+
+
+## SSH configuration side effects
+
+Plain configuration parsing remains filesystem-free. Include files are read only when the caller explicitly uses the supplied loader; the directory loader confines canonicalized paths to its caller-provided root and limits expansion to depth 8 and 16 files. Ordinary connect does not execute ProxyCommand. A caller may explicitly invoke `proxy::spawn_proxy_command` for an already-resolved command; it starts the executable directly, without a default shell path.

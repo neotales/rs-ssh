@@ -9,6 +9,8 @@
 #![allow(clippy::module_name_repetitions, dead_code)]
 
 use std::fmt;
+use std::fs;
+use std::path::{Component, Path};
 use std::str::FromStr;
 
 /// An error produced while parsing or resolving an SSH client configuration.
@@ -41,6 +43,8 @@ pub enum SshConfigError {
     Include,
     /// An algorithm list was empty, duplicated, modified, or contained an unimplemented name.
     InvalidAlgorithm,
+    /// Include path invalid or limits exceeded.
+    InvalidInclude,
 }
 
 impl fmt::Display for SshConfigError {
@@ -73,6 +77,9 @@ impl fmt::Display for SshConfigError {
             }
             Self::InvalidAlgorithm => {
                 formatter.write_str("SSH configuration algorithm list is unsupported")
+            }
+            Self::InvalidInclude => {
+                formatter.write_str("SSH configuration include is invalid or exceeds limits")
             }
         }
     }
@@ -109,6 +116,19 @@ impl SshConfig {
     /// unsupported `Include`, or malformed host and match patterns.
     pub fn parse(text: &str) -> Result<Self, SshConfigError> {
         parse_document(text)
+    }
+
+    /// Parses configuration using a caller-supplied Include loader.
+    ///
+    /// # Errors
+    /// Returns syntax errors, loader errors, or errors when include limits are exceeded.
+    pub fn parse_with_loader<F>(text: &str, loader: &mut F) -> Result<Self, SshConfigError>
+    where
+        F: FnMut(&str) -> Result<String, SshConfigError>,
+    {
+        let mut count = 0;
+        let expanded = expand_includes(text, loader, 0, &mut count)?;
+        parse_document(&expanded)
     }
 
     /// Resolves this document for one original command-line host.
@@ -148,6 +168,72 @@ impl SshConfig {
     pub fn is_empty(&self) -> bool {
         self.stanzas.is_empty()
     }
+}
+
+/// Builds a loader that reads relative files confined to `root`.
+pub fn directory_include_loader(
+    root: impl AsRef<Path>,
+) -> impl FnMut(&str) -> Result<String, SshConfigError> {
+    let root = fs::canonicalize(root).map_err(|_| SshConfigError::InvalidInclude);
+    move |name| {
+        let root = root.as_ref().map_err(|_| SshConfigError::InvalidInclude)?;
+        let path = Path::new(name);
+        if path.is_absolute()
+            || path.components().any(|part| {
+                matches!(
+                    part,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(SshConfigError::InvalidInclude);
+        }
+        let full = fs::canonicalize(root.join(path)).map_err(|_| SshConfigError::InvalidInclude)?;
+        if !full.starts_with(root) || !full.is_file() {
+            return Err(SshConfigError::InvalidInclude);
+        }
+        fs::read_to_string(full).map_err(|_| SshConfigError::InvalidInclude)
+    }
+}
+
+fn expand_includes<F>(
+    text: &str,
+    loader: &mut F,
+    depth: usize,
+    count: &mut usize,
+) -> Result<String, SshConfigError>
+where
+    F: FnMut(&str) -> Result<String, SshConfigError>,
+{
+    if depth > 8 {
+        return Err(SshConfigError::InvalidInclude);
+    }
+    let mut result = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed
+            .split_whitespace()
+            .next()
+            .is_some_and(|key| key.eq_ignore_ascii_case("include"))
+        {
+            let names: Vec<_> = trimmed.split_whitespace().skip(1).collect();
+            if names.is_empty() {
+                return Err(SshConfigError::InvalidInclude);
+            }
+            for name in names {
+                *count += 1;
+                if *count > 16 {
+                    return Err(SshConfigError::InvalidInclude);
+                }
+                result.push_str(&expand_includes(&loader(name)?, loader, depth + 1, count)?);
+                result.push('\n');
+            }
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    Ok(result)
 }
 
 impl FromStr for SshConfig {

@@ -238,6 +238,31 @@ pub fn expand_proxy_command(command: &str, host: &str, port: u16, user: &str) ->
     expanded
 }
 
+/// Explicitly starts a resolved proxy command without invoking a shell.
+/// The command string must be executable plus whitespace-separated arguments.
+///
+/// # Errors
+/// Returns an I/O error if the command is empty, oversized, or cannot be spawned.
+#[cfg(unix)]
+pub fn spawn_proxy_command(command: &str) -> io::Result<std::process::Child> {
+    if command.len() > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "proxy command exceeds limit",
+        ));
+    }
+    let mut words = command.split_whitespace();
+    let executable = words
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty proxy command"))?;
+    let mut process = std::process::Command::new(executable);
+    process
+        .args(words)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    process.spawn()
+}
+
 /// Parses a comma-separated `ProxyJump` list.
 ///
 /// Accepted entries are `host`, `host:port`, `user@host`, `user@host:port`,

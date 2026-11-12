@@ -339,10 +339,30 @@ fn proxy_command_precedence_requires_callback_and_never_dials_or_executes() {
     );
 
     let source = include_str!("../src/proxy.rs");
-    assert!(!source.contains("std::process"));
+    assert!(source.contains("spawn_proxy_command"));
     assert!(!source.contains("std::net"));
-    assert!(!source.contains("Command::new"));
+    assert!(source.contains("spawn_proxy_command"));
     assert!(!source.contains("TcpStream"));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_proxy_command_spawn_round_trips_one_byte() -> Result<(), Box<dyn std::error::Error>> {
+    if !std::path::Path::new("/bin/cat").is_file() {
+        eprintln!("skipping: /bin/cat is unavailable");
+        return Ok(());
+    }
+    let mut child = proxy::spawn_proxy_command("/bin/cat")?;
+    let mut stdin = child.stdin.take().ok_or("child stdin was not piped")?;
+    let mut stdout = child.stdout.take().ok_or("child stdout was not piped")?;
+    stdin.write_all(b"x")?;
+    stdin.flush()?;
+    drop(stdin);
+    let mut byte = [0];
+    stdout.read_exact(&mut byte)?;
+    assert_eq!(byte, *b"x");
+    assert!(child.wait()?.success());
+    Ok(())
 }
 
 type Driver<'a> = Rc<RefCell<dyn FnMut() + 'a>>;

@@ -9,6 +9,8 @@
 mod ssh_config;
 
 use std::error::Error;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ssh_config::{SshConfigError, parse};
 
@@ -113,6 +115,35 @@ fn include_is_rejected_without_being_read() {
         parse("Host app\n  Include /path/that/must/not/be/read\n"),
         Err(SshConfigError::Include)
     ));
+}
+
+#[test]
+fn directory_loader_reads_nested_include_and_rejects_outside_symlink() -> Result<(), Box<dyn Error>>
+{
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let base = std::env::temp_dir().join(format!("ssh-config-include-{unique}"));
+    let root = base.join("root");
+    fs::create_dir_all(root.join("nested"))?;
+    fs::write(root.join("nested/config"), "Host app\n User nested-user\n")?;
+    let outside = base.join("outside");
+    fs::write(&outside, "Host app\n User outside-user\n")?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, root.join("escape"))?;
+
+    let mut loader = ssh_config::directory_include_loader(&root);
+    let config = ssh_config::SshConfig::parse_with_loader("Include nested/config\n", &mut loader)?;
+    assert_eq!(config.resolve("app", "default")?.user, "nested-user");
+    #[cfg(unix)]
+    assert_eq!(
+        ssh_config::SshConfig::parse_with_loader("Include escape\n", &mut loader),
+        Err(SshConfigError::InvalidInclude)
+    );
+    assert_eq!(
+        fs::read_to_string(&outside)?,
+        "Host app\n User outside-user\n"
+    );
+    fs::remove_dir_all(base)?;
+    Ok(())
 }
 
 #[test]
