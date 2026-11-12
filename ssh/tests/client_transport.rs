@@ -861,7 +861,9 @@ fn default_proposal_advertises_only_implemented_mechanisms_and_required_categori
             HOST_KEY_SSH_ED25519,
             "rsa-sha2-512",
             "rsa-sha2-256",
-            "ecdsa-sha2-nistp256"
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521"
         ]
     );
     assert_eq!(

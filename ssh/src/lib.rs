@@ -99,10 +99,17 @@ pub(crate) mod msg {
             "rsa-sha2-512",
             "rsa-sha2-256",
             "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
         ];
 
         pub const DEFAULT_HOST_KEY_ALGORITHMS: &[&str] = &[
-            HOST_KEY_SSH_ED25519, "rsa-sha2-512", "rsa-sha2-256", "ecdsa-sha2-nistp256",
+            HOST_KEY_SSH_ED25519,
+            "rsa-sha2-512",
+            "rsa-sha2-256",
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
         ];
 
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,8 +296,8 @@ pub mod scp;
 pub mod server_policy;
 pub mod sftp;
 pub mod ssh_config;
-pub mod tcpip_forward;
 pub mod streamlocal;
+pub mod tcpip_forward;
 pub mod x11;
 
 pub use agent::AgentClient;

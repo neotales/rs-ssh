@@ -1,7 +1,9 @@
 //! Host-key selection through both public handshakes, not standalone codecs.
 use neotales_ssh::{ClientConfig, KexInit, ServerConfig};
 use neotales_ssh::{
-    ecdsa_hostkey::EcdsaSigner, hostkey::Ed25519Signer, rsa_hostkey::RsaHostSigner,
+    ecdsa_hostkey::{EcdsaP384Signer, EcdsaP521Signer, EcdsaSigner},
+    hostkey::Ed25519Signer,
+    rsa_hostkey::RsaHostSigner,
 };
 use std::{
     net::{TcpListener, TcpStream},
@@ -156,6 +158,67 @@ fn every_offered_host_key_selects_the_matching_signer_and_checks_trust()
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn p384_and_p521_host_keys_complete_both_handshakes_after_verified_trust()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (algorithm, config, expected) in [
+        (
+            "ecdsa-sha2-nistp384",
+            ServerConfig::new(Ed25519Signer::from_seed(&mut [9; 32]))
+                .with_ecdsa_p384_host_key(EcdsaP384Signer::from_private_bytes([1; 48])?),
+            EcdsaP384Signer::from_private_bytes([1; 48])?.public_key_blob()?,
+        ),
+        (
+            "ecdsa-sha2-nistp521",
+            ServerConfig::new(Ed25519Signer::from_seed(&mut [9; 32]))
+                .with_ecdsa_p521_host_key(EcdsaP521Signer::from_private_bytes([1; 66])?),
+            EcdsaP521Signer::from_private_bytes([1; 66])?.public_key_blob()?,
+        ),
+    ] {
+        let config = Arc::new(config);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|e| e.to_string())?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .map_err(|e| e.to_string())?;
+            let mut server = config.accept(stream).map_err(|e| e.to_string())?;
+            assert_eq!(server.host_key_algorithm(), algorithm);
+            assert_eq!(server.read_auth_packet().map_err(|e| e.to_string())?, [5]);
+            server.write_payload(&[52]).map_err(|e| e.to_string())?;
+            Ok(())
+        });
+        let mut proposal = KexInit::client_defaults([0; 16]);
+        proposal.server_host_key_algorithms = vec![algorithm.to_owned()];
+        let stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut client =
+            ClientConfig::with_kexinit(proposal).connect_with_host_keys(stream, |key| {
+                if key.to_blob().is_ok_and(|blob| blob == expected) {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            })?;
+        assert_eq!(
+            client
+                .host_public_key()
+                .ok_or("missing trusted key")?
+                .to_blob()?,
+            expected
+        );
+        client.write_payload(&[5])?;
+        assert_eq!(client.read_payload()?, [52]);
+        assert!(server.join().map_err(|_| "server panicked")?.is_ok());
     }
     Ok(())
 }

@@ -39,8 +39,8 @@ and on Unix, real `ssh-agent` authentication.
 ## Protocol coverage that is not a live OpenSSH claim
 
 Both handshakes support `ssh-ed25519`, `rsa-sha2-256`, `rsa-sha2-512`, and
-`ecdsa-sha2-nistp256` host keys. SHA-1 `ssh-rsa` and ECDSA P-384/P-521 are not
-offered. `ServerConfig::with_rsa_host_key` and `with_ecdsa_host_key` add signing
+ECDSA P-256/P-384/P-521 host keys. SHA-1 `ssh-rsa` is not offered.
+`ServerConfig::with_rsa_host_key` and the ECDSA host-key builders add signing
 keys beside the primary Ed25519 key. The server filters proposals to available
 keys and signs with the negotiated algorithm. Use
 `ClientConfig::connect_with_host_keys` for an algorithm-aware trust callback.

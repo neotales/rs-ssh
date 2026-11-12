@@ -76,6 +76,8 @@ pub(crate) const HOST_KEY_RSA_SHA2_512: &str = "rsa-sha2-512";
 
 /// The ECDSA NIST P-256 host-key algorithm name.
 pub(crate) const HOST_KEY_ECDSA_SHA2_NISTP256: &str = "ecdsa-sha2-nistp256";
+pub(crate) const HOST_KEY_ECDSA_SHA2_NISTP384: &str = "ecdsa-sha2-nistp384";
+pub(crate) const HOST_KEY_ECDSA_SHA2_NISTP521: &str = "ecdsa-sha2-nistp521";
 
 /// The AES-128 CTR packet-encryption algorithm name.
 pub(crate) const ENCRYPTION_AES128_CTR: &str = "aes128-ctr";
@@ -287,7 +289,7 @@ pub(crate) const SUPPORTED_KEX_ALGORITHMS: &[&str] = &[
 /// `ProtectionPlan::from_algorithms`, rather than comparing against one
 /// hard-coded name.
 ///
-/// Ed25519, RSA SHA-2, and NIST P-256 are wired into both handshakes. A server
+/// Ed25519, RSA SHA-2, and ECDSA NIST curves are wired into both handshakes. A server
 /// advertises only names for which it has a configured signing key.
 pub(crate) const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[
     "ssh-ed25519-cert-v01@openssh.com",
@@ -295,6 +297,8 @@ pub(crate) const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[
     HOST_KEY_RSA_SHA2_512,
     HOST_KEY_RSA_SHA2_256,
     HOST_KEY_ECDSA_SHA2_NISTP256,
+    HOST_KEY_ECDSA_SHA2_NISTP384,
+    HOST_KEY_ECDSA_SHA2_NISTP521,
 ];
 
 /// Every key-exchange name this crate recognises.
@@ -325,15 +329,16 @@ pub(crate) const KNOWN_KEX_ALGORITHMS: &[&str] = &[
 /// This currently equals [`SUPPORTED_HOST_KEY_ALGORITHMS`]. Unlike the broader
 /// key-exchange catalog, every listed host key has a complete handshake path.
 ///
-/// The P-384 and P-521 ECDSA curves are *not* here: they are recognised by name
-/// in [`KNOWN_KEX_ALGORITHMS`]'s sibling `ecdsa_hostkey.rs` type surface but are
-/// outside the host-key algorithm names this crate advertises or accepts.
+/// This list also includes recognized host-key names without a full transport
+/// implementation, if any.
 pub(crate) const KNOWN_HOST_KEY_ALGORITHMS: &[&str] = &[
     "ssh-ed25519-cert-v01@openssh.com",
     HOST_KEY_SSH_ED25519,
     HOST_KEY_RSA_SHA2_512,
     HOST_KEY_RSA_SHA2_256,
     HOST_KEY_ECDSA_SHA2_NISTP256,
+    HOST_KEY_ECDSA_SHA2_NISTP384,
+    HOST_KEY_ECDSA_SHA2_NISTP521,
 ];
 
 /// The complete packet-encryption catalog supported by the SSH algorithm
@@ -395,6 +400,8 @@ pub(crate) const SUPPORTED_ALGORITHMS: &[&str] = &[
     HOST_KEY_RSA_SHA2_512,
     HOST_KEY_RSA_SHA2_256,
     HOST_KEY_ECDSA_SHA2_NISTP256,
+    HOST_KEY_ECDSA_SHA2_NISTP384,
+    HOST_KEY_ECDSA_SHA2_NISTP521,
     // SUPPORTED_ENCRYPTION_ALGORITHMS
     ENCRYPTION_CHACHA20_POLY1305_OPENSSH,
     ENCRYPTION_AES128_GCM_OPENSSH,
@@ -446,6 +453,8 @@ pub(crate) const DEFAULT_HOST_KEY_ALGORITHMS: &[&str] = &[
     HOST_KEY_RSA_SHA2_512,
     HOST_KEY_RSA_SHA2_256,
     HOST_KEY_ECDSA_SHA2_NISTP256,
+    HOST_KEY_ECDSA_SHA2_NISTP384,
+    HOST_KEY_ECDSA_SHA2_NISTP521,
 ];
 
 /// The default packet-encryption proposal, ordered by preference.

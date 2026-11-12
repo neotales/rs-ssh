@@ -380,7 +380,7 @@ impl ServerConfig {
         self
     }
 
-    /// Adds a NIST P-256 ECDSA host key. Other ECDSA curves are not offered.
+    /// Adds a NIST P-256 ECDSA host key.
     #[must_use]
     pub fn with_ecdsa_host_key(mut self, signer: neotales_ssh::ecdsa_hostkey::EcdsaSigner) -> Self {
         self.additional_signers
@@ -394,6 +394,50 @@ impl ServerConfig {
             self.kexinit
                 .server_host_key_algorithms
                 .push("ecdsa-sha2-nistp256".to_owned());
+        }
+        self
+    }
+
+    /// Adds a NIST P-384 ECDSA host key and offers its SSH algorithm.
+    #[must_use]
+    pub fn with_ecdsa_p384_host_key(
+        mut self,
+        signer: neotales_ssh::ecdsa_hostkey::EcdsaP384Signer,
+    ) -> Self {
+        self.additional_signers
+            .push(Arc::new(HostSigner::EcdsaP384(Box::new(signer))));
+        let name = "ecdsa-sha2-nistp384";
+        if !self
+            .kexinit
+            .server_host_key_algorithms
+            .iter()
+            .any(|n| n == name)
+        {
+            self.kexinit
+                .server_host_key_algorithms
+                .push(name.to_owned());
+        }
+        self
+    }
+
+    /// Adds a NIST P-521 ECDSA host key and offers its SSH algorithm.
+    #[must_use]
+    pub fn with_ecdsa_p521_host_key(
+        mut self,
+        signer: neotales_ssh::ecdsa_hostkey::EcdsaP521Signer,
+    ) -> Self {
+        self.additional_signers
+            .push(Arc::new(HostSigner::EcdsaP521(Box::new(signer))));
+        let name = "ecdsa-sha2-nistp521";
+        if !self
+            .kexinit
+            .server_host_key_algorithms
+            .iter()
+            .any(|n| n == name)
+        {
+            self.kexinit
+                .server_host_key_algorithms
+                .push(name.to_owned());
         }
         self
     }

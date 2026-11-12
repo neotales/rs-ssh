@@ -27,6 +27,10 @@ pub enum HostPublicKey {
     Rsa(neotales_ssh::rsa_hostkey::RsaPublicKey),
     /// NIST P-256 host key.
     Ecdsa(neotales_ssh::ecdsa_hostkey::EcdsaPublicKey),
+    /// NIST P-384 host key.
+    EcdsaP384(neotales_ssh::ecdsa_hostkey::EcdsaP384PublicKey),
+    /// NIST P-521 host key.
+    EcdsaP521(neotales_ssh::ecdsa_hostkey::EcdsaP521PublicKey),
 }
 
 impl HostPublicKey {
@@ -40,6 +44,8 @@ impl HostPublicKey {
             Self::Ed25519(key) => key.to_blob(),
             Self::Rsa(key) => key.to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
             Self::Ecdsa(key) => key.to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
+            Self::EcdsaP384(key) => (*key).to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
+            Self::EcdsaP521(key) => (*key).to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
         }
     }
 }
@@ -105,6 +111,20 @@ where
                 .map_err(|_| HostKeyError::InvalidSignature)?;
             (HostPublicKey::Ecdsa(key), None)
         }
+        "ecdsa-sha2-nistp384" => {
+            let key = neotales_ssh::ecdsa_hostkey::EcdsaP384PublicKey::from_blob(blob)
+                .map_err(|_| HostKeyError::InvalidPublicKey)?;
+            neotales_ssh::ecdsa_hostkey::verify_p384_host_key_signature(&key, signature, hash)
+                .map_err(|_| HostKeyError::InvalidSignature)?;
+            (HostPublicKey::EcdsaP384(key), None)
+        }
+        "ecdsa-sha2-nistp521" => {
+            let key = neotales_ssh::ecdsa_hostkey::EcdsaP521PublicKey::from_blob(blob)
+                .map_err(|_| HostKeyError::InvalidPublicKey)?;
+            neotales_ssh::ecdsa_hostkey::verify_p521_host_key_signature(&key, signature, hash)
+                .map_err(|_| HostKeyError::InvalidSignature)?;
+            (HostPublicKey::EcdsaP521(key), None)
+        }
         _ => return Err(HostKeyError::UnsupportedAlgorithm),
     };
     match catch_unwind(AssertUnwindSafe(|| trust(&key))) {
@@ -127,6 +147,8 @@ pub(crate) enum HostSigner {
     Ed25519(std::sync::Arc<Ed25519Signer>),
     Rsa(Box<neotales_ssh::rsa_hostkey::RsaHostSigner>),
     Ecdsa(Box<neotales_ssh::ecdsa_hostkey::EcdsaSigner>),
+    EcdsaP384(Box<neotales_ssh::ecdsa_hostkey::EcdsaP384Signer>),
+    EcdsaP521(Box<neotales_ssh::ecdsa_hostkey::EcdsaP521Signer>),
 }
 
 impl HostSigner {
@@ -139,6 +161,8 @@ impl HostSigner {
             ) | (Self::Ed25519(_), SSH_ED25519)
                 | (Self::Rsa(_), "rsa-sha2-256" | "rsa-sha2-512")
                 | (Self::Ecdsa(_), "ecdsa-sha2-nistp256")
+                | (Self::EcdsaP384(_), "ecdsa-sha2-nistp384")
+                | (Self::EcdsaP521(_), "ecdsa-sha2-nistp521")
         )
     }
 
@@ -150,6 +174,12 @@ impl HostSigner {
                 .public_key_blob()
                 .map_err(|_| HostKeyError::InvalidPublicKey),
             Self::Ecdsa(signer) => signer
+                .public_key_blob()
+                .map_err(|_| HostKeyError::InvalidPublicKey),
+            Self::EcdsaP384(signer) => signer
+                .public_key_blob()
+                .map_err(|_| HostKeyError::InvalidPublicKey),
+            Self::EcdsaP521(signer) => signer
                 .public_key_blob()
                 .map_err(|_| HostKeyError::InvalidPublicKey),
         }
@@ -167,6 +197,12 @@ impl HostSigner {
                 .sign_with_algorithm(hash, algorithm)
                 .map_err(|_| HostKeyError::SigningFailed),
             Self::Ecdsa(signer) => signer
+                .sign_exchange_hash(hash)
+                .map_err(|_| HostKeyError::SigningFailed),
+            Self::EcdsaP384(signer) => signer
+                .sign_exchange_hash(hash)
+                .map_err(|_| HostKeyError::SigningFailed),
+            Self::EcdsaP521(signer) => signer
                 .sign_exchange_hash(hash)
                 .map_err(|_| HostKeyError::SigningFailed),
         }
