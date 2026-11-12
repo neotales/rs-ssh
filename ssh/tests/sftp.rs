@@ -22,6 +22,36 @@ use sftp::{
     SftpError, SftpOpenFlags, SftpReadResult,
 };
 
+#[cfg(unix)]
+#[test]
+fn in_process_memory_server_round_trips_one_file() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::net::UnixStream;
+    let (client_stream, server_stream) = UnixStream::pair()?;
+    let server = std::thread::spawn(move || {
+        let mut server = sftp::SftpServer::new(server_stream, std::collections::HashMap::new());
+        for _ in 0..8 {
+            server.serve_one().unwrap();
+        }
+    });
+    let mut client = SftpClient::connect(client_stream)?;
+    let handle = client.open(
+        b"one",
+        SftpOpenFlags::WRITE | SftpOpenFlags::READ | SftpOpenFlags::CREAT,
+    )?;
+    client.write(&handle, 0, b"bytes")?;
+    client.close(&handle)?;
+    let handle = client.open(b"one", SftpOpenFlags::READ)?;
+    assert_eq!(
+        client.read(&handle, 0, 16)?,
+        SftpReadResult::Data(b"bytes".to_vec())
+    );
+    client.close(&handle)?;
+    assert!(client.open(b"missing", SftpOpenFlags::READ).is_err());
+    drop(client);
+    server.join().map_err(|_| "server thread panicked")?;
+    Ok(())
+}
+
 struct ScriptedStream {
     input: Cursor<Vec<u8>>,
     output: Vec<u8>,

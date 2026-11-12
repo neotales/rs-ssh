@@ -54,8 +54,9 @@ host PTY. Malformed controls do not reach that callback.
 `SendEnv` and `SetEnv` are applied by `EnvironmentPlan` and sent as RFC 4254
 `env` requests. `subsystem`, including the `sftp` name, and the `scp -t` /
 `scp -f` exec requests are covered by in-process session tests. Those tests do
-not start `sshd`. SCP remains single-file. SFTP remains a version-3 client over
-a caller-supplied byte stream. An in-process SFTP server is not implemented.
+not start `sshd`. SCP remains single-file. SFTP version 3 supports an
+in-process server over a caller-supplied byte stream and memory map. It is not
+a host filesystem server.
 
 ### Additional in-process protocol coverage
 

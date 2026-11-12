@@ -23,6 +23,171 @@ use neotales_ssh::{Error as WireError, Reader};
 /// The maximum SFTP packet body, excluding its four-byte length prefix.
 pub const MAX_SFTP_PACKET_SIZE: usize = 16_777_216;
 
+/// SFTP v3 server backed solely by the caller-provided in-memory files.
+#[derive(Debug)]
+pub struct SftpServer<T> {
+    transport: T,
+    files: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    handles: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    next_handle: u32,
+    initialized: bool,
+}
+
+impl<T: Read + Write> SftpServer<T> {
+    /// Creates a version-3 server. No host filesystem access is performed.
+    pub fn new(transport: T, files: std::collections::HashMap<Vec<u8>, Vec<u8>>) -> Self {
+        Self {
+            transport,
+            files,
+            handles: std::collections::HashMap::new(),
+            next_handle: 0,
+            initialized: false,
+        }
+    }
+
+    /// Serves one request from the byte stream.
+    ///
+    /// # Errors
+    /// Returns framing, protocol, or transport errors. Malformed frames are
+    /// rejected; unsupported requests receive an SFTP failure status.
+    pub fn serve_one(&mut self) -> Result<(), SftpError> {
+        let request = read_packet(&mut self.transport)?;
+        if request.first() == Some(&SSH_FXP_INIT) {
+            self.initialized = true;
+            return write_packet(&mut self.transport, &[SSH_FXP_VERSION, 0, 0, 0, 3]);
+        }
+        if !self.initialized {
+            return Err(SftpError::NotInitialized);
+        }
+        let reply = self.handle_request(&request)?;
+        write_packet(&mut self.transport, &reply)
+    }
+
+    fn handle_request(&mut self, request: &[u8]) -> Result<Vec<u8>, SftpError> {
+        let mut r = Reader::new(request.get(1..).ok_or(SftpError::InvalidFrame)?);
+        let id = read_u32(&mut r)?;
+        let status = |code| Self::status_reply(id, code);
+        let reply = match request[0] {
+            SSH_FXP_OPEN => self.handle_open(id, &mut r)?,
+            SSH_FXP_CLOSE => {
+                let handle = read_string(&mut r, MAX_SFTP_HANDLE_SIZE)?;
+                if self.handles.remove(&handle).is_some() {
+                    status(SSH_FX_OK)?
+                } else {
+                    status(SSH_FX_FAILURE)?
+                }
+            }
+            SSH_FXP_WRITE => {
+                let handle = read_string(&mut r, MAX_SFTP_HANDLE_SIZE)?;
+                let offset =
+                    usize::try_from(read_u64(&mut r)?).map_err(|_| SftpError::InvalidFrame)?;
+                let data = read_string(&mut r, MAX_SFTP_PACKET_SIZE)?;
+                if !r.is_empty() {
+                    return Err(SftpError::InvalidFrame);
+                }
+                if let Some(path) = self.handles.get(&handle) {
+                    if let Some(file) = self.files.get_mut(path) {
+                        if offset <= file.len()
+                            && offset.saturating_add(data.len()) <= MAX_SFTP_PACKET_SIZE
+                        {
+                            file.resize(offset + data.len(), 0);
+                            file[offset..offset + data.len()].copy_from_slice(&data);
+                            status(SSH_FX_OK)?
+                        } else {
+                            status(SSH_FX_FAILURE)?
+                        }
+                    } else {
+                        status(SSH_FX_FAILURE)?
+                    }
+                } else {
+                    status(SSH_FX_FAILURE)?
+                }
+            }
+            SSH_FXP_READ => {
+                let handle = read_string(&mut r, MAX_SFTP_HANDLE_SIZE)?;
+                let offset =
+                    usize::try_from(read_u64(&mut r)?).map_err(|_| SftpError::InvalidFrame)?;
+                let length = read_u32(&mut r)? as usize;
+                if let Some(path) = self.handles.get(&handle) {
+                    if let Some(file) = self.files.get(path) {
+                        if offset >= file.len() {
+                            status(SSH_FX_EOF)?
+                        } else {
+                            let mut p = PacketBuilder::with_capacity(64);
+                            p.push_byte(SSH_FXP_DATA);
+                            p.push_uint32(id);
+                            p.push_string(
+                                &file[offset..file.len().min(offset.saturating_add(length))],
+                                MAX_SFTP_PACKET_SIZE,
+                                SftpError::FrameTooLarge,
+                            )?;
+                            p.finish()?
+                        }
+                    } else {
+                        status(SSH_FX_FAILURE)?
+                    }
+                } else {
+                    status(SSH_FX_FAILURE)?
+                }
+            }
+            SSH_FXP_STAT | SSH_FXP_LSTAT => {
+                let path = read_string(&mut r, MAX_SFTP_PATH_SIZE)?;
+                if let Some(file) = self.files.get(&path) {
+                    let mut p = PacketBuilder::with_capacity(24);
+                    p.push_byte(SSH_FXP_ATTRS);
+                    p.push_uint32(id);
+                    p.push_bytes(&encode_attributes(&SftpAttributes {
+                        size: Some(file.len() as u64),
+                        ..SftpAttributes::new()
+                    })?)?;
+                    p.finish()?
+                } else {
+                    status(SSH_FX_NO_SUCH_FILE)?
+                }
+            }
+            _ => status(SSH_FX_FAILURE)?,
+        };
+        Ok(reply)
+    }
+
+    fn handle_open(&mut self, id: u32, r: &mut Reader<'_>) -> Result<Vec<u8>, SftpError> {
+        let path = read_string(r, MAX_SFTP_PATH_SIZE)?;
+        let flags = read_u32(r)?;
+        let _attrs = decode_attributes(r)?;
+        if !r.is_empty() || path.is_empty() || path.split(|b| *b == b'/').any(|part| part == b"..")
+        {
+            Self::status_reply(id, SSH_FX_PERMISSION_DENIED)
+        } else if !self.files.contains_key(&path) && flags & SSH_FXF_CREAT == 0 {
+            Self::status_reply(id, SSH_FX_NO_SUCH_FILE)
+        } else {
+            if flags & SSH_FXF_CREAT != 0 {
+                self.files.entry(path.clone()).or_default();
+            }
+            if flags & SSH_FXF_TRUNC != 0 {
+                self.files.insert(path.clone(), Vec::new());
+            }
+            let handle = self.next_handle.to_be_bytes().to_vec();
+            self.next_handle = self.next_handle.wrapping_add(1);
+            self.handles.insert(handle.clone(), path);
+            let mut p = PacketBuilder::with_capacity(32);
+            p.push_byte(SSH_FXP_HANDLE);
+            p.push_uint32(id);
+            p.push_string(&handle, MAX_SFTP_HANDLE_SIZE, SftpError::InvalidFrame)?;
+            p.finish()
+        }
+    }
+
+    fn status_reply(id: u32, code: u32) -> Result<Vec<u8>, SftpError> {
+        let mut p = PacketBuilder::with_capacity(32);
+        p.push_byte(SSH_FXP_STATUS);
+        p.push_uint32(id);
+        p.push_uint32(code);
+        p.push_string(b"", 64, SftpError::InvalidFrame)?;
+        p.push_string(b"", 64, SftpError::InvalidFrame)?;
+        p.finish()
+    }
+}
+
 /// A short alias for [`MAX_SFTP_PACKET_SIZE`].
 pub const MAX_PACKET_SIZE: usize = MAX_SFTP_PACKET_SIZE;
 
