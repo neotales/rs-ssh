@@ -298,6 +298,7 @@ pub mod sftp;
 pub mod ssh_config;
 pub mod streamlocal;
 pub mod tcpip_forward;
+pub mod tunnel;
 pub mod x11;
 
 pub use agent::AgentClient;

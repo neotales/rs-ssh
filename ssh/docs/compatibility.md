@@ -76,9 +76,17 @@ interoperability evidence:
   pings with the same bytes; pre-authentication pings do not generate a reply.
   The legacy global request named `ping@openssh.com` is distinct.
   `GlobalRequest::keepalive_with_reply()` requests a response without a timer.
-- Remote TCP port-zero forwarding requires explicit policy and an application
-  port allocator. `TcpipForwardResponse::AllocatedPort` exposes the result;
-  fixed-port success stays a one-byte response. No socket is opened.
+- RFC 4254 §7.1 reverse TCP forwarding has a one-connection byte tunnel in
+  `tunnel`: `ReverseListener` binds only a caller-supplied numeric address and
+  port (empty addresses are errors), and `TcpTunnel` dials the caller-supplied
+  local destination and copies both ways through the existing channel window.
+  Drop/cancel closes the listener; no bind retry or implicit wildcard exists.
+  The caller polls nonblocking TCP and routes events from its synchronous SSH
+  dispatcher only when a complete payload is ready; there is no background SSH
+  reader. EOF half-closes the copy, while cancellation closes it immediately.
+  Port-zero allocation metadata alone is not this byte tunnel. Port zero in
+  `ReverseListener` really binds an OS-selected port and replies with that port;
+  protocol-only types in `tcpip_forward` still open no sockets.
 - `ResolvedConfig::to_kexinit()` applies implemented-only exact algorithm lists.
   Unknown names, duplicates, and OpenSSH list modifiers error. Include remains
   rejected and ProxyCommand remains inert text.
