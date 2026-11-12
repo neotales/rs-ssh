@@ -3149,6 +3149,11 @@ pub enum ClientAuthMethod {
 }
 
 impl ClientAuthMethod {
+    /// Creates an authentication method backed by an agent identity.
+    #[must_use]
+    pub fn agent(signer: AgentKeySigner) -> Self {
+        Self::public_key(PublicKeySigner::agent(signer))
+    }
     /// Explicitly offers GSSAPI-with-MIC using a caller-owned security context.
     /// No mechanism is selected, initialized, or discovered by default.
     #[must_use]

@@ -1,10 +1,11 @@
 # neotales-ssh
 
 SSH-2 building blocks meant to be forked and patched. `SshClient` covers common
-paths; every low-level API and policy hook remains public. Helpers do not read
-`~/.ssh`, execute local commands, or accept a host key by default.
+paths; every low-level API and policy hook remains public. The string form reads
+the default agent and existing `~/.ssh/known_hosts`, and fails closed for unknown
+keys. Helpers do not execute local commands or accept a host key by default.
 
-Each call requires a username, authentication methods, and a trusted Ed25519 SSH
+The pinned form requires a username, authentication methods, and a trusted Ed25519 SSH
 public-key blob supplied by the application. `None` selects port 22. Signature
 verification precedes the pin check; no host key is accepted by default. The
 script is sent as exact command bytes, without selecting an interpreter. Output
@@ -12,12 +13,33 @@ is buffered; stderr is discarded. Upload progress counts payload bytes only and
 failed uploads may leave partial files. Set appropriate network deadlines at the
 lower level when needed.
 
+## Opening a connection
+
+```rust,no_run
+use neotales_ssh::SshClient;
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = SshClient::open("example.org")?;
+    let _ = client.exec(b"hostname")?;
+    Ok(())
+}
+```
+
+```rust,no_run
+use neotales_ssh::SshClient;
+fn example(pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let builder = SshClient::builder().host("example.org").username("user").agent(true).pin(pin);
+    let alternate_port = builder.clone().port(2222);
+    let _client = alternate_port.build()?;
+    Ok(())
+}
+```
+
 ## Command
 
 ```rust,no_run
 use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
     let (stdout, status) = client.exec(b"printf hello")?;
     assert_eq!((stdout.as_slice(), status), (b"hello".as_slice(), 0));
     Ok(())
@@ -29,7 +51,7 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 ```rust,no_run
 use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
     let (stdout, status) = client.script(b"printf one\nprintf two\n")?;
     assert_eq!((stdout.as_slice(), status), (b"onetwo".as_slice(), 0));
     Ok(())
@@ -41,7 +63,7 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 ```rust,no_run
 use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
     client.upload("report.txt", b"report", |bytes| println!("uploaded {bytes}"))?;
     Ok(())
 }
@@ -52,7 +74,7 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 ```rust,no_run
 use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
     let bytes = client.download("report.txt", |bytes| println!("downloaded {bytes}"))?;
     assert_eq!(bytes, b"report");
     Ok(())
@@ -64,7 +86,7 @@ fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::
 ```rust,no_run
 use neotales_ssh::{ClientAuthMethod, SshClient};
 fn example(methods: &[ClientAuthMethod], pin: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = SshClient::open("example.org", None, "user", methods, pin)?;
+    let mut client = SshClient::open_pinned("example.org", None, "user", methods, pin)?;
     let mut sftp = client.sftp()?;
     let handle = sftp.open("report.txt", neotales_ssh::sftp::SSH_FXF_READ | neotales_ssh::sftp::SSH_FXF_WRITE | neotales_ssh::sftp::SSH_FXF_CREAT)?;
     sftp.write(&handle, 0, b"report")?;

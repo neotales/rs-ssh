@@ -8,8 +8,8 @@
 //! `shell`, and `subsystem` requests. [`EnvironmentPlan`] applies `SendEnv`
 //! and `SetEnv` to those channels. SCP and SFTP each have a byte codec and a
 //! session request that starts it. The agent client enumerates identities and
-//! requests signatures; it does not read `SSH_AUTH_SOCK` unless the caller
-//! passes that environment in.
+//! requests signatures. The convenience client reads `SSH_AUTH_SOCK` on Unix;
+//! the low-level agent module does not read the process environment.
 //!
 //! The supported entry points are re-exported at the crate root. The
 //! sequence-facing types used by the public rekey and transport-error APIs,
@@ -301,7 +301,7 @@ pub mod private_key;
 pub mod proxy;
 #[path = "recipes.rs"]
 mod recipes_impl;
-pub use recipes_impl::{ClientError, SessionStream, SshClient, SshSession};
+pub use recipes_impl::{ClientError, SessionStream, SshClient, SshClientBuilder, SshSession};
 
 /// Deprecated compatibility exports; use [`SshClient`] for common client operations.
 #[deprecated(note = "use SshClient for common client operations")]

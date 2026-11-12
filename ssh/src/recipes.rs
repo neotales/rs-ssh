@@ -1,11 +1,11 @@
 //! Thin common-case adapters. All underlying protocol APIs remain public.
 //!
-//! Callers supply authenticated transports, byte streams, trust and server policy.
-//! These helpers never read SSH configuration, start a process, or add peer trust.
+//! These helpers never start a process or add peer trust.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::rc::Rc;
 
 use crate::channel::{ChannelId, ChannelTransport};
 use crate::hostkey::Ed25519PublicKey;
@@ -31,14 +31,294 @@ impl<T: ChannelTransport> std::fmt::Debug for SshClient<T> {
 /// Error returned by the convenience client.
 pub type ClientError = Box<dyn std::error::Error>;
 
+/// Configuration for a convenience client. Clones share explicitly supplied
+/// authentication methods, but independently own their configuration.
+#[derive(Clone, Debug, Default)]
+pub struct SshClientBuilder {
+    host: Option<String>,
+    username: Option<String>,
+    port: Option<u16>,
+    methods: Option<Rc<Vec<ClientAuthMethod>>>,
+    agent: bool,
+    pin: Option<Vec<u8>>,
+    known_hosts: Option<String>,
+    known_hosts_path: Option<std::path::PathBuf>,
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn parse_destination(value: &str) -> Result<(Option<&str>, &str, u16), ClientError> {
+    let (user, address) = match value.split_once('@') {
+        Some((user, address)) => (Some(user), address),
+        None => (None, value),
+    };
+    if user == Some("") || address.is_empty() || address.contains('@') {
+        return Err(invalid("username and host required").into());
+    }
+    let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| invalid("invalid IPv6 host"))?;
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| invalid("invalid IPv6 host"))?;
+        let port = if tail.is_empty() {
+            22
+        } else {
+            tail.strip_prefix(':')
+                .ok_or_else(|| invalid("invalid port"))?
+                .parse::<u16>()
+                .map_err(|_| invalid("invalid port"))?
+        };
+        (host, port)
+    } else if let Some((host, port)) = address.split_once(':') {
+        (
+            host,
+            port.parse::<u16>().map_err(|_| invalid("invalid port"))?,
+        )
+    } else {
+        (address, 22)
+    };
+    if host.is_empty() || port == 0 || host.contains(['[', ']']) {
+        return Err(invalid("invalid host or port").into());
+    }
+    Ok((user, host, port))
+}
+
+fn default_username() -> Result<String, ClientError> {
+    let names: &[&str] = if cfg!(windows) {
+        &["USERNAME"]
+    } else {
+        &["USER", "LOGNAME"]
+    };
+    names
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty())
+        .ok_or_else(|| invalid("current process username unavailable; specify user@host").into())
+}
+
+impl SshClientBuilder {
+    /// Sets the destination host.
+    #[must_use]
+    pub fn host(mut self, host: impl Into<String>) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+    /// Sets the login name.
+    #[must_use]
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+    /// Sets the destination port (default 22).
+    #[must_use]
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+    /// Sets explicit authentication methods.
+    #[must_use]
+    pub fn methods(mut self, methods: Vec<ClientAuthMethod>) -> Self {
+        self.methods = Some(Rc::new(methods));
+        self.agent = false;
+        self
+    }
+    /// Enables or disables default-agent authentication.
+    #[must_use]
+    pub fn agent(mut self, enabled: bool) -> Self {
+        self.agent = enabled;
+        if enabled {
+            self.methods = None;
+        }
+        self
+    }
+    /// Pins an SSH-format Ed25519 host key; takes precedence over known hosts.
+    #[must_use]
+    pub fn pin(mut self, blob: impl AsRef<[u8]>) -> Self {
+        self.pin = Some(blob.as_ref().to_vec());
+        self
+    }
+    /// Sets known-hosts document text.
+    #[must_use]
+    pub fn known_hosts(mut self, text: impl Into<String>) -> Self {
+        self.known_hosts = Some(text.into());
+        self.known_hosts_path = None;
+        self
+    }
+    /// Sets a known-hosts document path, read only during build.
+    #[must_use]
+    pub fn known_hosts_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.known_hosts_path = Some(path.into());
+        self.known_hosts = None;
+        self
+    }
+
+    /// Connects and authenticates. No unknown host key is accepted.
+    ///
+    /// # Errors
+    /// Returns validation, agent, trust, network, handshake or authentication errors.
+    pub fn build(self) -> Result<SshClient, ClientError> {
+        let host = self
+            .host
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("host required"))?;
+        let username = self
+            .username
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid("username required"))?;
+        let port = self.port.unwrap_or(22);
+        if port == 0 {
+            return Err(invalid("invalid port").into());
+        }
+        if !self.agent && self.methods.as_ref().is_none_or(|m| m.is_empty()) {
+            return Err(invalid("authentication methods required").into());
+        }
+        let agent_methods = if self.agent {
+            default_agent_methods()?
+        } else {
+            Vec::new()
+        };
+        let pin = self
+            .pin
+            .as_deref()
+            .map(Ed25519PublicKey::from_blob)
+            .transpose()?;
+        let known_hosts = if pin.is_some() {
+            None
+        } else {
+            let text = if let Some(text) = self.known_hosts {
+                text
+            } else if let Some(path) = self.known_hosts_path {
+                std::fs::read_to_string(path).map_err(|_| {
+                    io::Error::other("known_hosts unavailable; builder pin required")
+                })?
+            } else {
+                return Err(invalid("known_hosts or builder pin required").into());
+            };
+            Some(crate::KnownHosts::parse(&text)?)
+        };
+        let stream = TcpStream::connect((host, port))?;
+        let config = ClientConfig::new();
+        let mut transport = if let Some(pin) = pin {
+            config.connect(stream, |key| if *key == pin { Ok(()) } else { Err(()) })?
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            config.connect_with_known_hosts(stream, known_hosts.as_ref().ok_or_else(|| invalid("builder pin required"))?, host, port, now)
+                .map_err(|error| io::Error::other(format!("host verification failed or handshake failed ({error}); builder pin required if host is not trusted")))?
+        };
+        // Public-key authentication consumes one attempt for the query and one
+        // for the signed request, including for the last agent identity.
+        if let Some(methods) = self.methods.as_ref().filter(|m| !m.is_empty()) {
+            crate::authenticate_client(
+                &mut transport,
+                username,
+                methods,
+                methods.len().saturating_mul(2),
+            )?;
+        } else {
+            crate::authenticate_client(
+                &mut transport,
+                username,
+                &agent_methods,
+                agent_methods.len().saturating_mul(2),
+            )?;
+        }
+        Ok(SshClient {
+            sessions: ClientSessions::new(transport),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn default_agent_methods() -> Result<Vec<ClientAuthMethod>, ClientError> {
+    let path = std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| io::Error::other("SSH agent unavailable: SSH_AUTH_SOCK is not set"))?;
+    let client = crate::agent::connect_unix(path)
+        .map_err(|e| io::Error::other(format!("SSH agent unavailable: {e}")))?;
+    agent_methods(client, std::os::unix::net::UnixStream::try_clone)
+}
+
+#[cfg(windows)]
+fn default_agent_methods() -> Result<Vec<ClientAuthMethod>, ClientError> {
+    let client = crate::agent::connect_pipe(r"\\.\pipe\openssh-ssh-agent")
+        .map_err(|e| io::Error::other(format!("SSH agent unavailable: {e}")))?;
+    agent_methods(client, std::fs::File::try_clone)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn default_agent_methods() -> Result<Vec<ClientAuthMethod>, ClientError> {
+    Err(io::Error::other("SSH agent unavailable on this platform").into())
+}
+
+#[cfg(any(unix, windows))]
+fn agent_methods<T: Read + Write + Send + 'static>(
+    mut client: crate::agent::AgentClient<T>,
+    clone_stream: impl Fn(&T) -> io::Result<T>,
+) -> Result<Vec<ClientAuthMethod>, ClientError> {
+    let identities = client
+        .identities()
+        .map_err(|e| io::Error::other(format!("SSH agent unavailable: {e}")))?;
+    let stream = client.into_inner();
+    let mut methods = Vec::new();
+    for identity in identities {
+        let client = crate::agent::AgentClient::new(clone_stream(&stream)?);
+        if let Ok(signer) = crate::AgentKeySigner::new(client, &identity.key_blob) {
+            methods.push(ClientAuthMethod::agent(signer));
+        }
+    }
+    if methods.is_empty() {
+        return Err(io::Error::other("SSH agent has no supported identities").into());
+    }
+    Ok(methods)
+}
+
 impl SshClient<crate::ClientTransport<TcpStream>> {
+    /// Opens a destination using the current process user when omitted, the
+    /// default agent, and the existing known-hosts file.
+    ///
+    /// # Errors
+    /// Rejects invalid destinations, unavailable agents, unknown hosts and connection failures.
+    pub fn open(destination: &str) -> Result<Self, ClientError> {
+        let (username, host, port) = parse_destination(destination)?;
+        let username = match username {
+            Some(username) => username.to_owned(),
+            None => default_username()?,
+        };
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .ok_or_else(|| io::Error::other("known_hosts unavailable; builder pin required"))?;
+        Self::builder()
+            .username(username)
+            .host(host)
+            .port(port)
+            .agent(true)
+            .known_hosts_path(
+                std::path::PathBuf::from(home)
+                    .join(".ssh")
+                    .join("known_hosts"),
+            )
+            .build()
+    }
+
+    /// Creates an independently cloneable client configuration.
+    #[must_use]
+    pub fn builder() -> SshClientBuilder {
+        SshClientBuilder::default()
+    }
+
     /// Dials and authenticates with a required SSH-format Ed25519 key blob.
     /// `None` selects port 22. No configuration or credentials are loaded.
     /// The pin is checked only after the server signature has been verified.
     ///
     /// # Errors
     /// Rejects empty methods, invalid pins, dial, handshake and authentication failures.
-    pub fn open(
+    pub fn open_pinned(
         host: &str,
         port: Option<u16>,
         username: &str,
@@ -56,7 +336,12 @@ impl SshClient<crate::ClientTransport<TcpStream>> {
         let stream = TcpStream::connect((host, port.unwrap_or(22)))?;
         let mut transport = ClientConfig::new()
             .connect(stream, |key| if *key == pin { Ok(()) } else { Err(()) })?;
-        crate::authenticate_client(&mut transport, username, methods, methods.len())?;
+        crate::authenticate_client(
+            &mut transport,
+            username,
+            methods,
+            methods.len().saturating_mul(2),
+        )?;
         Ok(Self {
             sessions: ClientSessions::new(transport),
         })
@@ -575,8 +860,159 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn destination_parsing() -> Result<(), ClientError> {
+        assert_eq!(parse_destination("example.org")?, (None, "example.org", 22));
+        assert_eq!(
+            parse_destination("example.org:2222")?,
+            (None, "example.org", 2222)
+        );
+        assert_eq!(parse_destination("user@host")?, (Some("user"), "host", 22));
+        assert_eq!(
+            parse_destination("user@host:22")?,
+            (Some("user"), "host", 22)
+        );
+        assert_eq!(
+            parse_destination("user@example.org:2222")?,
+            (Some("user"), "example.org", 2222)
+        );
+        assert_eq!(parse_destination("[::1]")?, (None, "::1", 22));
+        assert_eq!(parse_destination("[::1]:2222")?, (None, "::1", 2222));
+        assert_eq!(
+            parse_destination("user@[::1]:2222")?,
+            (Some("user"), "::1", 2222)
+        );
+        for value in [
+            "",
+            "@host",
+            "user@",
+            "host@",
+            ":22",
+            "host:bad",
+            "user@host:no",
+            "user@host:0",
+            "user@::1",
+        ] {
+            assert!(parse_destination(value).is_err(), "{value}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn builder_clone_is_independent() {
+        let original = SshClient::builder()
+            .host("example.org")
+            .username("user")
+            .port(22)
+            .pin(b"key");
+        let changed = original.clone().port(2222);
+        assert_eq!(original.port, Some(22));
+        assert_eq!(changed.port, Some(2222));
+        assert_eq!(original.pin, changed.pin);
+        assert_eq!(original.host, changed.host);
+    }
+
+    #[test]
+    fn pinned_builder_authenticates_public_key() -> Result<(), ClientError> {
+        let host_signer = crate::hostkey::Ed25519Signer::from_seed(&mut [7; 32]);
+        let pin = host_signer.public_key().to_blob()?;
+        let user_signer = crate::hostkey::Ed25519Signer::from_seed(&mut [8; 32]);
+        let user_key = user_signer.public_key().to_blob()?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            let run = || -> Result<(), ClientError> {
+                let (stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+                let mut transport = ServerConfig::new(host_signer).accept(stream)?;
+                let policy = crate::ServerAuthPolicy::new(4)?.with_authorized_key(&user_key)?;
+                crate::authenticate_server(&mut transport, &policy)?;
+                Ok(())
+            };
+            run().map_err(|error| error.to_string())
+        });
+        let method =
+            ClientAuthMethod::public_key(crate::auth::PublicKeySigner::Ed25519(user_signer));
+        let client = SshClient::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .username("user")
+            .methods(vec![method])
+            .pin(pin)
+            .build();
+        assert!(client.is_ok(), "{client:?}");
+        assert_eq!(
+            server
+                .join()
+                .map_err(|_| io::Error::other("server panicked"))?,
+            Ok(())
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_user_defaults() -> Result<(), ClientError> {
+        const CHILD: &str = "NEOTALES_SSH_USER_TEST_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            if expected == "missing" {
+                assert!(
+                    default_username()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("username unavailable")
+                );
+            } else {
+                assert_eq!(default_username()?, expected);
+            }
+            return Ok(());
+        }
+        for (user, logname, expected) in [
+            ("first", "second", "first"),
+            ("", "second", "second"),
+            ("", "", "missing"),
+        ] {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .arg("--exact")
+                .arg("recipes_impl::tests::current_user_defaults")
+                .env("USER", user)
+                .env("LOGNAME", logname)
+                .env(CHILD, expected)
+                .status()?;
+            assert!(status.success());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn string_open_without_agent_does_not_dial() -> Result<(), ClientError> {
+        const CHILD: &str = "NEOTALES_SSH_NO_AGENT_CHILD";
+        if let Some(port) = std::env::var_os(CHILD) {
+            let error =
+                SshClient::open(&format!("127.0.0.1:{}", port.to_string_lossy())).unwrap_err();
+            assert!(error.to_string().contains("agent unavailable"), "{error}");
+            return Ok(());
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("recipes_impl::tests::string_open_without_agent_does_not_dial")
+            .env_remove("SSH_AUTH_SOCK")
+            .env("USER", "test-user")
+            .env(CHILD, listener.local_addr()?.port().to_string())
+            .status()?;
+        assert!(status.success());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        Ok(())
+    }
+
+    #[test]
     fn owned_client_rejects_empty_auth_before_dial() {
-        assert!(SshClient::open("invalid.invalid", None, "user", &[], b"").is_err());
+        assert!(SshClient::open_pinned("invalid.invalid", None, "user", &[], b"").is_err());
     }
 
     // Public-contract fixtures: scripted protocol peers avoid a network/server.
