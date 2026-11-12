@@ -512,3 +512,8 @@ No cross-platform build was run. No Unix-only production API was introduced.
 No library process spawning or process-environment reads were introduced.
 The worktree already contained uncommitted changes when this pass began.
 Those changes were preserved. Nothing was committed or pushed.
+# Current status — 2026-11-12
+
+Recorded tasks 0003 and 0005–0038 are implemented on branch `plab-rs-ssh`. Later commits added P-384/P-521 host keys, delayed zlib, non-ML-KEM rekey, an `ssh -R` byte tunnel, a memory SFTP server, in-memory recursive SCP, explicit Include, and explicit ProxyCommand spawn. This does not claim support for sntrup, security keys, ML-DSA, SHA-1, group1, CBC, 3DES, RC4, or HMAC-SHA1.
+
+The gap lists below are historical findings from the pre-implementation review, not current status.
