@@ -15,12 +15,12 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-/// Explicit Linux filesystem-backed SFTP v3 server over a caller-owned byte stream.
+/// Explicit filesystem-backed SFTP v3 server over a caller-owned byte stream.
 ///
 /// Relative paths are beneath the canonicalized caller-supplied root; absolute
 /// paths must be beneath that same root. `..`, escaping symlinks, and special
-/// files are rejected. Relative in-root symlinks work; absolute symlinks are
-/// conservatively rejected. Linux `openat2` is required (no unsafe fallback).
+/// files are rejected. Linux uses `openat2`; other platforms reject all links
+/// and require the caller to prevent concurrent directory modifications.
 /// Open handles pin files, not pathnames; dropping the server closes all handles.
 /// Only OPEN, READ, WRITE and CLOSE are implemented. No home or host root is used.
 #[derive(Debug)]
@@ -36,9 +36,7 @@ impl<T: Read + Write> RootedSftpServer<T> {
     /// Canonicalizes and pins an existing root directory, without creating it.
     ///
     /// # Errors
-    /// Returns [`RootedTransferError::UnsupportedPlatform`] without accessing the
-    /// filesystem on non-Linux targets, or [`RootedTransferError::Io`] if the root
-    /// cannot be opened as a directory on Linux.
+    /// Returns [`RootedTransferError::Io`] if the root cannot be opened as a directory.
     pub fn new(transport: T, root: impl AsRef<Path>) -> Result<Self, RootedTransferError> {
         Ok(Self {
             transport,

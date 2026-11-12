@@ -76,7 +76,7 @@ fn client_drives_add_list_sign_remove_lock_unlock_and_constraint_denial()
     let (record, blob) = identity(41)?;
     let (second, other) = identity(42)?;
     let mut client = AgentClient::new(Loopback::default());
-    assert!(client.identities()?.is_empty());
+    assert_eq!(client.identities()?.len(), 0);
     client.add_identity(&record)?;
     client.add_identity(&second)?;
     assert_eq!(client.identities()?.len(), 2);
@@ -89,7 +89,7 @@ fn client_drives_add_list_sign_remove_lock_unlock_and_constraint_denial()
     client.remove_identity(&other)?;
     assert_eq!(client.identities()?.len(), 1);
     client.lock(b"synthetic-lock-passphrase")?;
-    assert!(client.identities()?.is_empty());
+    assert_eq!(client.identities()?.len(), 0);
     assert!(client.sign(&blob, b"denied").is_err());
     assert!(client.add_identity(&second).is_err());
     let error = client
@@ -109,7 +109,7 @@ fn client_drives_add_list_sign_remove_lock_unlock_and_constraint_denial()
     client.add_identity(&record)?;
     assert_eq!(client.identities()?.len(), 1);
     client.remove_all()?;
-    assert!(client.identities()?.is_empty());
+    assert_eq!(client.identities()?.len(), 0);
     assert!(client.sign(&blob, b"removed").is_err());
     Ok(())
 }

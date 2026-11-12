@@ -304,7 +304,7 @@ fn the_existing_signer_variants_are_unchanged() -> Result<(), Box<dyn std::error
     let method = ClientAuthMethod::public_key(PublicKeySigner::ecdsa(
         EcdsaSigner::from_secret_scalar(&mut valid_scalar())?,
     ));
-    assert!(!format!("{method:?}").is_empty());
+    assert_ne!(format!("{method:?}"), "");
     Ok(())
 }
 

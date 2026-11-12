@@ -665,7 +665,7 @@ mod tests {
                 let mut client = Client::new(context(algorithm)).unwrap();
                 assert!(client.accept_group(packet.as_bytes()).is_err());
                 assert!(client.secret.is_none());
-                assert!(client.public.is_empty());
+                assert_eq!(client.public, []);
             }
         }
         validate_group(&prime, &[2], REQUEST).unwrap();

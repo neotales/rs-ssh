@@ -8,13 +8,13 @@ use crate::transfer_root::{
 use std::io::{Read, Write};
 use std::path::Path;
 
-/// Explicit Linux filesystem-backed, single-file SCP source/sink.
+/// Explicit filesystem-backed, single-file SCP source/sink.
 ///
 /// The caller supplies both the root and the exact file path for each transfer;
 /// peer basenames never select a destination. The canonicalized root is pinned.
 /// `..`, absolute paths outside it, escaping symlinks, and special files are
-/// rejected using Linux `openat2` (required; no unsafe fallback). Relative in-root
-/// symlinks work; absolute symlinks are conservatively rejected. No process,
+/// rejected using Linux `openat2`. Other platforms reject all links and require
+/// the caller to prevent concurrent directory modifications. No process,
 /// implicit host root, or home directory is used. Directory APIs stay in-memory.
 #[derive(Debug)]
 pub struct RootedScpServer<T> {
@@ -26,9 +26,7 @@ impl<T: Read + Write> RootedScpServer<T> {
     /// Canonicalizes and pins the caller's existing root directory.
     ///
     /// # Errors
-    /// Returns [`RootedTransferError::UnsupportedPlatform`] without accessing the
-    /// filesystem on non-Linux targets, or [`RootedTransferError::Io`] if the root
-    /// cannot be opened as a directory on Linux.
+    /// Returns [`RootedTransferError::Io`] if the root cannot be opened as a directory.
     pub fn new(transport: T, root: impl AsRef<Path>) -> Result<Self, RootedTransferError> {
         Ok(Self {
             transport,

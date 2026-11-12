@@ -166,7 +166,7 @@ records including the root; directory transfers do not access host directories.
 SFTP version 3 supports an in-process server over a caller-supplied byte stream
 and memory map. This remains the default and never touches disk.
 
-Filesystem access is an explicit Linux-only adapter: `sftp::RootedSftpServer`
+Filesystem access is an explicit adapter: `sftp::RootedSftpServer`
 implements v3 OPEN/READ/WRITE/CLOSE; `scp::RootedScpServer` receives or sends one
 file without spawning a process. Each requires a caller-supplied root directory,
 canonicalized and pinned at construction. There is no implicit host root or home.
@@ -175,8 +175,10 @@ canonical path. `..`, escaping symlinks, and special files are rejected. Relativ
 in-root symlinks are allowed; absolute symlinks are conservatively rejected.
 Linux `openat2` (5.6+, allowed by host policy) enforces confinement during path
 resolution, including symlink swaps; there is no unsafe fallback on older hosts.
-On non-Linux targets the rooted APIs compile, but constructors return the typed
-`RootedTransferError::UnsupportedPlatform` without accessing the filesystem.
+On other platforms, the adapter rejects all symlinks and reparse points and
+checks canonical paths before opening. These checks are not atomic: callers must
+prevent concurrent modification of the root and its directories; otherwise a
+path swap can escape the root. They are not a sandbox against an active attacker.
 Existing hard links/mounts inside the root and externally moving open files are
 the caller's responsibility, not an additional sandbox guarantee.
 

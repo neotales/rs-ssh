@@ -471,7 +471,7 @@ fn fixed_kexinit_vector_round_trips_without_normalization() -> Result<(), Error>
     let decoded = KexInit::decode(&encoded)?;
     assert_eq!(decoded, message);
     assert_eq!(decoded.kex_algorithms[1], CURVE25519_SHA256);
-    assert!(decoded.languages_client_to_server.is_empty());
+    assert_eq!(decoded.languages_client_to_server, [] as [String; 0]);
     assert_eq!(decoded.languages_server_to_client, ["en-US"]);
     assert!(decoded.first_kex_packet_follows);
     assert_eq!(decoded.reserved, 0x0102_0304);
@@ -802,8 +802,8 @@ fn chacha_negotiation_does_not_require_mac_algorithms() {
         negotiated.cipher_server_to_client,
         ENCRYPTION_CHACHA20_POLY1305_OPENSSH
     );
-    assert!(negotiated.mac_client_to_server.is_empty());
-    assert!(negotiated.mac_server_to_client.is_empty());
+    assert_eq!(negotiated.mac_client_to_server, "");
+    assert_eq!(negotiated.mac_server_to_client, "");
 
     let mut disjoint_client = client;
     let mut disjoint_server = server;
@@ -814,8 +814,8 @@ fn chacha_negotiation_does_not_require_mac_algorithms() {
     let negotiated = disjoint_client
         .negotiate(&disjoint_server)
         .expect("disjoint MAC lists are ignored for ChaCha");
-    assert!(negotiated.mac_client_to_server.is_empty());
-    assert!(negotiated.mac_server_to_client.is_empty());
+    assert_eq!(negotiated.mac_client_to_server, "");
+    assert_eq!(negotiated.mac_server_to_client, "");
 
     disjoint_client.encryption_algorithms_client_to_server = vec![AES128_CTR.to_owned()];
     disjoint_client.encryption_algorithms_server_to_client = vec![AES128_CTR.to_owned()];

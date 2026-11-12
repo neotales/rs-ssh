@@ -5,7 +5,6 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-#[cfg(target_os = "linux")]
 use std::path::{Component, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -16,7 +15,7 @@ pub enum RootedTransferError {
     /// Secure rooted filesystem access is not implemented on this platform.
     /// No filesystem operation has been performed.
     UnsupportedPlatform,
-    /// Opening the root on Linux failed.
+    /// Opening the root failed.
     Io(io::Error),
 }
 
@@ -32,7 +31,7 @@ impl std::fmt::Debug for RootedTransferError {
 impl std::fmt::Display for RootedTransferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::UnsupportedPlatform => "rooted file transfers require Linux",
+            Self::UnsupportedPlatform => "rooted file transfers are unsupported on this platform",
             Self::Io(_) => "opening the file-transfer root failed",
         })
     }
@@ -70,7 +69,6 @@ pub(crate) struct TransferOpenOptions {
 }
 
 pub(crate) struct TransferRoot {
-    #[cfg(target_os = "linux")]
     path: PathBuf,
     #[cfg(target_os = "linux")]
     directory: File,
@@ -84,20 +82,73 @@ impl std::fmt::Debug for TransferRoot {
 
 impl TransferRoot {
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn new(_root: &Path) -> Result<Self, RootedTransferError> {
-        Err(RootedTransferError::UnsupportedPlatform)
+    pub(crate) fn new(root: &Path) -> Result<Self, RootedTransferError> {
+        let path = root.canonicalize()?;
+        if !path.is_dir() {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        Ok(Self { path })
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn open(&self, _path: &[u8], options: TransferOpenOptions) -> io::Result<File> {
-        // Keep this branch filesystem-free even if internal construction changes.
-        let _ = (
+    pub(crate) fn open(&self, path: &[u8], options: TransferOpenOptions) -> io::Result<File> {
+        let path =
+            std::str::from_utf8(path).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let path = Path::new(path);
+        if path.as_os_str().is_empty()
+            || path.components().any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&self.path)
+                .map_err(|_| io::Error::from(io::ErrorKind::PermissionDenied))?
+        } else {
+            path
+        };
+        // Reject all links, including Windows junctions and other reparse points.
+        // This validation is not atomic with open; callers must prevent concurrent
+        // modification of the root's directories on platforms without openat2.
+        let mut current = self.path.clone();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            if !matches!(component, Component::Normal(_) | Component::CurDir) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            current.push(component.as_os_str());
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                    if !current.canonicalize()?.starts_with(&self.path) {
+                        return Err(io::ErrorKind::PermissionDenied.into());
+                    }
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && components.peek().is_none()
+                        && options.create => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut open = std::fs::OpenOptions::new();
+        open.read(matches!(
             options.access,
-            options.create,
-            options.exclusive,
-            options.append,
-        );
-        Err(io::ErrorKind::Unsupported.into())
+            TransferAccess::Read | TransferAccess::ReadWrite
+        ))
+        .write(matches!(
+            options.access,
+            TransferAccess::Write | TransferAccess::ReadWrite
+        ))
+        .append(options.append)
+        .create(options.create)
+        .create_new(options.create && options.exclusive);
+        let file = open.open(current)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(file)
     }
 
     #[cfg(target_os = "linux")]
@@ -172,4 +223,15 @@ impl TransferRoot {
         }
         Ok(file)
     }
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn is_reparse_point(_: &std::fs::Metadata) -> bool {
+    false
 }

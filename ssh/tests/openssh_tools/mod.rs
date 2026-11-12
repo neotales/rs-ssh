@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn current_username_is_nonempty() {
-        assert!(!current_user().unwrap().is_empty());
+        assert_ne!(current_user().unwrap(), "");
     }
 
     #[test]

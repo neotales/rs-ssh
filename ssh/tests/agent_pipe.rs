@@ -50,7 +50,7 @@ fn pipe_protocol_is_independent_of_the_connector() -> Result<(), Box<dyn std::er
         output: Vec::new(),
     };
     let mut client = neotales_ssh::agent::AgentClient::new(stream);
-    assert!(client.identities()?.is_empty());
+    assert_eq!(client.identities()?.len(), 0);
     assert_eq!(client.into_inner().output, [0, 0, 0, 1, 11]);
     Ok(())
 }

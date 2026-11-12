@@ -239,8 +239,8 @@ fn directory_paths_reject_escape_and_collisions_before_upload_io() {
             .collect();
         let mut stream = ScriptedStream::new(Vec::new());
         assert!(upload_directory(&mut stream, b"tree", &entries).is_err());
-        assert!(stream.output.is_empty());
-        assert!(stream.read_lengths.is_empty());
+        assert_eq!(stream.output, []);
+        assert_eq!(stream.read_lengths, []);
     }
 }
 

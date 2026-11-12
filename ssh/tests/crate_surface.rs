@@ -41,13 +41,13 @@ fn assert_public_type<T>() {
 }
 
 fn assert_public_function<F>(function: &F) {
-    assert!(!std::any::type_name_of_val(function).is_empty());
+    assert_ne!(std::any::type_name_of_val(function), "");
 }
 
 #[test]
 fn public_crate_surface_is_available_without_io() {
     let client_config = ClientConfig::new();
-    assert!(!client_config.kexinit().kex_algorithms.is_empty());
+    assert_ne!(client_config.kexinit().kex_algorithms.len(), 0);
     assert!(CLIENT_IDENTIFICATION.starts_with("SSH-2.0-"));
     assert!(DEFAULT_SERVER_IDENTIFICATION.starts_with("SSH-2.0-"));
 

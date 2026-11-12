@@ -489,8 +489,8 @@ fn chacha_handshake_allows_empty_mac_lists() -> Result<(), Box<dyn std::error::E
     peer.accept_client_newkeys()?;
 
     let negotiated = peer.state.borrow().negotiated.clone();
-    assert!(negotiated.mac_client_to_server.is_empty());
-    assert!(negotiated.mac_server_to_client.is_empty());
+    assert_eq!(negotiated.mac_client_to_server, "");
+    assert_eq!(negotiated.mac_server_to_client, "");
     assert_eq!(
         PacketSuite::new(ENCRYPTION_CHACHA20_POLY1305_OPENSSH, None)?.integrity_name(),
         None

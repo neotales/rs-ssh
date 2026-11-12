@@ -680,7 +680,7 @@ mod tests {
             u32::from(origin.local_addr()?.port())
         );
         // No bytes are sent before confirmation, even if TCP data is ready.
-        assert!(server.transport().incoming.borrow().is_empty());
+        assert_eq!(server.transport().incoming.borrow().len(), 0);
         let remote = server.allocate_channel_id()?;
         server.confirm_open_with_limits(request.sender_channel(), remote, WINDOW, PACKET)?;
         server.write_data(remote, b"r")?;

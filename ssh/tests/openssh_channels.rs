@@ -1007,7 +1007,7 @@ fn a_channel_survives_our_close_until_the_peers_close_arrives()
         }
         match sessions.dispatch_one()? {
             SessionEvent::Data { session: id, data } if id == session => {
-                assert!(!data.is_empty());
+                assert_ne!(data, []);
                 break;
             }
             SessionEvent::Close { .. } => return Err("the command finished too fast".into()),

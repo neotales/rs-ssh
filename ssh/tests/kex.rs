@@ -564,7 +564,10 @@ fn rfc4253_section_7_2_derivation_reproduces_all_six_letters() -> Result<(), Kex
             32,
         )?
     );
-    assert!(derive_key(&shared, &exchange_hash, &session_id, DerivationLetter::A, 0,)?.is_empty());
+    assert_eq!(
+        derive_key(&shared, &exchange_hash, &session_id, DerivationLetter::A, 0,)?,
+        []
+    );
     Ok(())
 }
 

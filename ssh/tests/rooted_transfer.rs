@@ -1,21 +1,69 @@
 #![allow(missing_docs)]
 
-#[cfg(not(target_os = "linux"))]
 #[test]
-fn rooted_constructors_report_unsupported_without_a_disk_root() {
-    use neotales_ssh::{RootedTransferError, scp::RootedScpServer, sftp::RootedSftpServer};
-    use std::io::Cursor;
-
-    // No temporary directory or other filesystem setup: even an empty path must
-    // return the typed platform error, not a filesystem/path validation error.
-    assert!(matches!(
-        RootedSftpServer::new(Cursor::new(Vec::<u8>::new()), ""),
-        Err(RootedTransferError::UnsupportedPlatform)
-    ));
-    assert!(matches!(
-        RootedScpServer::new(Cursor::new(Vec::<u8>::new()), ""),
-        Err(RootedTransferError::UnsupportedPlatform)
-    ));
+fn rooted_disk_round_trip_and_escape() {
+    use neotales_ssh::sftp::{RootedSftpServer, SftpClient, SftpOpenFlags};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), b"outside").unwrap();
+    #[cfg(unix)]
+    let link = std::os::unix::fs::symlink(outside.path(), root.path().join("escape"));
+    #[cfg(windows)]
+    let link = std::os::windows::fs::symlink_dir(outside.path(), root.path().join("escape"));
+    #[cfg(not(any(unix, windows)))]
+    let link: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
+    if let Err(error) = &link {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ),
+            "symlink creation failed: {error}"
+        );
+        eprintln!("skipping symlink escape assertion: {error}");
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    for stream in [&client, &server] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+    }
+    let mut server = RootedSftpServer::new(server, root.path()).unwrap();
+    let requests = if link.is_ok() { 7 } else { 6 };
+    let worker = std::thread::spawn(move || {
+        for _ in 0..requests {
+            server.serve_one().unwrap();
+        }
+    });
+    let mut client = SftpClient::connect(client).unwrap();
+    let handle = client
+        .open(
+            "one",
+            SftpOpenFlags::READ | SftpOpenFlags::WRITE | SftpOpenFlags::CREAT,
+        )
+        .unwrap();
+    client.write(&handle, 0, b"disk bytes").unwrap();
+    assert_eq!(
+        client.read(&handle, 0, 32).unwrap().as_slice(),
+        b"disk bytes"
+    );
+    client.close(&handle).unwrap();
+    assert!(client.open("../secret", SftpOpenFlags::READ).is_err());
+    if link.is_ok() {
+        assert!(client.open("escape/secret", SftpOpenFlags::READ).is_err());
+    }
+    worker.join().unwrap();
+    assert_eq!(
+        std::fs::read(root.path().join("one")).unwrap(),
+        b"disk bytes"
+    );
 }
 
 #[cfg(target_os = "linux")]

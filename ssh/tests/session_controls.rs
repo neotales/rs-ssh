@@ -188,7 +188,7 @@ fn agent_forwarding_is_explicit_default_denied_and_carries_only_opaque_channel_b
         return Err("expected agent open".into());
     };
     assert_eq!(request.channel_type(), b"auth-agent@openssh.com");
-    assert!(request.type_specific_data().is_empty());
+    assert_eq!(request.type_specific_data(), []);
     let client_agent = client.accept_agent_channel(&request)?;
     server.dispatch_one()?;
     server

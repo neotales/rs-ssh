@@ -32,7 +32,7 @@ fn in_place_seal_preserves_the_allocation_and_wipes_failed_input() -> Result<(),
     }
     let mut invalid = vec![0x77; 3];
     assert!(cipher.seal_in_place(3, &mut invalid).is_err());
-    assert!(invalid.is_empty());
+    assert_eq!(invalid.len(), 0);
     Ok(())
 }
 

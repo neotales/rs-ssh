@@ -39,7 +39,7 @@ fn sign_request_cap_includes_all_framing_and_rejects_before_writing() -> Result<
         Err(AgentError::FrameTooLarge)
     ));
     let stream = client.into_inner();
-    assert!(stream.output.is_empty());
+    assert_eq!(stream.output, []);
     assert_eq!(stream.input.position(), 0);
     Ok(())
 }

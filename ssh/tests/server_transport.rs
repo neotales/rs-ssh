@@ -629,8 +629,8 @@ fn chacha_handshake_allows_disjoint_mac_lists() -> Result<(), Box<dyn std::error
     let negotiated = client_proposal
         .negotiate(&server_proposal)
         .expect("ChaCha ignores disjoint MAC lists");
-    assert!(negotiated.mac_client_to_server.is_empty());
-    assert!(negotiated.mac_server_to_client.is_empty());
+    assert_eq!(negotiated.mac_client_to_server, "");
+    assert_eq!(negotiated.mac_server_to_client, "");
     assert_eq!(
         PacketSuite::new(ENCRYPTION_CHACHA20_POLY1305_OPENSSH, None)?.integrity_name(),
         None

@@ -41,7 +41,7 @@ fn explicit_request_and_open_are_default_denied_then_policy_accepted()
     let server_session = server.allocate_channel_id()?;
     server.confirm_open(open.sender_channel(), server_session)?;
     client.dispatch_one()?;
-    assert!(a.borrow().is_empty()); // No implicit X11 request.
+    assert_eq!(a.borrow().len(), 0); // No implicit X11 request.
     let request = X11Request::new(true, b"MIT-MAGIC-COOKIE-1", b"0123456789abcdef", 7)?;
     // RFC 4254 6.3 independent body fixture, not our encoder's round trip.
     assert_eq!(
