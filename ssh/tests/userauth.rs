@@ -1004,6 +1004,127 @@ fn ed25519_authentication_reuses_the_transport_for_application_data()
     Ok(())
 }
 
+fn security_key_public_blob(algorithm: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    let mut public = Writer::new();
+    public.write_string(algorithm)?;
+    if algorithm == security_key::ED25519 {
+        public.write_string(
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+                .verifying_key()
+                .as_bytes(),
+        )?;
+    } else {
+        public.write_string("nistp256")?;
+        public.write_string(
+            p256::SecretKey::from_slice(&[7; 32])?
+                .public_key()
+                .to_sec1_point(false)
+                .as_bytes(),
+        )?;
+    }
+    public.write_string("ssh:test")?;
+    Ok(public.into_bytes())
+}
+
+#[test]
+fn security_key_callbacks_sign_authenticate_and_enroll_without_hardware()
+-> Result<(), Box<dyn std::error::Error>> {
+    use security_key::{
+        EnrolledKey, ResidentKeyEnrollment, SecurityKeySigner, SecurityKeyVerifier, Signature,
+    };
+    use std::sync::{Arc, Mutex};
+
+    for algorithm in [security_key::ED25519, security_key::ECDSA] {
+        let public = security_key_public_blob(algorithm)?;
+        assert!(
+            ResidentKeyEnrollment::default()
+                .enroll(algorithm, b"ssh:test")
+                .is_err()
+        );
+        let enrolled_blob = public.clone();
+        let enrollment = ResidentKeyEnrollment::new(move |name, application| {
+            assert_eq!(name, algorithm);
+            assert_eq!(application, b"ssh:test");
+            Some(EnrolledKey {
+                public_key_blob: enrolled_blob.clone(),
+                handle: b"fake-handle".to_vec(),
+            })
+        });
+        let enrolled = enrollment.enroll(algorithm, b"ssh:test")?;
+        assert_eq!(enrolled.public_key_blob, public);
+
+        for mode in 0..3 {
+            // success, missing verifier, explicit verifier denial
+            let signed = Arc::new(Mutex::new(None));
+            let recorded = Arc::clone(&signed);
+            let auth_signer = SecurityKeySigner::new(
+                enrolled.public_key_blob.clone(),
+                enrolled.handle.clone(),
+                move |request| {
+                    assert_eq!(request.handle, b"fake-handle");
+                    let preimage = request.signed_data(1, 42).ok()?;
+                    *recorded.lock().unwrap() = Some(preimage);
+                    let signature = if algorithm == security_key::ED25519 {
+                        vec![9; 64]
+                    } else {
+                        let mut parts = Writer::new();
+                        parts.write_mpint(1_u32).unwrap();
+                        parts.write_mpint(2_u32).unwrap();
+                        parts.into_bytes()
+                    };
+                    Some(Signature {
+                        bytes: signature,
+                        flags: 1,
+                        counter: 42,
+                    })
+                },
+            )?;
+            let mut policy = ServerAuthPolicy::new(4)?.with_authorized_key(&public)?;
+            if mode != 1 {
+                let recorded = Arc::clone(&signed);
+                policy =
+                    policy.with_security_key_verifier(SecurityKeyVerifier::new(move |request| {
+                        assert_eq!(request.algorithm, algorithm);
+                        assert_eq!(request.signed_data, recorded.lock().unwrap().unwrap());
+                        assert_eq!(request.flags, 1);
+                        assert_eq!(request.counter, 42);
+                        mode == 0 // Fake callback; not a cryptographic/device claim.
+                    }));
+            }
+            assert_eq!(policy.public_key_enabled(), mode != 1);
+            let config = ServerConfig::new(signer(202));
+            let (mut client, driver) = connect_auth_pair(&config, policy)?;
+            let mut authenticator = ClientAuthenticator::new(&mut client, "alice", 4)?;
+            let result = authenticator.authenticate(&[ClientAuthMethod::public_key(
+                PublicKeySigner::SecurityKey(auth_signer),
+            )]);
+            if mode == 0 {
+                assert_eq!(result?.method(), AuthMethodKind::PublicKey);
+                let mut server = driver.take_server().ok_or("lost server")?;
+                assert!(server.is_authenticated());
+                client.write_payload(b"authenticated")?;
+                assert_eq!(server.read_payload()?, b"authenticated");
+            } else {
+                assert!(result.is_err());
+                assert!(
+                    !driver
+                        .take_server()
+                        .ok_or("lost server")?
+                        .is_authenticated()
+                );
+                if mode == 1 {
+                    assert!(signed.lock().unwrap().is_none());
+                }
+            }
+            if let Some(error) = driver.take_error() {
+                return Err(Box::new(error));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn rsa_sha256_publickey_authentication_uses_pkcs1_sha256() -> Result<(), Box<dyn std::error::Error>>
 {

@@ -50,8 +50,34 @@ PROTOCOL.u2f preimage `SHA256(application) || flags || counter || SHA256(message
 The verifier must perform cryptographic verification and application/presence/
 counter policy; false or panic denies. Unknown flags/extensions and trailing or
 truncated framing fail before callback invocation. Rekey pins the public blob
-and retains this verifier. Tests use a fake callback; no hardware provenance,
-resident key, signing device, userauth integration, or USB access is claimed.
+and retains this verifier.
+
+`SecurityKeySigner::new(public_blob, handle, callback)` installs an explicit
+signing capability. Its callback chooses flags/counter, signs the library-built
+`Signing::signed_data(flags, counter)` PROTOCOL.u2f preimage, and returns
+`Signature` (raw Ed25519 bytes or SSH P-256 r/s mpints, not DER). The library
+validates framing and builds the SSH signature blob with those exact flags and
+counter; it neither generates signatures nor stores a private key. Callback
+denial, panic, malformed signatures and unknown flags fail closed.
+
+`ClientAuthMethod::public_key(PublicKeySigner::SecurityKey(signer))` uses this
+capability for user authentication. The server requires both an explicitly
+authorized public blob and `ServerAuthPolicy::with_security_key_verifier(...)`;
+the existing verifier owns crypto and application/presence/counter policy.
+Without the respective callbacks the client cannot construct the signer and the
+server neither offers SK-only publickey authentication nor accepts SK queries
+or signatures. Server signature-algorithm advertisements are opt-in as well.
+SHA-1 `ssh-rsa` userauth rejection and RSA SHA-2 behavior are unchanged.
+
+`ResidentKeyEnrollment::new(callback).enroll(algorithm, application)` delegates
+one resident-key enrollment request entirely to the caller and returns a
+validated public blob plus opaque handle. The default has no callback and
+rejects without sending any enrollment request. Application/algorithm mismatch,
+malformed keys, denial and panic are rejected. No credential file is read.
+Offline tests use fake callbacks to sign, authenticate and enroll both SK key
+types, and cover missing callbacks and denial. These are in-process callback
+contracts, not evidence of a device, resident hardware, USB access or live
+OpenSSH interoperability.
 
 Both handshakes support `sntrup761x25519-sha512@openssh.com` through explicit
 KEXINIT selection, with unchanged default proposals. Strict/non-strict loopback

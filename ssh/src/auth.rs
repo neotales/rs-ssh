@@ -649,6 +649,8 @@ fn map_agent_error(error: &AgentError) -> AuthError {
 
 /// A client-side public-key signer usable by the authentication loop.
 pub enum PublicKeySigner {
+    /// Callback-only security-key signer; absence cannot construct this variant.
+    SecurityKey(crate::security_key::SecurityKeySigner),
     /// Ed25519 certificate and subject signer, associated by the
     /// `ed25519_certificate` constructor before authentication.
     Ed25519Certificate {
@@ -752,6 +754,7 @@ impl PublicKeySigner {
     #[must_use]
     pub fn algorithm(&self) -> &'static str {
         match self {
+            Self::SecurityKey(signer) => signer.algorithm(),
             Self::Ed25519Certificate { .. } => neotales_ssh::cert::SSH_ED25519_CERT_V01,
             Self::Ed25519(_) => SSH_ED25519,
             Self::Rsa(_) => SSH_RSA_SHA2_256,
@@ -770,6 +773,7 @@ impl PublicKeySigner {
     /// Returns an [`AuthError`] if the fixed key encoding fails.
     pub fn public_key_blob(&self) -> Result<Vec<u8>, AuthError> {
         match self {
+            Self::SecurityKey(signer) => Ok(signer.public_key_blob().to_vec()),
             Self::Ed25519Certificate { blob, .. } => Ok(blob.clone()),
             Self::Ed25519(signer) => signer.public_key_blob().map_err(map_hostkey_error),
             Self::Rsa(signer) | Self::RsaSha512(signer) => Ok(signer.public_key_blob().to_vec()),
@@ -783,11 +787,12 @@ impl PublicKeySigner {
     /// Returns whether signing is performed by an external key holder.
     #[must_use]
     pub const fn is_external(&self) -> bool {
-        matches!(self, Self::Agent(_))
+        matches!(self, Self::Agent(_) | Self::SecurityKey(_))
     }
 
     fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>, AuthError> {
         match self {
+            Self::SecurityKey(signer) => signer.sign(bytes).map_err(|_| AuthError::InvalidProof),
             Self::Ed25519Certificate { signer, .. } => {
                 signer.sign_exchange_hash(bytes).map_err(map_hostkey_error)
             }
@@ -1592,6 +1597,7 @@ type NonePolicy = dyn Fn(&str) -> bool;
 /// accepts every key or password. An empty policy is valid but denies both
 /// methods. `max_attempts` is checked for a value of at least one.
 pub struct ServerAuthPolicy {
+    security_key_verifier: Option<crate::security_key::SecurityKeyVerifier>,
     user_certificate_trust: Option<neotales_ssh::cert::UserCertificateTrust>,
     none_policy: Option<Box<NonePolicy>>,
     authorized_keys: Vec<Vec<u8>>,
@@ -1610,6 +1616,10 @@ impl fmt::Debug for ServerAuthPolicy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServerAuthPolicy")
+            .field(
+                "security_key_verifier",
+                &self.security_key_verifier.is_some(),
+            )
             .field(
                 "user_certificate_trust",
                 &self.user_certificate_trust.is_some(),
@@ -1636,6 +1646,21 @@ impl fmt::Debug for ServerAuthPolicy {
 }
 
 impl ServerAuthPolicy {
+    /// Enables SK signature verification and its advertised algorithms. Keys still
+    /// require explicit authorization; callback policy and crypto remain mandatory.
+    #[must_use]
+    pub fn with_security_key_verifier(
+        mut self,
+        verifier: crate::security_key::SecurityKeyVerifier,
+    ) -> Self {
+        self.security_key_verifier = Some(verifier);
+        for algorithm in [crate::security_key::ED25519, crate::security_key::ECDSA] {
+            if !self.signature_algorithms.contains(&algorithm) {
+                self.signature_algorithms.push(algorithm);
+            }
+        }
+        self
+    }
     /// Creates an explicit policy with no methods enabled.
     ///
     /// # Errors
@@ -1646,6 +1671,7 @@ impl ServerAuthPolicy {
             return Err(AuthError::InvalidRequest);
         }
         Ok(Self {
+            security_key_verifier: None,
             user_certificate_trust: None,
             none_policy: None,
             authorized_keys: Vec::new(),
@@ -1712,6 +1738,12 @@ impl ServerAuthPolicy {
                 SSH_ECDSA_SHA2_NISTP256 => SSH_ECDSA_SHA2_NISTP256,
                 SSH_ECDSA_SHA2_NISTP384 => SSH_ECDSA_SHA2_NISTP384,
                 SSH_ECDSA_SHA2_NISTP521 => SSH_ECDSA_SHA2_NISTP521,
+                crate::security_key::ED25519 if self.security_key_verifier.is_some() => {
+                    crate::security_key::ED25519
+                }
+                crate::security_key::ECDSA if self.security_key_verifier.is_some() => {
+                    crate::security_key::ECDSA
+                }
                 _ => return Err(AuthError::InvalidKey),
             };
             if selected.contains(&name) {
@@ -2061,7 +2093,14 @@ impl ServerAuthPolicy {
     /// Returns whether at least one public key is authorized.
     #[must_use]
     pub fn public_key_enabled(&self) -> bool {
-        !self.authorized_keys.is_empty() || self.user_certificate_trust.is_some()
+        self.authorized_keys.iter().any(|blob| {
+            let mut reader = Reader::new(blob);
+            let is_sk = reader.read_string().is_ok_and(|name| {
+                name == crate::security_key::ED25519.as_bytes()
+                    || name == crate::security_key::ECDSA.as_bytes()
+            });
+            !is_sk || self.security_key_verifier.is_some()
+        }) || self.user_certificate_trust.is_some()
     }
 
     /// Returns whether a password callback is configured.
@@ -2615,22 +2654,24 @@ where
         }
         let signed_bytes =
             encode_signed_bytes(self.transport.session_id(), &payload[..prefix_end])?;
-        if !verify_public_key(&parsed, &signature_blob, &signed_bytes) {
+        let valid = match &parsed {
+            ParsedPublicKey::SecurityKey(algorithm, blob) => self
+                .policy
+                .security_key_verifier
+                .as_ref()
+                .is_some_and(|verifier| {
+                    verifier
+                        .verify(algorithm, blob, &signature_blob, &signed_bytes)
+                        .is_ok()
+                }),
+            _ => verify_public_key(&parsed, &signature_blob, &signed_bytes),
+        };
+        if !valid {
             self.write_failure()?;
             return Ok(ServerAuthStep::Failure);
         }
-        let algorithm_name = match algorithm.as_slice() {
-            value if value == neotales_ssh::cert::SSH_ED25519_CERT_V01.as_bytes() => {
-                neotales_ssh::cert::SSH_ED25519_CERT_V01
-            }
-            value if value == SSH_ED25519.as_bytes() => SSH_ED25519,
-            value if value == SSH_RSA_SHA2_256.as_bytes() => SSH_RSA_SHA2_256,
-            value if value == SSH_RSA_SHA2_512.as_bytes() => SSH_RSA_SHA2_512,
-            value if value == SSH_ECDSA_SHA2_NISTP256.as_bytes() => SSH_ECDSA_SHA2_NISTP256,
-            value if value == SSH_ECDSA_SHA2_NISTP384.as_bytes() => SSH_ECDSA_SHA2_NISTP384,
-            value if value == SSH_ECDSA_SHA2_NISTP521.as_bytes() => SSH_ECDSA_SHA2_NISTP521,
-            _ => return Err(AuthError::InvalidKey),
-        };
+        // The algorithm has already passed the policy allowlist and key parser.
+        let algorithm_name = std::str::from_utf8(&algorithm).map_err(|_| AuthError::InvalidKey)?;
         if self.policy.check_public_key(
             algorithm_name,
             &key_blob,
@@ -3842,6 +3883,7 @@ fn parse_userauth_header(payload: &[u8]) -> Result<RequestHeader<'_>, AuthError>
 }
 
 enum ParsedPublicKey {
+    SecurityKey(&'static str, Vec<u8>),
     Ed25519(Ed25519PublicKey),
     Rsa(RsaPublicKey, &'static str),
     Ecdsa256(neotales_ssh::ecdsa_hostkey::EcdsaPublicKey),
@@ -3850,6 +3892,12 @@ enum ParsedPublicKey {
 }
 
 fn parse_public_key(algorithm: &[u8], blob: &[u8]) -> Result<ParsedPublicKey, AuthError> {
+    for name in [crate::security_key::ED25519, crate::security_key::ECDSA] {
+        if algorithm == name.as_bytes() {
+            crate::security_key::parse_key(name, blob).map_err(|_| AuthError::InvalidKey)?;
+            return Ok(ParsedPublicKey::SecurityKey(name, blob.to_vec()));
+        }
+    }
     match algorithm {
         value if value == SSH_ED25519.as_bytes() => Ed25519PublicKey::from_blob(blob)
             .map(ParsedPublicKey::Ed25519)
@@ -3895,6 +3943,7 @@ fn validate_authorized_blob(blob: &[u8]) -> Result<(), AuthError> {
 
 fn verify_public_key(key: &ParsedPublicKey, signature_blob: &[u8], signed_bytes: &[u8]) -> bool {
     match key {
+        ParsedPublicKey::SecurityKey(..) => false, // Only explicit verifier capability can accept.
         ParsedPublicKey::Ed25519(key) => {
             verify_host_key_signature(key, signature_blob, signed_bytes).is_ok()
         }

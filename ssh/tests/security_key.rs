@@ -120,3 +120,107 @@ fn security_key_proposals_require_explicit_callback() {
         Err(neotales_ssh::client::HandshakeError::UnsupportedAlgorithm)
     ));
 }
+
+#[test]
+fn security_key_userauth_without_verifier_does_not_offer_publickey() {
+    let (key, _) = fixture(security_key::ED25519);
+    let policy = neotales_ssh::auth::ServerAuthPolicy::new(4)
+        .unwrap()
+        .with_authorized_key(&key)
+        .unwrap();
+    assert!(!policy.public_key_enabled());
+    assert!(
+        policy
+            .with_signature_algorithms(&[security_key::ED25519])
+            .is_err()
+    );
+}
+
+#[test]
+fn security_key_signing_and_enrollment_callbacks_fail_closed() {
+    use security_key::{EnrolledKey, ResidentKeyEnrollment, SecurityKeySigner, Signature};
+
+    for algorithm in [security_key::ED25519, security_key::ECDSA] {
+        let (key, expected) = fixture(algorithm);
+        let mut reader = neotales_ssh::Reader::new(&expected);
+        reader.read_string().unwrap();
+        let raw = reader.read_string().unwrap().to_vec();
+        let supplied = raw.clone();
+        let signer = SecurityKeySigner::new(key.clone(), b"handle".to_vec(), move |request| {
+            assert_eq!(request.algorithm, algorithm);
+            assert_eq!(request.application, b"ssh:test");
+            assert_eq!(request.handle, b"handle");
+            assert!(request.signed_data(0x80, 42).is_err());
+            let data = request.signed_data(1, 42).unwrap();
+            assert_eq!(data[..32], Sha256::digest(b"ssh:test")[..]);
+            assert_eq!(data[32..37], [1, 0, 0, 0, 42]);
+            assert_eq!(data[37..], Sha256::digest(b"message")[..]);
+            Some(Signature {
+                bytes: supplied.clone(),
+                flags: 1,
+                counter: 42,
+            })
+        })
+        .unwrap();
+        assert_eq!(signer.sign(b"message").unwrap(), expected);
+        for mode in 0..4 {
+            let raw = raw.clone();
+            let signer = SecurityKeySigner::new(key.clone(), vec![], move |_| match mode {
+                0 => None,
+                1 => panic!("fake callback failure"),
+                2 => Some(Signature {
+                    bytes: vec![],
+                    flags: 1,
+                    counter: 42,
+                }),
+                _ => Some(Signature {
+                    bytes: raw.clone(),
+                    flags: 0x80,
+                    counter: 42,
+                }),
+            })
+            .unwrap();
+            assert!(signer.sign(b"message").is_err());
+        }
+        assert!(SecurityKeySigner::new(vec![], vec![], |_| panic!("must not sign")).is_err());
+        assert!(SecurityKeySigner::new(key.clone(), vec![0; 1025], |_| None).is_err());
+        assert!(
+            ResidentKeyEnrollment::default()
+                .enroll(algorithm, b"ssh:test")
+                .is_err()
+        );
+        assert!(
+            ResidentKeyEnrollment::new(|_, _| None)
+                .enroll(algorithm, b"ssh:test")
+                .is_err()
+        );
+        assert!(
+            ResidentKeyEnrollment::new(|_, _| panic!("denied"))
+                .enroll(algorithm, b"ssh:test")
+                .is_err()
+        );
+        let enrollment = ResidentKeyEnrollment::new(move |_, _| {
+            Some(EnrolledKey {
+                public_key_blob: key.clone(),
+                handle: b"handle".to_vec(),
+            })
+        });
+        assert_eq!(
+            enrollment.enroll(algorithm, b"ssh:test").unwrap().handle,
+            b"handle"
+        );
+        assert!(enrollment.enroll(algorithm, b"ssh:wrong").is_err());
+        assert!(
+            enrollment
+                .enroll(
+                    if algorithm == security_key::ED25519 {
+                        security_key::ECDSA
+                    } else {
+                        security_key::ED25519
+                    },
+                    b"ssh:test"
+                )
+                .is_err()
+        );
+    }
+}
