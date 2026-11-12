@@ -159,17 +159,27 @@ interoperability evidence:
   pings with the same bytes; pre-authentication pings do not generate a reply.
   The legacy global request named `ping@openssh.com` is distinct.
   `GlobalRequest::keepalive_with_reply()` requests a response without a timer.
-- RFC 4254 §7.1 reverse TCP forwarding has a one-connection byte tunnel in
-  `tunnel`: `ReverseListener` binds only a caller-supplied numeric address and
-  port (empty addresses are errors), and `TcpTunnel` dials the caller-supplied
-  local destination and copies both ways through the existing channel window.
-  Drop/cancel closes the listener; no bind retry or implicit wildcard exists.
+- RFC 4254 TCP forwarding has caller-driven byte tunnels in `tunnel`.
+  `LocalListener` (`ssh -L`) and `ReverseListener` (`ssh -R`) bind only a
+  caller-supplied numeric address and port (empty addresses/hostnames are errors).
+  Each accepted connection opens its own `direct-tcpip` or `forwarded-tcpip`
+  channel and returns an independent `TcpTunnel`; the listener remains bound
+  for further connections. Local forwarding sends the explicit destination
+  bytes to the peer without local DNS/dialing. For reverse forwarding,
+  `TcpTunnel::connect` dials the caller-supplied local destination. Both copy
+  directions honor the existing channel window.
+  Drop/cancel closes the listener and shuts down all its accepted TCP copies;
+  continue polling/routing copies to finish SSH CLOSE, including late open
+  confirmations. No bind retry or implicit wildcard exists.
   The caller polls nonblocking TCP and routes events from its synchronous SSH
   dispatcher only when a complete payload is ready; there is no background SSH
   reader. EOF half-closes the copy, while cancellation closes it immediately.
   Port-zero allocation metadata alone is not this byte tunnel. Port zero in
   `ReverseListener` really binds an OS-selected port and replies with that port;
-  protocol-only types in `tcpip_forward` still open no sockets.
+  protocol-only types in `tcpip_forward` and `direct_tcpip` still open no sockets.
+  Loopback tests cover a local byte each way and two simultaneous reverse
+  connections with distinct bytes, including cancel/drop cleanup; these are
+  not new live-OpenSSH interoperability claims.
 - `ResolvedConfig::to_kexinit()` applies implemented-only exact algorithm lists.
   Unknown names, duplicates, and OpenSSH list modifiers error. Plain parsing
   does not read Include files; the explicit loader does. Default connect does

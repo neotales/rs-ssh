@@ -79,22 +79,38 @@ The lower-level `proxy::connect` also supports multiple hops and an explicit
 caller-supplied `ProxyCommand` byte-stream opener. It does not execute a command
 implicitly. `spawn_proxy_command` is a separate, explicit process-launch hook.
 
-## Reverse tunnel bind
+## Local and reverse TCP tunnels
 
 ```rust,no_run
-use neotales_ssh::tunnel::ReverseListener;
+use neotales_ssh::tunnel::{LocalListener, ReverseListener};
+// ssh -L: the destination is sent to the peer, not resolved/dialed locally.
+let local = LocalListener::bind("127.0.0.1", 0, b"destination.example", 80)?;
+assert_ne!(local.local_addr()?.port(), 0);
+// ssh -R: explicitly authorize this numeric reverse bind.
 let mut listener = ReverseListener::bind("127.0.0.1", 0)?;
 let bound = listener.local_addr()?;
 assert_ne!(bound.port(), 0);
 // Application handles requests and accepts through handle_request/poll_accept.
 listener.cancel();
+drop(local);
 # Ok::<(), std::io::Error>(())
 ```
 
-This binds only the numeric address supplied. It is not a background forwarding
-service: drive `ReverseListener::handle_request` / `poll_accept` and
-`TcpTunnel::poll_tcp` / `handle_event` yourself. See `tcpip_forward` for SSH
-forward requests and `direct_tcpip` for local-forward channel metadata.
+Both listeners bind only the supplied numeric address, without retries. Each
+`poll_accept` accepts at most one ready connection and returns its own `TcpTunnel`:
+`LocalListener` opens `direct-tcpip`; `ReverseListener` opens `forwarded-tcpip`.
+They remain bound for subsequent connections. Keep and service all returned
+copies independently. For reverse forwarding, use `TcpTunnel::connect` on the
+other SSH endpoint to dial the explicitly authorized local destination.
+
+This is not a background forwarding service: drive `poll_accept`, reverse
+`handle_request`, and each copy's `poll_tcp` / `handle_event` yourself. Dispatch
+SSH only when a complete payload is ready; TCP polls do not read SSH, and SSH
+writes can still block. Drop/cancel closes the listener and shuts down all its
+accepted TCP copies. Continue routing/polling copies to finish SSH CLOSE,
+including confirmations arriving after cancellation. EOF preserves half-close.
+See `tcpip_forward` for SSH forward requests and `direct_tcpip` for socket-free
+local-forward metadata and policy.
 
 ## One-file SCP upload and download
 

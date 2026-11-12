@@ -1,4 +1,4 @@
-//! One-connection RFC 4254 reverse TCP byte tunnel.
+//! Caller-driven RFC 4254 local and reverse TCP byte tunnels.
 //!
 //! The caller owns the synchronous SSH dispatcher. Repeatedly call
 //! [`TcpTunnel::poll_tcp`] and route dispatched events to
@@ -10,10 +10,13 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use crate::channel::{
     ChannelConnection, ChannelError, ChannelEvent, ChannelId, ChannelOpenRequest, ChannelTransport,
 };
+use crate::direct_tcpip::{DIRECT_TCPIP_CHANNEL_TYPE, DirectTcpipTuple};
 use crate::tcpip_forward::{
     CANCEL_TCPIP_FORWARD_REQUEST, FORWARDED_TCPIP_CHANNEL_TYPE, ForwardedTcpipTuple,
     TCPIP_FORWARD_REQUEST, TcpipForwardBinding, TcpipForwardError, TcpipForwardResponse,
@@ -32,7 +35,10 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-/// An explicitly bound, one-shot reverse listener. Drop or `cancel` closes it.
+/// An explicitly bound reverse listener, accepting one channel per TCP connection.
+/// Drop or `cancel` closes the listener and shuts down all its accepted TCP copies.
+/// The caller owns returned tunnels and must keep polling/routing them to finish
+/// SSH CLOSE (including an open confirmation that arrives after cancellation).
 /// Authorization belongs to the caller; no address or wildcard is inferred.
 #[derive(Debug)]
 pub struct ReverseListener {
@@ -40,6 +46,7 @@ pub struct ReverseListener {
     binding: TcpipForwardBinding,
     address: SocketAddr,
     requested_port: u16,
+    copies: Vec<Weak<TunnelSocket>>,
 }
 
 impl ReverseListener {
@@ -61,13 +68,14 @@ impl ReverseListener {
                 .map_err(protocol_error)?,
             address: local,
             requested_port: port,
+            copies: Vec::new(),
         })
     }
 
     /// Returns the actual bound address, including an OS-allocated port.
     ///
     /// # Errors
-    /// Returns `NotConnected` after cancellation or acceptance.
+    /// Returns `NotConnected` after cancellation.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener
             .as_ref()
@@ -81,15 +89,19 @@ impl ReverseListener {
         &self.binding
     }
 
-    /// Closes the listener immediately. Repeated cancellation is harmless.
+    /// Closes the listener and shuts down every accepted TCP copy immediately.
+    /// Repeated cancellation is harmless. Poll returned tunnels to send SSH CLOSE.
     pub fn cancel(&mut self) {
         self.listener = None;
+        for socket in self.copies.drain(..).filter_map(|copy| copy.upgrade()) {
+            socket.cancel();
+        }
     }
 
     /// Answers a dispatched forwarding request only when it exactly matches
     /// this caller-authorized bind. A port-zero reply carries the real port.
-    /// Exact `cancel-tcpip-forward` closes the listener, not an accepted copy;
-    /// cancel that separately with `TcpTunnel::cancel`. Returns false for other
+    /// Exact `cancel-tcpip-forward` closes the listener and all accepted copies.
+    /// Poll returned tunnels to send SSH CLOSE. Returns false for other
     /// events. No request can cause a new bind or widen the supplied address.
     ///
     /// # Errors
@@ -143,7 +155,8 @@ impl ReverseListener {
 
     /// Accepts at most one socket and opens one `forwarded-tcpip` channel.
     /// Returns `None` when no socket is ready or the listener is closed.
-    /// Acceptance closes this one-shot listener, including on an open error.
+    /// The listener stays bound for subsequent accepts, including on open errors.
+    /// The caller owns the returned copy; listener cancellation also shuts it down.
     ///
     /// # Errors
     /// Returns socket, metadata, channel-limit, or SSH write errors. No retry.
@@ -151,16 +164,9 @@ impl ReverseListener {
         &mut self,
         connection: &mut ChannelConnection<T>,
     ) -> io::Result<Option<TcpTunnel>> {
-        let Some(listener) = &self.listener else {
+        let Some((stream, origin)) = self.accept_socket()? else {
             return Ok(None);
         };
-        let (stream, origin) = match listener.accept() {
-            Ok(accepted) => accepted,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        self.cancel();
-        stream.set_nonblocking(true)?;
         let tuple = ForwardedTcpipTuple::new(
             self.binding.bind_address(),
             self.binding.port(),
@@ -178,7 +184,141 @@ impl ReverseListener {
                 PACKET,
             )
             .map_err(channel_error)?;
-        Ok(Some(TcpTunnel::new(stream, channel)))
+        Ok(Some(self.track(TcpTunnel::new(stream, channel))))
+    }
+
+    fn accept_socket(&self) -> io::Result<Option<(TcpStream, SocketAddr)>> {
+        let Some(listener) = &self.listener else {
+            return Ok(None);
+        };
+        match listener.accept() {
+            Ok((stream, origin)) => {
+                stream.set_nonblocking(true)?;
+                Ok(Some((stream, origin)))
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn track(&mut self, tunnel: TcpTunnel) -> TcpTunnel {
+        // Weak references neither retain finished sockets nor grow across
+        // sequential connections. Active count is bounded by SSH channel limits.
+        self.copies.retain(|copy| copy.strong_count() != 0);
+        self.copies.push(Arc::downgrade(
+            tunnel.stream.as_ref().expect("new TCP copy"),
+        ));
+        tunnel
+    }
+}
+
+impl Drop for ReverseListener {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// A local (`ssh -L`) listener opening one `direct-tcpip` channel per connection.
+/// Only the explicit numeric bind address is used locally. Destination bytes are
+/// sent unchanged to the SSH peer; this listener never resolves or dials them.
+/// No worker reads SSH: the caller polls accepts and each returned `TcpTunnel`.
+/// Drop/cancel closes the listener and shuts down all accepted TCP copies.
+#[derive(Debug)]
+pub struct LocalListener {
+    listener: ReverseListener,
+    destination_host: Vec<u8>,
+    destination_port: u16,
+}
+
+impl LocalListener {
+    /// Binds exactly the supplied numeric address (port zero is OS-allocated).
+    /// Destination host must be nonempty, at most 255 bytes; port must be nonzero.
+    /// Invalid metadata fails before binding. No address inference or retry.
+    ///
+    /// # Errors
+    /// Returns metadata, invalid-input, or socket errors.
+    pub fn bind(
+        address: &str,
+        port: u16,
+        destination_host: &[u8],
+        destination_port: u16,
+    ) -> io::Result<Self> {
+        DirectTcpipTuple::new(
+            destination_host,
+            destination_port,
+            address.as_bytes(),
+            0_u16,
+        )
+        .map_err(io::Error::other)?;
+        Ok(Self {
+            listener: ReverseListener::bind(address, port)?,
+            destination_host: destination_host.to_vec(),
+            destination_port,
+        })
+    }
+
+    /// Returns the actual bound address, or `NotConnected` after cancellation.
+    ///
+    /// # Errors
+    /// Returns `NotConnected` if closed.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// Closes the listener and shuts down all accepted TCP copies. Idempotent.
+    /// Poll returned tunnels to finish SSH CLOSE; this method never writes SSH.
+    pub fn cancel(&mut self) {
+        self.listener.cancel();
+    }
+
+    /// Accepts at most one ready socket and sends one direct-tcpip open with its
+    /// real originator address/port. Returns `None` if no socket is ready/closed.
+    /// The caller owns the copy and routes dispatched events to it; no data is
+    /// read from TCP until SSH confirms the open. A failed open drops that socket
+    /// but leaves the listener bound; the operation is not retried.
+    ///
+    /// # Errors
+    /// Returns socket, metadata, channel-limit, or SSH write errors.
+    pub fn poll_accept<T: ChannelTransport>(
+        &mut self,
+        connection: &mut ChannelConnection<T>,
+    ) -> io::Result<Option<TcpTunnel>> {
+        let Some((stream, origin)) = self.listener.accept_socket()? else {
+            return Ok(None);
+        };
+        let tuple = DirectTcpipTuple::new(
+            &self.destination_host,
+            self.destination_port,
+            origin.ip().to_string().as_bytes(),
+            origin.port(),
+        )
+        .map_err(io::Error::other)?;
+        let channel = connection.allocate_channel_id().map_err(channel_error)?;
+        connection
+            .open_channel_with_limits(
+                channel,
+                DIRECT_TCPIP_CHANNEL_TYPE.as_bytes(),
+                &tuple.encode().map_err(io::Error::other)?,
+                WINDOW,
+                PACKET,
+            )
+            .map_err(channel_error)?;
+        Ok(Some(self.listener.track(TcpTunnel::new(stream, channel))))
+    }
+}
+
+#[derive(Debug)]
+struct TunnelSocket {
+    stream: TcpStream,
+    cancelled: AtomicBool,
+}
+
+impl TunnelSocket {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        // Cancellation is best effort at the OS boundary (e.g. both FINs may
+        // already have completed). The flag prevents any later copy I/O.
+        let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -193,7 +333,7 @@ enum Receive {
 /// Drop closes TCP; use `cancel` to also send SSH CLOSE. No worker survives it.
 #[derive(Debug)]
 pub struct TcpTunnel {
-    stream: Option<TcpStream>,
+    stream: Option<Arc<TunnelSocket>>,
     channel: ChannelId,
     pending: VecDeque<u8>,
     receive: Receive,
@@ -202,7 +342,10 @@ pub struct TcpTunnel {
 impl TcpTunnel {
     fn new(stream: TcpStream, channel: ChannelId) -> Self {
         Self {
-            stream: Some(stream),
+            stream: Some(Arc::new(TunnelSocket {
+                stream,
+                cancelled: AtomicBool::new(false),
+            })),
             channel,
             pending: VecDeque::new(),
             receive: Receive::Open,
@@ -244,10 +387,13 @@ impl TcpTunnel {
         Ok(Self::new(stream, channel))
     }
 
-    /// Reports completion after CLOSE or explicit cancellation.
+    /// Reports TCP completion after CLOSE or explicit/listener cancellation.
+    /// Keep routing SSH events after cancellation to close a pending open.
     #[must_use]
-    pub const fn is_finished(&self) -> bool {
-        self.stream.is_none()
+    pub fn is_finished(&self) -> bool {
+        self.stream
+            .as_ref()
+            .is_none_or(|socket| socket.cancelled.load(Ordering::Relaxed))
     }
 
     /// Closes TCP immediately and sends CLOSE if the channel is established.
@@ -281,6 +427,19 @@ impl TcpTunnel {
         connection: &mut ChannelConnection<T>,
         event: &ChannelEvent,
     ) -> io::Result<bool> {
+        if self.is_finished() {
+            // A cancelled pending open still needs CLOSE after confirmation.
+            // Never enqueue late DATA for a socket shut down by its listener.
+            self.cancel(connection)?;
+            return Ok(matches!(event,
+                ChannelEvent::Opened(channel)
+                | ChannelEvent::Data { channel, .. }
+                | ChannelEvent::Eof { channel }
+                | ChannelEvent::Close { channel }
+                | ChannelEvent::OpenFailed { channel, .. }
+                | ChannelEvent::WindowAdjusted { channel, .. }
+                if *channel == self.channel));
+        }
         match event {
             ChannelEvent::Data { channel, data } if *channel == self.channel => {
                 if self.pending.len() + data.len() > WINDOW as usize {
@@ -321,9 +480,15 @@ impl TcpTunnel {
         &mut self,
         connection: &mut ChannelConnection<T>,
     ) -> io::Result<()> {
-        let Some(stream) = &mut self.stream else {
+        let Some(socket) = self
+            .stream
+            .as_ref()
+            .filter(|socket| !socket.cancelled.load(Ordering::Relaxed))
+        else {
+            self.cancel(connection)?;
             return Ok(());
         };
+        let mut stream = &socket.stream;
         if !self.pending.is_empty() {
             match stream.write(self.pending.as_slices().0) {
                 Ok(0) => {
@@ -436,6 +601,258 @@ mod tests {
         fn read_channel_payload(&mut self) -> Result<Vec<u8>, ()> {
             self.incoming.borrow_mut().pop_front().ok_or(())
         }
+    }
+
+    fn connections() -> (
+        ChannelConnection<MemoryTransport>,
+        ChannelConnection<MemoryTransport>,
+    ) {
+        let incoming = Rc::new(RefCell::new(VecDeque::new()));
+        let outgoing = Rc::new(RefCell::new(VecDeque::new()));
+        (
+            ChannelConnection::new(MemoryTransport {
+                incoming: incoming.clone(),
+                outgoing: outgoing.clone(),
+            }),
+            ChannelConnection::new(MemoryTransport {
+                incoming: outgoing,
+                outgoing: incoming,
+            }),
+        )
+    }
+
+    fn pump(
+        connection: &mut ChannelConnection<MemoryTransport>,
+        copies: &mut [TcpTunnel],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for copy in &mut *copies {
+            copy.poll_tcp(connection)?;
+        }
+        while !connection.transport().incoming.borrow().is_empty() {
+            let event = connection.dispatch_one()?;
+            let mut handled = 0;
+            for copy in &mut *copies {
+                handled += usize::from(copy.handle_event(connection, &event)?);
+            }
+            assert_eq!(handled, 1, "event must belong to exactly one copy");
+        }
+        Ok(())
+    }
+
+    fn read_ready(stream: &mut TcpStream, received: &mut Vec<u8>) -> io::Result<()> {
+        let mut buffer = [0; 16];
+        match stream.read(&mut buffer) {
+            Ok(count) => received.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    // Exact channel routing and dispatch ordering use in-memory SSH payloads;
+    // all listening, accepting, copying and cancellation use real loopback TCP.
+    #[test]
+    fn local_listener_splices_one_byte_each_way() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, mut server) = connections();
+        assert!(LocalListener::bind("localhost", 0, b"destination", 80).is_err());
+        assert!(LocalListener::bind("", 0, b"destination", 80).is_err());
+        assert!(LocalListener::bind("127.0.0.1", 0, b"", 80).is_err());
+        assert!(LocalListener::bind("127.0.0.1", 0, b"destination", 0).is_err());
+        let mut listener = LocalListener::bind("127.0.0.1", 0, b"destination", 80)?;
+        let address = listener.local_addr()?;
+        assert!(listener.poll_accept(&mut client)?.is_none());
+        assert!(LocalListener::bind("127.0.0.1", address.port(), b"destination", 80).is_err());
+        let mut origin = TcpStream::connect(address)?;
+        origin.set_nonblocking(true)?;
+        let mut copies = [listener.poll_accept(&mut client)?.ok_or("no accept")?];
+        origin.write_all(b"l")?;
+        copies[0].poll_tcp(&mut client)?;
+        let ChannelEvent::OpenRequest(request) = server.dispatch_one()? else {
+            return Err("no direct open".into());
+        };
+        assert_eq!(request.channel_type(), b"direct-tcpip");
+        let tuple = DirectTcpipTuple::decode(request.type_specific_data())?;
+        assert_eq!(tuple.destination_host(), b"destination");
+        assert_eq!(tuple.destination_port(), 80);
+        assert_eq!(tuple.originator_address(), b"127.0.0.1");
+        assert_eq!(
+            tuple.originator_port(),
+            u32::from(origin.local_addr()?.port())
+        );
+        // No bytes are sent before confirmation, even if TCP data is ready.
+        assert!(server.transport().incoming.borrow().is_empty());
+        let remote = server.allocate_channel_id()?;
+        server.confirm_open_with_limits(request.sender_channel(), remote, WINDOW, PACKET)?;
+        server.write_data(remote, b"r")?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut received_origin = Vec::new();
+        let mut received_remote = Vec::new();
+        while received_origin.is_empty() || received_remote.is_empty() {
+            assert!(Instant::now() < deadline, "local tunnel stalled");
+            pump(&mut client, &mut copies)?;
+            while !server.transport().incoming.borrow().is_empty() {
+                match server.dispatch_one()? {
+                    ChannelEvent::Data { channel, data } => {
+                        assert_eq!(channel, remote);
+                        received_remote.extend(data);
+                    }
+                    ChannelEvent::WindowAdjusted { .. } => {}
+                    event => panic!("unexpected event {event:?}"),
+                }
+            }
+            read_ready(&mut origin, &mut received_origin)?;
+            std::thread::yield_now();
+        }
+        assert_eq!(received_origin, b"r");
+        assert_eq!(received_remote, b"l");
+        drop(listener);
+        assert!(TcpStream::connect(address).is_err());
+        assert!(copies[0].is_finished());
+        pump(&mut client, &mut copies)?;
+        assert!(
+            matches!(server.dispatch_one()?, ChannelEvent::Close { channel } if channel == remote)
+        );
+        origin.set_nonblocking(false)?;
+        origin.set_read_timeout(Some(Duration::from_secs(3)))?;
+        assert_eq!(origin.read(&mut [0])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reverse_two_connections_copy_independently_and_cancel_or_drop_closes_both()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for cancel in [false, true] {
+            let (mut server, mut client) = connections();
+            let mut listener = ReverseListener::bind("127.0.0.1", 0)?;
+            let address = listener.local_addr()?;
+            let binding = listener.binding().clone();
+            let destination = TcpListener::bind(("127.0.0.1", 0))?;
+            let mut origins = Vec::new();
+            let mut locals = Vec::new();
+            let mut server_copies = Vec::new();
+            let mut client_copies = Vec::new();
+            for _ in 0..2 {
+                let origin = TcpStream::connect(address)?;
+                origin.set_nonblocking(true)?;
+                origins.push(origin);
+                server_copies.push(listener.poll_accept(&mut server)?.ok_or("no accept")?);
+                let ChannelEvent::OpenRequest(request) = client.dispatch_one()? else {
+                    return Err("no forwarded open".into());
+                };
+                assert_eq!(request.channel_type(), b"forwarded-tcpip");
+                client_copies.push(TcpTunnel::connect(
+                    &mut client,
+                    &request,
+                    &binding,
+                    destination.local_addr()?,
+                )?);
+                let (local, _) = destination.accept()?;
+                local.set_nonblocking(true)?;
+                locals.push(local);
+            }
+            assert_ne!(server_copies[0].channel, server_copies[1].channel);
+            assert_ne!(client_copies[0].channel, client_copies[1].channel);
+            assert_eq!(listener.local_addr()?, address);
+            assert!(listener.poll_accept(&mut server)?.is_none());
+            // Opposite order in the two directions catches cross-copy routing.
+            origins[0].write_all(b"a")?;
+            origins[1].write_all(b"b")?;
+            locals[1].write_all(b"y")?;
+            locals[0].write_all(b"x")?;
+            let mut at_origin = [Vec::new(), Vec::new()];
+            let mut at_local = [Vec::new(), Vec::new()];
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while at_origin.iter().chain(&at_local).any(Vec::is_empty) {
+                assert!(Instant::now() < deadline, "two reverse copies stalled");
+                pump(&mut server, &mut server_copies)?;
+                pump(&mut client, &mut client_copies)?;
+                for i in 0..2 {
+                    read_ready(&mut origins[i], &mut at_origin[i])?;
+                    read_ready(&mut locals[i], &mut at_local[i])?;
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(at_origin, [b"x".to_vec(), b"y".to_vec()]);
+            assert_eq!(at_local, [b"a".to_vec(), b"b".to_vec()]);
+            if cancel {
+                let event = ChannelEvent::GlobalRequest {
+                    request_name: CANCEL_TCPIP_FORWARD_REQUEST.as_bytes().to_vec(),
+                    want_reply: false,
+                    data: binding.encode()?,
+                };
+                assert!(listener.handle_request(&mut server, &event)?);
+                listener.cancel(); // repeated cancellation is harmless
+            }
+            drop(listener);
+            assert!(TcpStream::connect(address).is_err());
+            assert!(server_copies.iter().all(TcpTunnel::is_finished));
+            // Polling, not cancellation/drop, writes SSH CLOSE for both copies.
+            pump(&mut server, &mut server_copies)?;
+            pump(&mut client, &mut client_copies)?;
+            pump(&mut server, &mut server_copies)?;
+            assert!(client_copies.iter().all(TcpTunnel::is_finished));
+            assert_eq!(server.channel_count(), 0);
+            assert_eq!(client.channel_count(), 0);
+            for mut stream in origins.into_iter().chain(locals) {
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                assert_eq!(stream.read(&mut [0])?, 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_cancel_before_confirmation_closes_late_open() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut client, mut server) = connections();
+        let mut listener = LocalListener::bind("127.0.0.1", 0, b"destination", 80)?;
+        let address = listener.local_addr()?;
+        let mut origin = TcpStream::connect(address)?;
+        origin.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let mut copies = [listener.poll_accept(&mut client)?.ok_or("no accept")?];
+        listener.cancel();
+        listener.cancel();
+        assert!(listener.local_addr().is_err());
+        assert!(listener.poll_accept(&mut client)?.is_none());
+        assert!(TcpStream::connect(address).is_err());
+        assert!(copies[0].is_finished());
+        assert_eq!(origin.read(&mut [0])?, 0);
+        pump(&mut client, &mut copies)?;
+        let ChannelEvent::OpenRequest(request) = server.dispatch_one()? else {
+            return Err("no direct open".into());
+        };
+        let remote = server.allocate_channel_id()?;
+        server.confirm_open(request.sender_channel(), remote)?;
+        pump(&mut client, &mut copies)?;
+        assert!(
+            matches!(server.dispatch_one()?, ChannelEvent::Close { channel } if channel == remote)
+        );
+        server.send_close(remote)?;
+        pump(&mut client, &mut copies)?;
+        assert_eq!(client.channel_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reverse_listener_accepts_two_connections() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let mut connection = ChannelConnection::new(MemoryTransport {
+            incoming: queue.clone(),
+            outgoing: queue,
+        });
+        let mut listener = ReverseListener::bind("127.0.0.1", 0)?;
+        let address = listener.local_addr()?;
+        let _first = TcpStream::connect(address)?;
+        let _first_copy = listener
+            .poll_accept(&mut connection)?
+            .ok_or("no first accept")?;
+        assert_eq!(listener.local_addr()?, address);
+        let _second = TcpStream::connect(address)?;
+        let _second_copy = listener
+            .poll_accept(&mut connection)?
+            .ok_or("no second accept")?;
+        Ok(())
     }
 
     #[test]
