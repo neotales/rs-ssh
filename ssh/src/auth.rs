@@ -649,6 +649,15 @@ fn map_agent_error(error: &AgentError) -> AuthError {
 
 /// A client-side public-key signer usable by the authentication loop.
 pub enum PublicKeySigner {
+    /// Explicit pure ML-DSA identity; never selected implicitly.
+    Mldsa(neotales_ssh::mldsa_hostkey::MldsaSigner),
+    /// ML-DSA subject and existing Go-vendor user certificate.
+    MldsaCertificate {
+        /// Subject signer, with redacted Debug output.
+        signer: neotales_ssh::mldsa_hostkey::MldsaSigner,
+        /// Existing certificate, not issued by this API.
+        blob: Vec<u8>,
+    },
     /// Callback-only security-key signer; absence cannot construct this variant.
     SecurityKey(crate::security_key::SecurityKeySigner),
     /// Ed25519 certificate and subject signer, associated by the
@@ -683,6 +692,38 @@ pub enum PublicKeySigner {
 }
 
 impl PublicKeySigner {
+    /// Offers an explicit ML-DSA identity. The server must opt in separately.
+    #[must_use]
+    pub const fn mldsa(signer: neotales_ssh::mldsa_hostkey::MldsaSigner) -> Self {
+        Self::Mldsa(signer)
+    }
+
+    /// Associates an existing Go-vendor user certificate with its ML-DSA key.
+    /// CA, principal and time trust are checked by the server, not here.
+    ///
+    /// # Errors
+    /// Rejects a wrong role, parameter set, or subject key.
+    pub fn mldsa_certificate(
+        signer: neotales_ssh::mldsa_hostkey::MldsaSigner,
+        blob: &[u8],
+    ) -> Result<Self, AuthError> {
+        let certificate =
+            neotales_ssh::cert::parse_certificate(blob).map_err(|_| AuthError::InvalidKey)?;
+        if certificate.algorithm() != mldsa_certificate_name(signer.public_key().algorithm())
+            || certificate.certificate_type() != neotales_ssh::cert::CertificateType::User
+            || certificate.subject_public_key_blob()
+                != signer
+                    .public_key()
+                    .to_blob()
+                    .map_err(|_| AuthError::InvalidKey)?
+        {
+            return Err(AuthError::InvalidKey);
+        }
+        Ok(Self::MldsaCertificate {
+            signer,
+            blob: blob.to_vec(),
+        })
+    }
     /// Associates an existing user certificate with an Ed25519 subject key.
     /// The server, not this constructor, decides CA/principal/time trust.
     ///
@@ -754,6 +795,10 @@ impl PublicKeySigner {
     #[must_use]
     pub fn algorithm(&self) -> &'static str {
         match self {
+            Self::Mldsa(signer) => signer.public_key().algorithm().name(),
+            Self::MldsaCertificate { signer, .. } => {
+                mldsa_certificate_name(signer.public_key().algorithm())
+            }
             Self::SecurityKey(signer) => signer.algorithm(),
             Self::Ed25519Certificate { .. } => neotales_ssh::cert::SSH_ED25519_CERT_V01,
             Self::Ed25519(_) => SSH_ED25519,
@@ -773,8 +818,14 @@ impl PublicKeySigner {
     /// Returns an [`AuthError`] if the fixed key encoding fails.
     pub fn public_key_blob(&self) -> Result<Vec<u8>, AuthError> {
         match self {
+            Self::Mldsa(signer) => signer
+                .public_key()
+                .to_blob()
+                .map_err(|_| AuthError::InvalidKey),
+            Self::MldsaCertificate { blob, .. } | Self::Ed25519Certificate { blob, .. } => {
+                Ok(blob.clone())
+            }
             Self::SecurityKey(signer) => Ok(signer.public_key_blob().to_vec()),
-            Self::Ed25519Certificate { blob, .. } => Ok(blob.clone()),
             Self::Ed25519(signer) => signer.public_key_blob().map_err(map_hostkey_error),
             Self::Rsa(signer) | Self::RsaSha512(signer) => Ok(signer.public_key_blob().to_vec()),
             Self::Ecdsa(signer) => signer.public_key_blob().map_err(map_ecdsa_error),
@@ -792,6 +843,9 @@ impl PublicKeySigner {
 
     fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>, AuthError> {
         match self {
+            Self::Mldsa(signer) | Self::MldsaCertificate { signer, .. } => {
+                signer.sign(bytes).map_err(|_| AuthError::InvalidProof)
+            }
             Self::SecurityKey(signer) => signer.sign(bytes).map_err(|_| AuthError::InvalidProof),
             Self::Ed25519Certificate { signer, .. } => {
                 signer.sign_exchange_hash(bytes).map_err(map_hostkey_error)
@@ -841,6 +895,15 @@ impl fmt::Debug for PublicKeySigner {
             .debug_struct("PublicKeySigner")
             .field("algorithm", &self.algorithm())
             .finish_non_exhaustive()
+    }
+}
+
+fn mldsa_certificate_name(algorithm: neotales_ssh::mldsa_hostkey::Algorithm) -> &'static str {
+    use neotales_ssh::{cert, mldsa_hostkey::Algorithm};
+    match algorithm {
+        Algorithm::MlDsa44 => cert::SSH_MLDSA44_CERT_V01,
+        Algorithm::MlDsa65 => cert::SSH_MLDSA65_CERT_V01,
+        Algorithm::MlDsa87 => cert::SSH_MLDSA87_CERT_V01,
     }
 }
 
@@ -1720,7 +1783,9 @@ impl ServerAuthPolicy {
         self
     }
 
-    /// Restricts accepted public-key signatures and the RFC 8308 advertised list.
+    /// Sets accepted public-key signatures and the RFC 8308 advertised list.
+    /// ML-DSA plain and Go-vendor certificate names require explicit inclusion;
+    /// defaults and `with_user_certificate_trust` do not enable them.
     ///
     /// # Errors
     /// Unknown names and duplicate entries are rejected. An empty list denies
@@ -1729,6 +1794,18 @@ impl ServerAuthPolicy {
         let mut selected = Vec::new();
         for algorithm in algorithms {
             let name = match *algorithm {
+                "ssh-mldsa-44" => "ssh-mldsa-44",
+                "ssh-mldsa-65" => "ssh-mldsa-65",
+                "ssh-mldsa-87" => "ssh-mldsa-87",
+                neotales_ssh::cert::SSH_MLDSA44_CERT_V01 => {
+                    neotales_ssh::cert::SSH_MLDSA44_CERT_V01
+                }
+                neotales_ssh::cert::SSH_MLDSA65_CERT_V01 => {
+                    neotales_ssh::cert::SSH_MLDSA65_CERT_V01
+                }
+                neotales_ssh::cert::SSH_MLDSA87_CERT_V01 => {
+                    neotales_ssh::cert::SSH_MLDSA87_CERT_V01
+                }
                 SSH_ED25519 => SSH_ED25519,
                 neotales_ssh::cert::SSH_ED25519_CERT_V01 => {
                     neotales_ssh::cert::SSH_ED25519_CERT_V01
@@ -2596,9 +2673,7 @@ where
         }
         let key_blob = reader.read_string_bytes()?;
         let prefix_end = method_position + reader.position();
-        let (parsed, authorized) = if algorithm
-            == neotales_ssh::cert::SSH_ED25519_CERT_V01.as_bytes()
-        {
+        let (parsed, authorized) = if is_user_certificate_algorithm(&algorithm) {
             let username = std::str::from_utf8(username).map_err(|_| AuthError::InvalidRequest)?;
             let verified = self
                 .policy
@@ -2609,14 +2684,13 @@ where
                 self.write_failure()?;
                 return Ok(ServerAuthStep::Failure);
             };
-            if certificate.algorithm() != neotales_ssh::cert::SSH_ED25519_CERT_V01 {
+            if certificate.algorithm().as_bytes() != algorithm {
                 return Err(AuthError::InvalidKey);
             }
+            let subject = certificate.subject_public_key_blob();
+            let mut subject_reader = Reader::new(subject);
             (
-                parse_public_key(
-                    SSH_ED25519.as_bytes(),
-                    certificate.subject_public_key_blob(),
-                )?,
+                parse_public_key(subject_reader.read_string()?, subject)?,
                 true,
             )
         } else {
@@ -3035,7 +3109,7 @@ pub enum AuthMethodKind {
     Gssapi,
     /// Explicitly policy-authorized authentication without credentials.
     None,
-    /// Ed25519 or RSA public-key authentication.
+    /// Explicitly offered public-key authentication, including opt-in ML-DSA.
     PublicKey,
     /// Password authentication.
     Password,
@@ -3883,6 +3957,7 @@ fn parse_userauth_header(payload: &[u8]) -> Result<RequestHeader<'_>, AuthError>
 }
 
 enum ParsedPublicKey {
+    Mldsa(neotales_ssh::mldsa_hostkey::MldsaPublicKey),
     SecurityKey(&'static str, Vec<u8>),
     Ed25519(Ed25519PublicKey),
     Rsa(RsaPublicKey, &'static str),
@@ -3891,7 +3966,30 @@ enum ParsedPublicKey {
     Ecdsa521(neotales_ssh::ecdsa_hostkey::EcdsaP521PublicKey),
 }
 
+fn is_user_certificate_algorithm(algorithm: &[u8]) -> bool {
+    use neotales_ssh::cert;
+    [
+        cert::SSH_ED25519_CERT_V01,
+        cert::SSH_MLDSA44_CERT_V01,
+        cert::SSH_MLDSA65_CERT_V01,
+        cert::SSH_MLDSA87_CERT_V01,
+    ]
+    .iter()
+    .any(|name| name.as_bytes() == algorithm)
+}
+
 fn parse_public_key(algorithm: &[u8], blob: &[u8]) -> Result<ParsedPublicKey, AuthError> {
+    if matches!(
+        algorithm,
+        b"ssh-mldsa-44" | b"ssh-mldsa-65" | b"ssh-mldsa-87"
+    ) {
+        let key = neotales_ssh::mldsa_hostkey::MldsaPublicKey::from_blob(blob)
+            .map_err(|_| AuthError::InvalidKey)?;
+        if key.algorithm().name().as_bytes() != algorithm {
+            return Err(AuthError::InvalidKey);
+        }
+        return Ok(ParsedPublicKey::Mldsa(key));
+    }
     for name in [crate::security_key::ED25519, crate::security_key::ECDSA] {
         if algorithm == name.as_bytes() {
             crate::security_key::parse_key(name, blob).map_err(|_| AuthError::InvalidKey)?;
@@ -3943,6 +4041,7 @@ fn validate_authorized_blob(blob: &[u8]) -> Result<(), AuthError> {
 
 fn verify_public_key(key: &ParsedPublicKey, signature_blob: &[u8], signed_bytes: &[u8]) -> bool {
     match key {
+        ParsedPublicKey::Mldsa(key) => key.verify(signature_blob, signed_bytes).is_ok(),
         ParsedPublicKey::SecurityKey(..) => false, // Only explicit verifier capability can accept.
         ParsedPublicKey::Ed25519(key) => {
             verify_host_key_signature(key, signature_blob, signed_bytes).is_ok()

@@ -88,7 +88,7 @@ also use SHA-512. The exact pure-Rust `sntrup-kem =0.1.0-rc.0` dependency uses
 `force-scalar`; no C, assembly or cc build script was added. Length/low-order/
 tamper tests also run offline. This is not a live OpenSSH interoperability claim.
 
-### Opt-in ML-DSA host keys (draft-08)
+### Opt-in ML-DSA keys and user authentication (draft-08)
 
 The caller confirmed the identifiers and sizes from
 [draft-sfluhrer-ssh-mldsa-08 §§3, 4, 7](https://www.ietf.org/archive/id/draft-sfluhrer-ssh-mldsa-08.txt):
@@ -107,6 +107,32 @@ exact algorithm and signature length before decoding or crypto verification.
 Seeds supplied to `from_seed` are wiped, and secret key state zeroizes on drop.
 No C, assembly, cc build script, key discovery, or private-key file import is added.
 
+`PublicKeySigner::mldsa` also signs RFC 4252 user-authentication transcripts.
+The server must explicitly include the draft key name using
+`ServerAuthPolicy::with_signature_algorithms` and authorize the public key.
+Defaults do not advertise or accept ML-DSA user authentication.
+
+`PublicKeySigner::mldsa_certificate` carries an existing user certificate.
+Certificate identifiers are the existing Go x/crypto v0.59.0 vendor names
+`ssh-mldsa-44-cert-v01@golang.org`, `ssh-mldsa-65-cert-v01@golang.org`, and
+`ssh-mldsa-87-cert-v01@golang.org` from
+[Go certs.go](https://cs.opensource.google/go/x/crypto/+/refs/tags/v0.59.0:ssh/certs.go),
+not names specified by draft-08. Framing follows the OpenSSH certificate layout
+with one string containing the raw ML-DSA subject key. Existing Ed25519 framing
+is unchanged. The parser/verifier supports all three subject and CA parameter
+sets, including Ed25519 CAs for ML-DSA subjects. CA signatures cover the raw
+certificate prefix with pure ML-DSA and empty context when the CA is ML-DSA.
+User certificates require explicit CA/principal policy via
+`UserCertificateTrust` and explicit inclusion of the vendor certificate name
+in `with_signature_algorithms`. Time is supplied by the caller as Unix seconds;
+the inclusive start and exclusive expiry, principal, CA signature, and critical
+options are checked. No system clock is read by certificate verification.
+
+Offline `mldsa_userauth` tests exercise signing/verification for 44/65/87,
+protected client/server 65 user authentication, default denial with and without
+server-sig-algs, and certificate authentication with expired/not-yet-valid and
+wrong-principal rejection. This is not a live OpenSSH ML-DSA interoperability claim.
+
 Defaults remain unchanged. `ClientConfig::with_mldsa_host_keys()` explicitly
 appends the three names; an explicit KEXINIT can select them too.
 `ServerConfig::with_mldsa_host_key` adds one explicit signer and its matching
@@ -116,7 +142,7 @@ sign/verify for all three parameter sets, wrong context/key/message/name/size,
 and both handshakes selecting `ssh-mldsa-65` in strict and non-strict mode,
 protected traffic, trust denial, and client/server-initiated rekeys. This is
 in-process evidence, not a live OpenSSH or Go interoperability claim. ML-DSA
-user authentication and certificates are not implemented by this host-key API.
+user authentication and certificates use the separate opt-in APIs above.
 
 Both handshakes support `ssh-ed25519`, `rsa-sha2-256`, `rsa-sha2-512`, and
 ECDSA P-256/P-384/P-521 host keys. SHA-1 `ssh-rsa` is not offered by default.
