@@ -146,6 +146,12 @@ For explicit modes, timestamps or reusable endpoints use `ScpClient`,
 `scp::upload_with_mode`, and `scp::upload_with_time`. Directory transfers use
 `scp::upload_directory` / `download_directory` with an in-memory tree.
 
+Disk access is explicit: on Linux, `scp::RootedScpServer::new(stream, root)`
+pins a caller-supplied, canonicalized directory. `receive_file(path)` accepts
+one upload into that exact path (never the peer's basename); `send_file(path)`
+sends one disk file. Neither spawns a process. Directory copy stays in-memory.
+Modes/timestamps are validated but not applied; failures can leave partial files.
+
 ## SFTP session
 
 `recipes::sftp_session` opens a channel and sends `request_sftp`. It returns a
@@ -173,7 +179,24 @@ fn subsystem<T: ChannelTransport>(sessions: &mut ClientSessions<T>)
 
 The low-level names are `ClientSessions::open_session`, `request_subsystem`,
 `request_sftp`, `dispatch_one`, `send_data`, and `increase_local_window`.
-The in-process SFTP server is memory-backed, not a host-filesystem server.
+`SftpServer` stays memory-backed and never accesses disk. The explicit Linux
+adapter `sftp::RootedSftpServer::new(stream, root)` supports SFTP v3 OPEN, READ,
+WRITE and CLOSE through `SftpClient`. Missing files return a failure status.
+Each read/write is bounded by the existing 16 MiB SFTP frame cap (including
+framing overhead); SCP disk I/O is streamed in smaller bounded chunks.
+
+Both rooted adapters require Linux `openat2` (Linux 5.6+, permitted by the host's
+security policy), with no less-safe fallback. Their APIs compile on other targets,
+but constructors return `RootedTransferError::UnsupportedPlatform` without
+accessing the filesystem. Paths are relative to the supplied
+root; absolute paths must be beneath its canonical path. `..`, symlinks escaping
+the root, and special files are rejected. Relative in-root symlinks work;
+absolute symlinks are conservatively rejected. Descriptor-relative resolution
+prevents symlink-swap escapes. No implicit host root or home directory is used.
+The caller controls the root's contents and lifetime; hard links and mounts
+already placed inside the root are not a separate sandbox boundary. Open handles
+pin files even if their names are later replaced. Do not move open files out of
+the root if continued access is unwanted. Writes are not transactional.
 
 ## Server
 

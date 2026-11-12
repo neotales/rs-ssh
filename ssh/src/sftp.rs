@@ -20,6 +20,10 @@ use std::io::{self, Read, Write};
 
 use neotales_ssh::{Error as WireError, Reader};
 
+#[path = "sftp_rooted.rs"]
+mod rooted;
+pub use rooted::RootedSftpServer;
+
 /// The maximum SFTP packet body, excluding its four-byte length prefix.
 pub const MAX_SFTP_PACKET_SIZE: usize = 16_777_216;
 
@@ -3193,6 +3197,12 @@ fn unexpected_response_type(packet: &[u8]) -> SftpError {
 fn response_body(packet: &[u8], expected_type: u8, expected_id: u32) -> Result<&[u8], SftpError> {
     let packet_type = packet.first().copied().ok_or(SftpError::InvalidFrame)?;
     if packet_type != expected_type {
+        if packet_type == SSH_FXP_STATUS {
+            validate_response_id(packet, expected_id)?;
+            // Operations with typed success replies can also fail with STATUS.
+            // Preserve that status instead of disguising it as a packet-type error.
+            parse_status_response(packet, false)?;
+        }
         return Err(SftpError::UnexpectedResponse(packet_type));
     }
     validate_response_id(packet, expected_id)?;

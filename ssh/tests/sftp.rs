@@ -5,9 +5,7 @@
 // still reported.
 #![allow(missing_docs, unreachable_pub)]
 
-#[allow(dead_code)]
-#[path = "../src/sftp.rs"]
-mod sftp;
+use neotales_ssh::sftp;
 
 use std::error::Error;
 use std::io::{self, Cursor, Read, Write};

@@ -26,6 +26,9 @@
 
 extern crate self as neotales_ssh;
 
+mod transfer_root;
+pub use transfer_root::RootedTransferError;
+
 #[cfg(not(doctest))]
 #[allow(dead_code, unused_imports)]
 pub(crate) mod msg;

@@ -33,9 +33,7 @@ fn remote_shell_policy_preserves_windows_paths_and_quotes_without_posix_escaping
     Ok(())
 }
 
-#[allow(dead_code)]
-#[path = "../src/scp.rs"]
-mod scp;
+use neotales_ssh::scp;
 
 use std::error::Error;
 use std::io::{self, Cursor, Read, Write};

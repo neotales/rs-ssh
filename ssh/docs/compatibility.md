@@ -162,9 +162,30 @@ host PTY. Malformed controls do not reach that callback.
 `scp -f` exec requests are covered by in-process session tests. Those tests do
 not start `sshd`. SCP supports bounded in-memory directory records alongside
 single-file transfers, with at most 8 directory levels and 64 file/directory
-records including the root; it does not access host directories. SFTP version 3
-supports an in-process server over a caller-supplied byte stream and memory map.
-It is not a host filesystem server.
+records including the root; directory transfers do not access host directories.
+SFTP version 3 supports an in-process server over a caller-supplied byte stream
+and memory map. This remains the default and never touches disk.
+
+Filesystem access is an explicit Linux-only adapter: `sftp::RootedSftpServer`
+implements v3 OPEN/READ/WRITE/CLOSE; `scp::RootedScpServer` receives or sends one
+file without spawning a process. Each requires a caller-supplied root directory,
+canonicalized and pinned at construction. There is no implicit host root or home.
+Relative paths resolve beneath that root; absolute paths must start beneath its
+canonical path. `..`, escaping symlinks, and special files are rejected. Relative
+in-root symlinks are allowed; absolute symlinks are conservatively rejected.
+Linux `openat2` (5.6+, allowed by host policy) enforces confinement during path
+resolution, including symlink swaps; there is no unsafe fallback on older hosts.
+On non-Linux targets the rooted APIs compile, but constructors return the typed
+`RootedTransferError::UnsupportedPlatform` without accessing the filesystem.
+Existing hard links/mounts inside the root and externally moving open files are
+the caller's responsibility, not an additional sandbox guarantee.
+
+SFTP missing-file OPEN replies carry `SSH_FX_NO_SUCH_FILE`; reads and writes are
+bounded by the existing 16 MiB packet cap including overhead. SCP keeps its
+64 MiB file limit and uses bounded streaming disk I/O. Upload destinations are
+caller-selected, not peer-selected; mode/time metadata is validated, not applied.
+I/O failure can leave partial files. Rooted adapter tests use byte pipes, not
+live-peer interoperability tests; directory copy remains in-memory.
 
 ### Additional in-process protocol coverage
 

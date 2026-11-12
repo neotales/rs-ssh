@@ -16,6 +16,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read, Write};
 
+#[path = "scp_rooted.rs"]
+mod rooted;
+pub use rooted::RootedScpServer;
+
 /// The maximum number of bytes in one SCP header line, including its newline.
 pub const MAX_SCP_HEADER_LINE_SIZE: usize = 8 * 1024;
 
