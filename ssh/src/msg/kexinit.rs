@@ -346,6 +346,9 @@ pub(crate) const SUPPORTED_KEX_ALGORITHMS: &[&str] = &[
 /// Ed25519, RSA SHA-2, and ECDSA NIST curves are wired into both handshakes. A server
 /// advertises only names for which it has a configured signing key.
 pub(crate) const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[
+    "ssh-mldsa-44",
+    "ssh-mldsa-65",
+    "ssh-mldsa-87",
     "ssh-ed25519-cert-v01@openssh.com",
     HOST_KEY_SSH_ED25519,
     HOST_KEY_RSA_SHA2_512,
@@ -387,6 +390,9 @@ pub(crate) const KNOWN_KEX_ALGORITHMS: &[&str] = &[
 /// This list also includes recognized host-key names without a full transport
 /// implementation, if any.
 pub(crate) const KNOWN_HOST_KEY_ALGORITHMS: &[&str] = &[
+    "ssh-mldsa-44",
+    "ssh-mldsa-65",
+    "ssh-mldsa-87",
     "ssh-ed25519-cert-v01@openssh.com",
     HOST_KEY_SSH_ED25519,
     HOST_KEY_RSA_SHA2_512,
@@ -451,6 +457,9 @@ pub(crate) const SUPPORTED_ALGORITHMS: &[&str] = &[
     KEX_ECDH_SHA2_NISTP256,
     KEX_DIFFIE_HELLMAN_GROUP16_SHA512,
     // SUPPORTED_HOST_KEY_ALGORITHMS
+    "ssh-mldsa-44",
+    "ssh-mldsa-65",
+    "ssh-mldsa-87",
     "ssh-ed25519-cert-v01@openssh.com",
     HOST_KEY_SSH_ED25519,
     HOST_KEY_RSA_SHA2_512,

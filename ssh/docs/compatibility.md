@@ -61,8 +61,36 @@ X25519 secrets, encoded as an SSH string (not mpint); transcript and key expansi
 also use SHA-512. The exact pure-Rust `sntrup-kem =0.1.0-rc.0` dependency uses
 `force-scalar`; no C, assembly or cc build script was added. Length/low-order/
 tamper tests also run offline. This is not a live OpenSSH interoperability claim.
-ML-DSA remains unimplemented/unadvertised: exact SSH identifiers were not
-confirmed in the crate docs or existing repo comments; see `reviews/unaccounted.md`.
+
+### Opt-in ML-DSA host keys (draft-08)
+
+The caller confirmed the identifiers and sizes from
+[draft-sfluhrer-ssh-mldsa-08 §§3, 4, 7](https://www.ietf.org/archive/id/draft-sfluhrer-ssh-mldsa-08.txt):
+
+| Algorithm | Raw public key | Raw signature |
+| --- | ---: | ---: |
+| `ssh-mldsa-44` | 1312 bytes | 2420 bytes |
+| `ssh-mldsa-65` | 1952 bytes | 3309 bytes |
+| `ssh-mldsa-87` | 2592 bytes | 4627 bytes |
+
+Both public keys and signatures use `string algorithm, string raw bytes`.
+`mldsa_hostkey::MldsaSigner` uses the exact pure-Rust `ml-dsa =0.1.2` crate,
+deterministic pure ML-DSA with an empty FIPS 204 context, not HashML-DSA.
+The verifier accepts both deterministic and hedged signatures; it checks the
+exact algorithm and signature length before decoding or crypto verification.
+Seeds supplied to `from_seed` are wiped, and secret key state zeroizes on drop.
+No C, assembly, cc build script, key discovery, or private-key file import is added.
+
+Defaults remain unchanged. `ClientConfig::with_mldsa_host_keys()` explicitly
+appends the three names; an explicit KEXINIT can select them too.
+`ServerConfig::with_mldsa_host_key` adds one explicit signer and its matching
+name alongside existing host keys. Use `connect_with_host_keys` for application
+trust; the Ed25519-only `connect` API is unchanged. Tests exercise real crate
+sign/verify for all three parameter sets, wrong context/key/message/name/size,
+and both handshakes selecting `ssh-mldsa-65` in strict and non-strict mode,
+protected traffic, trust denial, and client/server-initiated rekeys. This is
+in-process evidence, not a live OpenSSH or Go interoperability claim. ML-DSA
+user authentication and certificates are not implemented by this host-key API.
 
 Both handshakes support `ssh-ed25519`, `rsa-sha2-256`, `rsa-sha2-512`, and
 ECDSA P-256/P-384/P-521 host keys. SHA-1 `ssh-rsa` is not offered by default.

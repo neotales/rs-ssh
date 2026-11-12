@@ -1,6 +1,6 @@
 # SSH remediation handoff
 
-## 2026-11-12: callback security keys and sntrup; ML-DSA blocked
+## 2026-11-12: callback security keys, sntrup, and opt-in ML-DSA
 
 1. Added callback-only security-key host verification and opt-in client proposals.
    PROTOCOL.u2f public application and signature flags/counter are parsed exactly;
@@ -18,19 +18,35 @@
    sha2 0.10's asm feature on x86/ARM. The selected crate was fetched successfully;
    tests contain no fetch. OpenSSH kexsntrup761x25519.c confirms string-encoded
    SHA512(KEM-secret || raw-X25519-secret); transcript and KDF use SHA-512.
-3. **ML-DSA blocked on wire-name confirmation under the supplied source rule.**
-   No ML-DSA crate was already in Cargo.lock. `cargo info ml-dsa` fetched
-   RustCrypto ml-dsa 0.1.2, whose README and crate docs specify FIPS 204 and the
-   44/65/87 parameter sets, but no SSH algorithm identifiers or SSH wire format.
-   Existing repo comments contain no Go-compatible ML-DSA wire names; review
-   prose only links draft-sfluhrer-ssh-mldsa-08 and mentions Go's build guard.
-   No guessed identifier, dependency, stub signer, or supported-catalog entry was
-   added. Implementing ML-DSA needs confirmed exact Go/draft identifiers and
-   draft framing/context rules, followed by a real crate sign/verify test.
+3. **ML-DSA source blocker resolved by the caller's draft-08 confirmation.**
+   Sections 3, 4 and 7 of
+   https://www.ietf.org/archive/id/draft-sfluhrer-ssh-mldsa-08.txt specify
+   `ssh-mldsa-44` (1312/2420 public/signature bytes), `ssh-mldsa-65`
+   (1952/3309), and `ssh-mldsa-87` (2592/4627). All three now sign and verify
+   through pinned pure-Rust `ml-dsa =0.1.2`, with real deterministic and hedged
+   crate signatures and empty FIPS 204 context. Exact signature sizes are checked
+   before cryptographic verification. Keys/signatures use two SSH strings;
+   wrong name, size, context, key, message, damage and trailing data fail closed.
+   Both handshakes select 65, exchange protected traffic, deny untrusted keys,
+   and complete both directions of rekey in strict/non-strict tests. Client and
+   server have explicit opt-in builders, defaults are unchanged, and existing
+   host keys remain available. No ML-DSA userauth or certificates are claimed.
+   Fetch succeeded; ml-dsa has build=false, forbids unsafe Rust, and contains no
+   C or assembly. Its dependencies were already locked; no cc build script or
+   native library was added. Its zeroize feature wipes retained key state.
 
 No existing KEX name was removed. No commit, push, atlas edit or E2E gate.
 
-Final verification from `rs/lib` (offline after the dependency fetch):
+ML-DSA continuation verification from `rs/lib` (offline after successful fetch):
+
+- `cargo test -p neotales-ssh --test mldsa_hostkey --offline`
+  — 3 passed, zero failures.
+- `cargo test -p neotales-ssh --all-targets --all-features --offline`
+  — 644 passed, 19 ignored, zero failures across 59 test binaries.
+- `cargo clippy -p neotales-ssh --all-targets --all-features --offline -- -D warnings`
+  — passed without warnings.
+
+Previous security-key/sntrup verification (before ML-DSA):
 
 - `cargo test -p neotales-ssh --lib --test security_key --test kex_breadth --offline`
   — 34 passed, zero failures. Includes fake-callback framing/default-denial,
@@ -561,6 +577,17 @@ The worktree already contained uncommitted changes when this pass began.
 Those changes were preserved. Nothing was committed or pushed.
 # Current status — 2026-11-12
 
-Recorded tasks 0003 and 0005–0038 are implemented on branch `plab-rs-ssh`. Later commits added P-384/P-521 host keys, delayed zlib, non-ML-KEM rekey, an `ssh -R` byte tunnel, a memory SFTP server, in-memory recursive SCP, explicit Include, and explicit ProxyCommand spawn. This does not claim support for sntrup, security keys, ML-DSA, SHA-1, group1, CBC, 3DES, RC4, or HMAC-SHA1.
+Recorded tasks 0003 and 0005–0038 are implemented on branch `plab-rs-ssh`.
+Later work added P-384/P-521 host keys, delayed zlib, non-ML-KEM rekey, an
+`ssh -R` byte tunnel, a memory SFTP server, in-memory recursive SCP, explicit
+Include and explicit ProxyCommand spawn. Deprecated SHA-1, group1, CBC, 3DES,
+RC4 and HMAC-SHA1 require explicit legacy opt-in. The committed sntrup hybrid
+completes both handshakes via explicit KEXINIT. Security-key host verification
+requires an explicit verification callback; it is not a device/resident-key
+implementation. ML-DSA-44/65/87 host keys now have opt-in real signing and
+verification, with both handshakes tested for 65. Default proposals are unchanged.
+These continuations do not claim new live-peer interoperability; details and
+verification are recorded at the top of this file and in compatibility.md.
 
-The gap lists below are historical findings from the pre-implementation review, not current status.
+The earlier gap lists are historical findings from the pre-implementation review,
+not current status.

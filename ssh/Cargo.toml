@@ -21,6 +21,7 @@ flate2.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
 ml-kem.workspace = true
+ml-dsa = { version = "=0.1.2", default-features = false, features = ["alloc", "zeroize", "rand_core"] }
 neotales-x509 = { path = "../../crypto/x509", version = "0.0.0-alpha.1" }
 p256 = { workspace = true, features = ["arithmetic"] }
 p384 = { workspace = true, features = ["arithmetic"] }

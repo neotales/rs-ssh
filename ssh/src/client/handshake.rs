@@ -220,6 +220,26 @@ impl ClientConfig {
         self
     }
 
+    /// Explicitly offers pure ML-DSA-44/65/87 draft host keys after existing choices.
+    /// Defaults exclude these names. A custom KEXINIT can also opt in directly.
+    /// Use `connect_with_host_keys` to supply application trust for these keys.
+    #[must_use]
+    pub fn with_mldsa_host_keys(mut self) -> Self {
+        for name in ["ssh-mldsa-44", "ssh-mldsa-65", "ssh-mldsa-87"] {
+            if !self
+                .kexinit
+                .server_host_key_algorithms
+                .iter()
+                .any(|entry| entry == name)
+            {
+                self.kexinit
+                    .server_host_key_algorithms
+                    .push(name.to_owned());
+            }
+        }
+        self
+    }
+
     /// Enables deprecated SHA-1, CBC, 3DES, RC4, and group1 algorithms.
     /// Appends them after modern choices; never use this for untrusted legacy peers.
     /// Custom proposals containing these names are rejected without this call.

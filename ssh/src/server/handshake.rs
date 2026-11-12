@@ -468,6 +468,26 @@ impl ServerConfig {
         self
     }
 
+    /// Adds an explicit pure ML-DSA host signer and offers only its parameter set.
+    /// No ML-DSA name is offered by default or without a matching configured key.
+    #[must_use]
+    pub fn with_mldsa_host_key(mut self, signer: neotales_ssh::mldsa_hostkey::MldsaSigner) -> Self {
+        let name = signer.public_key().algorithm().name();
+        self.additional_signers
+            .push(Arc::new(HostSigner::Mldsa(Box::new(signer))));
+        if !self
+            .kexinit
+            .server_host_key_algorithms
+            .iter()
+            .any(|entry| entry == name)
+        {
+            self.kexinit
+                .server_host_key_algorithms
+                .push(name.to_owned());
+        }
+        self
+    }
+
     fn select_signer(&self, algorithm: &str) -> Option<Arc<HostSigner>> {
         if algorithm == HOST_KEY_SSH_ED25519 {
             return Some(Arc::new(HostSigner::Ed25519(Arc::clone(&self.signer))));

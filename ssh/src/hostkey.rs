@@ -17,6 +17,8 @@ use zeroize::Zeroize;
 /// A validated public key selected by the transport's host-key negotiation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostPublicKey {
+    /// Pure ML-DSA key verified with empty context; application trust is separate.
+    Mldsa(neotales_ssh::mldsa_hostkey::MldsaPublicKey),
     /// Callback-verified OpenSSH security-key blob; no hardware provenance claim.
     SecurityKey(Vec<u8>),
     /// Structurally parsed Ed25519 certificate with verified proof of subject
@@ -42,6 +44,7 @@ impl HostPublicKey {
     /// Returns a bounded host-key error if encoding fails.
     pub fn to_blob(&self) -> Result<Vec<u8>, HostKeyError> {
         match self {
+            Self::Mldsa(key) => key.to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
             Self::Certificate(blob) | Self::SecurityKey(blob) => Ok(blob.clone()),
             Self::Ed25519(key) => key.to_blob(),
             Self::Rsa(key) => key.to_blob().map_err(|_| HostKeyError::InvalidPublicKey),
@@ -81,6 +84,16 @@ where
         return Err(HostKeyError::UnsupportedAlgorithm);
     }
     let (key, legacy) = match algorithm {
+        "ssh-mldsa-44" | "ssh-mldsa-65" | "ssh-mldsa-87" => {
+            let key = neotales_ssh::mldsa_hostkey::MldsaPublicKey::from_blob(blob)
+                .map_err(|_| HostKeyError::InvalidPublicKey)?;
+            if key.algorithm().name() != algorithm {
+                return Err(HostKeyError::UnsupportedAlgorithm);
+            }
+            key.verify(signature, hash)
+                .map_err(|_| HostKeyError::InvalidSignature)?;
+            (HostPublicKey::Mldsa(key), None)
+        }
         crate::security_key::ED25519 | crate::security_key::ECDSA => {
             security_key_verifier
                 .ok_or(HostKeyError::UnsupportedAlgorithm)?
@@ -156,6 +169,7 @@ where
 
 #[derive(Debug)]
 pub(crate) enum HostSigner {
+    Mldsa(Box<neotales_ssh::mldsa_hostkey::MldsaSigner>),
     Certificate {
         signer: std::sync::Arc<Ed25519Signer>,
         blob: Vec<u8>,
@@ -169,6 +183,9 @@ pub(crate) enum HostSigner {
 
 impl HostSigner {
     pub(crate) fn supports(&self, algorithm: &str) -> bool {
+        if let Self::Mldsa(signer) = self {
+            return signer.public_key().algorithm().name() == algorithm;
+        }
         matches!(
             (self, algorithm),
             (
@@ -184,6 +201,10 @@ impl HostSigner {
 
     pub(crate) fn public_key_blob(&self) -> Result<Vec<u8>, HostKeyError> {
         match self {
+            Self::Mldsa(signer) => signer
+                .public_key()
+                .to_blob()
+                .map_err(|_| HostKeyError::InvalidPublicKey),
             Self::Certificate { blob, .. } => Ok(blob.clone()),
             Self::Ed25519(signer) => signer.public_key_blob(),
             Self::Rsa(signer) => signer
@@ -206,6 +227,7 @@ impl HostSigner {
             return Err(HostKeyError::UnsupportedAlgorithm);
         }
         match self {
+            Self::Mldsa(signer) => signer.sign(hash).map_err(|_| HostKeyError::SigningFailed),
             Self::Certificate { signer, .. } | Self::Ed25519(signer) => {
                 signer.sign_exchange_hash(hash)
             }

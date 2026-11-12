@@ -95,6 +95,9 @@ pub(crate) mod msg {
             "diffie-hellman-group-exchange-sha256",
         ];
         pub const SUPPORTED_HOST_KEY_ALGORITHMS: &[&str] = &[
+            "ssh-mldsa-44",
+            "ssh-mldsa-65",
+            "ssh-mldsa-87",
             "ssh-ed25519-cert-v01@openssh.com",
             HOST_KEY_SSH_ED25519,
             "rsa-sha2-512",
@@ -287,6 +290,7 @@ pub mod gssapi;
 pub mod keepalive;
 #[allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 pub mod known_hosts;
+pub mod mldsa_hostkey;
 #[allow(dead_code)]
 pub mod openssh_key;
 pub mod private_key;
