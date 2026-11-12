@@ -31,7 +31,7 @@ pub(crate) const LEGACY_KEX: &[&str] = &[
     "diffie-hellman-group1-sha1",
     "diffie-hellman-group-exchange-sha1",
 ];
-pub(crate) const LEGACY_CIPHERS: &[&str] = &["aes128-cbc", "aes256-cbc", "3des-cbc", "arcfour"];
+pub(crate) const LEGACY_CIPHERS: &[&str] = &["aes128-cbc", "aes256-cbc", "3des-cbc"];
 pub(crate) const LEGACY_MACS: &[&str] = &["hmac-sha1", "hmac-sha1-etm@openssh.com"];
 
 pub(crate) fn has_legacy_algorithms(proposal: &KexInit) -> bool {

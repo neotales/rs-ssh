@@ -1592,7 +1592,7 @@ fn iv_length(suite: PacketSuite) -> usize {
     match suite.encryption_name() {
         // OpenSSH derives no IV for ChaCha; the protector receives two zero
         // words through the existing key-material API instead.
-        CHACHA20_POLY1305_OPENSSH_NAME | "arcfour" => 0,
+        CHACHA20_POLY1305_OPENSSH_NAME => 0,
         "3des-cbc" => 8,
         _ if suite.integrity_name().is_none() => GCM_IV_LENGTH,
         _ => CTR_IV_LENGTH,
@@ -1601,7 +1601,7 @@ fn iv_length(suite: PacketSuite) -> usize {
 
 fn encryption_key_length(suite: PacketSuite) -> Result<usize, HandshakeError> {
     match suite.encryption_name() {
-        AES128_CTR | AES128_GCM_OPENSSH | "aes128-cbc" | "arcfour" => Ok(AES128_KEY_LENGTH),
+        AES128_CTR | AES128_GCM_OPENSSH | "aes128-cbc" => Ok(AES128_KEY_LENGTH),
         AES256_CTR | AES256_GCM_OPENSSH | "aes256-cbc" => Ok(AES256_KEY_LENGTH),
         "3des-cbc" => Ok(24),
         CHACHA20_POLY1305_OPENSSH_NAME => Ok(CHACHA_KEY_LENGTH),

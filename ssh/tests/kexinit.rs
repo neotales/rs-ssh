@@ -34,7 +34,6 @@ fn default_proposals_and_supported_catalogs_exclude_every_legacy_name() {
         "aes128-cbc",
         "aes256-cbc",
         "3des-cbc",
-        "arcfour",
         "diffie-hellman-group1-sha1",
         "diffie-hellman-group-exchange-sha1",
     ];

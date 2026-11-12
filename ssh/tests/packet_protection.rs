@@ -63,12 +63,6 @@ fn legacy_cipher_and_sha1_packets_match_openssl_and_python_vectors() {
             8,
             "d4d3bc468b18b8ff2081ac11596126bb642d9de99bfcd83bced7bf5196ef5a0a29b0fb04",
         ),
-        (
-            "arcfour",
-            16,
-            0,
-            "e99c40f5439278b56ab4f6a2ab788fea642d9de99bfcd83bced7bf5196ef5a0a29b0fb04",
-        ),
     ] {
         assert!(PacketSuite::new(name, Some("hmac-sha1")).is_err());
         let suite = PacketSuite::new_with_legacy(name, Some("hmac-sha1"), true).expect("opt in");
@@ -94,7 +88,7 @@ fn legacy_cipher_and_sha1_packets_match_openssl_and_python_vectors() {
             Err(PacketProtectionError::AuthenticationFailed)
         );
         assert_eq!(receiver.open(SEQUENCE, &packet).expect("open"), PAYLOAD);
-        // Chaining/RC4 position survives packets; failed opens above did not advance it.
+        // Chaining survives packets; failed opens above did not advance it.
         let next = sender.seal(8, PAYLOAD, EAM_PADDING).expect("next");
         assert_ne!(next[..16], packet[..16]);
         assert_eq!(receiver.open(8, &next).expect("next open"), PAYLOAD);
@@ -118,7 +112,6 @@ fn sha1_etm_and_eam_round_trip_with_modern_and_legacy_ciphers() {
         ("aes128-cbc", 16, 16),
         ("aes256-cbc", 32, 16),
         ("3des-cbc", 24, 8),
-        ("arcfour", 16, 0),
     ] {
         for mac in ["hmac-sha1", "hmac-sha1-etm@openssh.com"] {
             let suite = PacketSuite::new_with_legacy(cipher, Some(mac), true).expect("suite");

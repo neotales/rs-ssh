@@ -259,7 +259,7 @@ repeated rekeys and protected traffic; no new live-peer evidence is claimed.
 
 - `ssh-rsa` (RSA PKCS#1 v1.5 SHA-1 host signatures; requires an RSA host key)
 - `hmac-sha1` and `hmac-sha1-etm@openssh.com`
-- `aes128-cbc`, `aes256-cbc`, `3des-cbc`, and `arcfour`
+- `aes128-cbc`, `aes256-cbc`, and `3des-cbc`
 - `diffie-hellman-group1-sha1` (RFC 4253 1024-bit MODP group, generator 2)
 - `diffie-hellman-group-exchange-sha1` (only the same approved 4096-bit
   group16 prime and generator 2 used by SHA-256 group exchange)
@@ -272,9 +272,10 @@ policy-bound proposals govern subsequent rekeys. RSA SHA-2 remains unchanged;
 `server-sig-algs` preference never selects SHA-1 for authentication.
 
 CBC uses continuous chaining across SSH packets with SSH padding, not PKCS#7.
-`arcfour` is the original 128-bit-key RC4 (not arcfour128/256 with initial-byte
-discard), implemented in pure Rust inside this crate. These algorithms are
-cryptographically obsolete: use opt-in only for unavoidable legacy compatibility.
+RC4 cipher names (`arcfour`, `arcfour128`, and `arcfour256`) are rejected,
+including behind `with_legacy_algorithms()`. RFC 8758 deprecates RC4. The
+remaining opt-in algorithms are cryptographically obsolete; use them only for
+unavoidable legacy compatibility.
 Packet fixtures use independent OpenSSL cipher and Python HMAC-SHA1 outputs;
 loopback tests cover SHA-1 RSA host signatures, protected traffic, and client-
 and server-initiated rekeys. This is not new live OpenSSH interoperability evidence.

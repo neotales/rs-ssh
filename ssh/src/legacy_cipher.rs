@@ -1,6 +1,6 @@
 //! Deprecated SSH ciphers. Only reached through explicitly enabled proposals.
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use super::{CipherAlgorithm, PacketProtectionError};
 
@@ -9,7 +9,6 @@ pub(super) enum LegacyCipher {
     Aes128(aes::Aes128, Zeroizing<[u8; 16]>),
     Aes256(aes::Aes256, Zeroizing<[u8; 16]>),
     Des(des::TdesEde3, Zeroizing<[u8; 8]>),
-    Arcfour(Box<Arcfour>),
 }
 
 impl LegacyCipher {
@@ -32,9 +31,6 @@ impl LegacyCipher {
                 des::TdesEde3::new_from_slice(key).map_err(|_| invalid())?,
                 Zeroizing::new(iv.try_into().map_err(|_| invalid())?),
             ),
-            CipherAlgorithm::Arcfour if iv.is_empty() && key.len() == 16 => {
-                Self::Arcfour(Box::new(Arcfour::new(key)))
-            }
             _ => return Err(invalid()),
         })
     }
@@ -84,52 +80,7 @@ impl LegacyCipher {
             Self::Aes128(cipher, iv) => cbc!(cipher, iv, 16),
             Self::Aes256(cipher, iv) => cbc!(cipher, iv, 16),
             Self::Des(cipher, iv) => cbc!(cipher, iv, 8),
-            Self::Arcfour(cipher) => cipher.apply(data),
         }
         Ok(())
-    }
-}
-
-/// RFC 4253's original RC4, without the discard used by arcfour128/256.
-/// This algorithm is broken; compatibility is its only purpose.
-#[derive(Clone)]
-pub(super) struct Arcfour {
-    permutation: [u8; 256],
-    i: u8,
-    j: u8,
-}
-impl Arcfour {
-    fn new(key: &[u8]) -> Self {
-        let mut state = Self {
-            permutation: std::array::from_fn(|i| u8::try_from(i).expect("byte index")),
-            i: 0,
-            j: 0,
-        };
-        let mut j = 0_u8;
-        for i in 0..256 {
-            j = j
-                .wrapping_add(state.permutation[i])
-                .wrapping_add(key[i % key.len()]);
-            state.permutation.swap(i, usize::from(j));
-        }
-        state
-    }
-    fn apply(&mut self, data: &mut [u8]) {
-        for byte in data {
-            self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.permutation[usize::from(self.i)]);
-            self.permutation
-                .swap(usize::from(self.i), usize::from(self.j));
-            let index = self.permutation[usize::from(self.i)]
-                .wrapping_add(self.permutation[usize::from(self.j)]);
-            *byte ^= self.permutation[usize::from(index)];
-        }
-    }
-}
-impl Drop for Arcfour {
-    fn drop(&mut self) {
-        self.permutation.zeroize();
-        self.i.zeroize();
-        self.j.zeroize();
     }
 }

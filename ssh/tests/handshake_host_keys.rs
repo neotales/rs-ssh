@@ -22,7 +22,6 @@ fn custom_legacy_proposals_fail_closed_without_config_opt_in() {
         "aes128-cbc",
         "aes256-cbc",
         "3des-cbc",
-        "arcfour",
         "diffie-hellman-group1-sha1",
         "diffie-hellman-group-exchange-sha1",
     ] {
@@ -73,7 +72,6 @@ fn legacy_opt_in_completes_host_signature_packets_and_rekey()
             "3des-cbc",
             "hmac-sha1",
         ),
-        ("curve25519-sha256", "arcfour", "hmac-sha1"),
         ("curve25519-sha256", "3des-cbc", "hmac-sha1-etm@openssh.com"),
         ("curve25519-sha256", "aes128-ctr", "hmac-sha1"),
     ] {

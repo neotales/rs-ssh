@@ -175,9 +175,11 @@ fn defaults_retain_existing_choices_and_advertise_only_modern_names_once() {
             &proposal.encryption_algorithms_client_to_server,
             &proposal.encryption_algorithms_server_to_client,
         ] {
-            assert!(!names.iter().any(|name| name.contains("cbc")
-                || name.contains("3des")
-                || name.contains("arcfour")));
+            assert!(
+                !names
+                    .iter()
+                    .any(|name| name.contains("cbc") || name.contains("3des"))
+            );
         }
         for names in [
             &proposal.mac_algorithms_client_to_server,

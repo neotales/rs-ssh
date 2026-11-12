@@ -113,7 +113,6 @@ enum CipherAlgorithm {
     Aes128Cbc,
     Aes256Cbc,
     DesCbc,
-    Arcfour,
     Aes128Ctr,
     Aes256Ctr,
     Aes128Gcm,
@@ -127,7 +126,6 @@ impl CipherAlgorithm {
             Self::Aes128Cbc => "aes128-cbc",
             Self::Aes256Cbc => "aes256-cbc",
             Self::DesCbc => "3des-cbc",
-            Self::Arcfour => "arcfour",
             Self::Aes128Ctr => AES128_CTR_NAME,
             Self::Aes256Ctr => AES256_CTR_NAME,
             Self::Aes128Gcm => AES128_GCM_OPENSSH_NAME,
@@ -138,7 +136,7 @@ impl CipherAlgorithm {
 
     const fn key_size(self) -> usize {
         match self {
-            Self::Aes128Cbc | Self::Arcfour | Self::Aes128Ctr | Self::Aes128Gcm => 16,
+            Self::Aes128Cbc | Self::Aes128Ctr | Self::Aes128Gcm => 16,
             Self::Aes256Cbc | Self::Aes256Ctr | Self::Aes256Gcm => 32,
             Self::DesCbc => 24,
             Self::Chacha20Poly1305 => CHACHA_KEY_SIZE,
@@ -154,10 +152,7 @@ impl CipherAlgorithm {
     }
 
     const fn is_legacy(self) -> bool {
-        matches!(
-            self,
-            Self::Aes128Cbc | Self::Aes256Cbc | Self::DesCbc | Self::Arcfour
-        )
+        matches!(self, Self::Aes128Cbc | Self::Aes256Cbc | Self::DesCbc)
     }
 }
 
@@ -250,7 +245,6 @@ impl PacketSuite {
             "aes128-cbc" if legacy => CipherAlgorithm::Aes128Cbc,
             "aes256-cbc" if legacy => CipherAlgorithm::Aes256Cbc,
             "3des-cbc" if legacy => CipherAlgorithm::DesCbc,
-            "arcfour" if legacy => CipherAlgorithm::Arcfour,
             AES128_CTR_NAME => CipherAlgorithm::Aes128Ctr,
             AES256_CTR_NAME => CipherAlgorithm::Aes256Ctr,
             AES128_GCM_OPENSSH_NAME => CipherAlgorithm::Aes128Gcm,
@@ -437,11 +431,7 @@ impl PacketAlignment {
             Some(name) => name.contains("-etm@openssh.com"),
         };
         Self {
-            block_size: if suite.is_chacha()
-                || matches!(
-                    suite.cipher,
-                    CipherAlgorithm::DesCbc | CipherAlgorithm::Arcfour
-                ) {
+            block_size: if suite.is_chacha() || matches!(suite.cipher, CipherAlgorithm::DesCbc) {
                 CHACHA_BLOCK_SIZE
             } else {
                 AES_BLOCK_SIZE
