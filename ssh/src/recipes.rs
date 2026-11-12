@@ -3,7 +3,9 @@
 //! Callers supply authenticated transports, byte streams, trust and server policy.
 //! These helpers never read SSH configuration, start a process, or add peer trust.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::net::TcpStream;
 
 use crate::channel::{ChannelId, ChannelTransport};
 use crate::hostkey::Ed25519PublicKey;
@@ -13,6 +15,304 @@ use crate::session::{SessionDecision, SessionError, SessionEvent, SessionRequest
 use crate::{
     ClientAuthMethod, ClientConfig, ClientSessions, ServerConfig, ServerSessions, ServerTransport,
 };
+
+/// An authenticated connection for sequential common-case operations.
+/// No background reader is started; operations may block on the peer.
+pub struct Client<T: ChannelTransport = crate::ClientTransport<TcpStream>> {
+    sessions: ClientSessions<T>,
+}
+
+impl<T: ChannelTransport> std::fmt::Debug for Client<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Client").finish_non_exhaustive()
+    }
+}
+
+/// Error returned by the convenience client.
+pub type ClientError = Box<dyn std::error::Error>;
+
+impl Client<crate::ClientTransport<TcpStream>> {
+    /// Dials and authenticates with a required SSH-format Ed25519 key blob.
+    /// `None` selects port 22. No configuration or credentials are loaded.
+    /// The pin is checked only after the server signature has been verified.
+    ///
+    /// # Errors
+    /// Rejects empty methods, invalid pins, dial, handshake and authentication failures.
+    pub fn open(
+        host: &str,
+        port: Option<u16>,
+        username: &str,
+        methods: &[ClientAuthMethod],
+        pinned_ed25519_blob: &[u8],
+    ) -> Result<Self, ClientError> {
+        if methods.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "authentication methods required",
+            )
+            .into());
+        }
+        let pin = Ed25519PublicKey::from_blob(pinned_ed25519_blob)?;
+        let stream = TcpStream::connect((host, port.unwrap_or(22)))?;
+        let mut transport = ClientConfig::new()
+            .connect(stream, |key| if *key == pin { Ok(()) } else { Err(()) })?;
+        crate::authenticate_client(&mut transport, username, methods, methods.len())?;
+        Ok(Self {
+            sessions: ClientSessions::new(transport),
+        })
+    }
+}
+
+impl<T: ChannelTransport> Client<T> {
+    /// Executes exact command bytes, discarding stderr, and returns stdout and status.
+    /// Output is buffered without a size limit. Repeating runs the command again.
+    ///
+    /// # Errors
+    /// Returns session, request or transport errors.
+    pub fn exec(&mut self, command: &[u8]) -> Result<(Vec<u8>, u32), SessionError> {
+        let session = open_session(&mut self.sessions)?;
+        self.sessions.request_exec(session, command, true)?;
+        let mut output = Vec::new();
+        let status = loop {
+            match self.sessions.dispatch_one()? {
+                SessionEvent::Data { session: id, data } if id == session => {
+                    return_credit(&mut self.sessions, session, data.len())?;
+                    output.extend(data);
+                }
+                SessionEvent::ExtendedData {
+                    session: id, data, ..
+                } if id == session => {
+                    return_credit(&mut self.sessions, session, data.len())?;
+                }
+                SessionEvent::ExitStatus {
+                    session: id,
+                    status,
+                } if id == session => break status,
+                SessionEvent::RequestSucceeded { session: id }
+                | SessionEvent::WindowAdjusted { session: id, .. }
+                | SessionEvent::Eof { session: id }
+                    if id == session => {}
+                SessionEvent::RequestFailed { session: id } if id == session => {
+                    return Err(SessionError::RequestRejected);
+                }
+                _ => return Err(SessionError::UnexpectedMessage),
+            }
+        };
+        close_session(&mut self.sessions, session)?;
+        Ok((output, status))
+    }
+
+    /// Executes the exact script bytes without selecting an interpreter.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::exec`].
+    pub fn script(&mut self, bytes: &[u8]) -> Result<(Vec<u8>, u32), SessionError> {
+        self.exec(bytes)
+    }
+
+    /// Uploads one in-memory file and reports payload bytes after success.
+    /// Failure may leave a partial remote file; retrying may overwrite it.
+    ///
+    /// # Errors
+    /// Returns channel, SCP or transport errors.
+    pub fn upload(
+        &mut self,
+        path: impl AsRef<[u8]>,
+        bytes: &[u8],
+        progress: impl Fn(u64),
+    ) -> Result<(), ClientError> {
+        let session = open_session(&mut self.sessions)?;
+        self.sessions.request_scp_upload(session, &path, true)?;
+        accepted(&mut self.sessions, session)?;
+        let mut stream = SessionStream::new(&mut self.sessions, session);
+        copy_up(&mut stream, path, bytes, progress)?;
+        stream.finish()?;
+        Ok(())
+    }
+
+    /// Downloads one in-memory file and reports payload bytes after success.
+    ///
+    /// # Errors
+    /// Returns channel, SCP or transport errors.
+    pub fn download(
+        &mut self,
+        path: impl AsRef<[u8]>,
+        progress: impl Fn(u64),
+    ) -> Result<Vec<u8>, ClientError> {
+        let session = open_session(&mut self.sessions)?;
+        self.sessions.request_scp_download(session, path, true)?;
+        accepted(&mut self.sessions, session)?;
+        let mut stream = SessionStream::new(&mut self.sessions, session);
+        let data = copy_down(&mut stream, progress)?.data;
+        stream.finish()?;
+        Ok(data)
+    }
+
+    /// Opens an SFTP subsystem borrowing this client until the returned client is dropped.
+    ///
+    /// # Errors
+    /// Returns channel, subsystem or SFTP negotiation errors.
+    pub fn sftp(&mut self) -> Result<crate::sftp::SftpClient<SessionStream<'_, T>>, ClientError> {
+        let session = sftp_session(&mut self.sessions)?;
+        accepted(&mut self.sessions, session)?;
+        Ok(crate::sftp::SftpClient::connect(SessionStream::new(
+            &mut self.sessions,
+            session,
+        ))?)
+    }
+}
+
+fn accepted<T: ChannelTransport>(
+    sessions: &mut ClientSessions<T>,
+    session: ChannelId,
+) -> Result<(), SessionError> {
+    match sessions.dispatch_one()? {
+        SessionEvent::RequestSucceeded { session: received } if session == received => Ok(()),
+        SessionEvent::RequestFailed { session: received } if session == received => {
+            Err(SessionError::RequestRejected)
+        }
+        _ => Err(SessionError::UnexpectedMessage),
+    }
+}
+
+/// A session-channel byte stream borrowed from a convenience client.
+pub struct SessionStream<'a, T: ChannelTransport> {
+    sessions: &'a mut ClientSessions<T>,
+    session: ChannelId,
+    incoming: VecDeque<u8>,
+    eof: bool,
+    finished: bool,
+}
+
+impl<T: ChannelTransport> std::fmt::Debug for SessionStream<'_, T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionStream")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, T: ChannelTransport> SessionStream<'a, T> {
+    fn new(sessions: &'a mut ClientSessions<T>, session: ChannelId) -> Self {
+        Self {
+            sessions,
+            session,
+            incoming: VecDeque::new(),
+            eof: false,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), SessionError> {
+        self.finished = true;
+        close_session(self.sessions, self.session)
+    }
+
+    fn dispatch(&mut self) -> io::Result<()> {
+        match self.sessions.dispatch_one().map_err(io::Error::other)? {
+            SessionEvent::Data { session, data } if session == self.session => {
+                self.incoming.extend(data);
+            }
+            SessionEvent::ExtendedData { session, data, .. } if session == self.session => {
+                return_credit(self.sessions, session, data.len()).map_err(io::Error::other)?;
+            }
+            SessionEvent::WindowAdjusted { session, .. } if session == self.session => {}
+            SessionEvent::Eof { session } | SessionEvent::Close { session }
+                if session == self.session =>
+            {
+                self.eof = true;
+            }
+            SessionEvent::ExitStatus { session, .. } if session == self.session => {}
+            _ => return Err(io::Error::other(SessionError::UnexpectedMessage)),
+        }
+        Ok(())
+    }
+}
+
+impl<T: ChannelTransport> Drop for SessionStream<'_, T> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.finish();
+        }
+    }
+}
+
+fn close_session<T: ChannelTransport>(
+    sessions: &mut ClientSessions<T>,
+    session: ChannelId,
+) -> Result<(), SessionError> {
+    sessions.send_close(session)?;
+    loop {
+        match sessions.dispatch_one()? {
+            SessionEvent::Close { session: id } if id == session => return Ok(()),
+            SessionEvent::Data { session: id, data }
+            | SessionEvent::ExtendedData {
+                session: id, data, ..
+            } if id == session => return_credit(sessions, session, data.len())?,
+            SessionEvent::ExitStatus { session: id, .. }
+            | SessionEvent::Eof { session: id }
+            | SessionEvent::WindowAdjusted { session: id, .. }
+                if id == session => {}
+            _ => return Err(SessionError::UnexpectedMessage),
+        }
+    }
+}
+
+impl<T: ChannelTransport> Read for SessionStream<'_, T> {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        if target.is_empty() {
+            return Ok(0);
+        }
+        while self.incoming.is_empty() {
+            if self.eof {
+                return Ok(0);
+            }
+            self.dispatch()?;
+        }
+        let count = target.len().min(self.incoming.len());
+        return_credit(self.sessions, self.session, count).map_err(io::Error::other)?;
+        for byte in &mut target[..count] {
+            *byte = self
+                .incoming
+                .pop_front()
+                .ok_or_else(|| io::Error::other("missing channel byte"))?;
+        }
+        Ok(count)
+    }
+}
+
+impl<T: ChannelTransport> Write for SessionStream<'_, T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let state = self
+                .sessions
+                .connection()
+                .channel(self.session)
+                .ok_or_else(|| io::Error::other(SessionError::UnexpectedMessage))?;
+            let count = bytes
+                .len()
+                .min(state.remote_window() as usize)
+                .min(state.remote_maximum_packet_size() as usize)
+                .min(crate::channel::MAX_CHANNEL_DATA_SIZE);
+            if count > 0 {
+                return self
+                    .sessions
+                    .send_data(self.session, &bytes[..count])
+                    .map_err(io::Error::other);
+            }
+            if self.eof || state.remote_maximum_packet_size() == 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
+            }
+            self.dispatch()?;
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Opens a session and executes the exact command bytes, returning stdout and exit status.
 ///
@@ -229,6 +529,11 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::Cursor;
 
+    #[test]
+    fn owned_client_rejects_empty_auth_before_dial() {
+        assert!(Client::open("invalid.invalid", None, "user", &[], b"").is_err());
+    }
+
     // Public-contract fixtures: scripted protocol peers avoid a network/server.
     struct Peer {
         incoming: VecDeque<Vec<u8>>,
@@ -273,6 +578,44 @@ mod tests {
             .into(),
             outgoing: Vec::new(),
         })
+    }
+
+    // A full authenticated SSH peer is an unreasonable fixture for this adapter.
+    #[test]
+    fn owned_client_scp_round_trip_over_scripted_channels() -> Result<(), Box<dyn std::error::Error>>
+    {
+        fn scripted(data: &[u8]) -> Result<Peer, Box<dyn std::error::Error>> {
+            let mut peer = peer()?;
+            peer.incoming.truncate(2);
+            let mut packet = Writer::new();
+            packet.write_byte(94);
+            packet.write_uint32(0);
+            packet.write_string(data)?;
+            peer.incoming.push_back(packet.into_bytes());
+            peer.incoming.push_back(vec![97, 0, 0, 0, 0]);
+            Ok(peer)
+        }
+        let counts = RefCell::new(Vec::new());
+        let mut upload = Client {
+            sessions: ClientSessions::new(scripted(&[0, 0, 0])?),
+        };
+        upload.upload("file", b"abc", |n| counts.borrow_mut().push(n))?;
+        let peer = upload.sessions.into_inner();
+        let wire = peer.outgoing.concat();
+        assert!(
+            wire.windows(b"C0644 3 file\n".len())
+                .any(|part| part == b"C0644 3 file\n")
+        );
+        assert!(wire.windows(3).any(|part| part == b"abc"));
+        let mut download = Client {
+            sessions: ClientSessions::new(scripted(b"C0644 3 file\nabc\0")?),
+        };
+        assert_eq!(
+            download.download("file", |n| counts.borrow_mut().push(n))?,
+            b"abc"
+        );
+        assert_eq!(*counts.borrow(), [3, 3]);
+        Ok(())
     }
 
     #[test]
