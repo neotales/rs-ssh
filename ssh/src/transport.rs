@@ -16,7 +16,7 @@ use crate::cipher::{
     PacketSuite, PlaintextBytes, PlaintextSlot,
 };
 use crate::hostkey::{HostPublicKey, VerifiedHostKey, VerifiedServerHostKey};
-use crate::kex::mlkem768_x25519::ClientKex as MlKemClientKex;
+use crate::kex::rekey::Client as RekeyClient;
 use crate::kex::{DerivationLengths, DerivedKeys};
 use crate::msg::kexinit::KexInit;
 pub use crate::sequence::RekeyPhase;
@@ -205,7 +205,9 @@ pub(crate) struct ClientRekeyState {
     pub(crate) peer_guessed: bool,
     pub(crate) peer_guess_is_correct: bool,
     pub(crate) protection: Option<RekeyProtection>,
-    pub(crate) client_kex: Option<MlKemClientKex>,
+    pub(crate) client_kex: Option<RekeyClient>,
+    pub(crate) method_payload: Option<Vec<u8>>,
+    pub(crate) group_received: bool,
     pub(crate) derived: Option<DerivedKeys>,
     pub(crate) client_method_sent: bool,
     pub(crate) write_newkeys_sent: bool,

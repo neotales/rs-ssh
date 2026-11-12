@@ -131,6 +131,130 @@ fn client_and_server_complete_a_strict_handshake_and_exchange_auth_packets()
     Ok(())
 }
 
+fn public_rekey(algorithm: &str) -> Result<(), Box<dyn std::error::Error>> {
+    for strict in [false, true] {
+        public_rekey_mode(algorithm, strict)?;
+    }
+    Ok(())
+}
+
+fn public_rekey_mode(algorithm: &str, strict: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+    let config = ServerConfig::new(signer(49));
+    let mut server_proposal = config.kexinit().clone();
+    server_proposal.kex_algorithms = vec![algorithm.to_owned()];
+    let mut client_proposal = client::ClientConfig::new().kexinit().clone();
+    client_proposal.kex_algorithms = vec![algorithm.to_owned()];
+    if strict {
+        server_proposal
+            .kex_algorithms
+            .push("kex-strict-s-v00@openssh.com".to_owned());
+        client_proposal
+            .kex_algorithms
+            .push("kex-strict-c-v00@openssh.com".to_owned());
+    }
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<Vec<u8>, String> {
+        let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| e.to_string())?;
+        let mut transport = config
+            .with_kexinit(server_proposal)
+            .accept(stream)
+            .map_err(|e| e.to_string())?;
+        let sid = transport.session_id().to_vec();
+        transport.write_payload(&[52]).map_err(|e| e.to_string())?;
+        transport.mark_authenticated();
+        // Simultaneous initiation, then client-only and server-only initiation.
+        for round in 0..3 {
+            if round != 1 {
+                transport.rekey().map_err(|e| e.to_string())?;
+            }
+            if round == 2 {
+                transport
+                    .write_payload(&[94, 2])
+                    .map_err(|e| e.to_string())?;
+            }
+            if transport.session_id() != sid {
+                return Err("session identity changed".to_owned());
+            }
+            if transport.read_payload().map_err(|e| e.to_string())? != [94, 1] {
+                return Err("bad request".to_owned());
+            }
+            if round != 2 {
+                transport
+                    .write_payload(&[94, 2])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(sid)
+    });
+    let stream = TcpStream::connect(address)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut transport = client::ClientConfig::with_kexinit(client_proposal)
+        .connect(stream, |_| Ok::<(), ()>(()))?;
+    let sid = transport.session_id().to_vec();
+    assert_eq!(transport.read_payload()?, [52]);
+    transport.authenticated = true;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for round in 0..3 {
+            if round != 2 {
+                transport.rekey()?;
+            }
+            if round == 2 {
+                assert_eq!(transport.read_payload()?, [94, 2]);
+            }
+            assert_eq!(transport.session_id(), sid);
+            transport.write_payload(&[94, 1])?;
+            if round != 2 {
+                assert_eq!(transport.read_payload()?, [94, 2]);
+            }
+        }
+        Ok(())
+    })();
+    drop(transport);
+    let server_result = server.join().map_err(|_| "server panicked")?;
+    result?;
+    assert_eq!(server_result?, sid);
+    Ok(())
+}
+
+#[test]
+fn curve25519_rekey() -> Result<(), Box<dyn std::error::Error>> {
+    public_rekey("curve25519-sha256")
+}
+
+#[test]
+fn hybrid_public_rekey() -> Result<(), Box<dyn std::error::Error>> {
+    public_rekey("mlkem768x25519-sha256")
+}
+
+#[test]
+fn nist_curve_rekey() -> Result<(), Box<dyn std::error::Error>> {
+    for algorithm in [
+        "ecdh-sha2-nistp256",
+        "ecdh-sha2-nistp384",
+        "ecdh-sha2-nistp521",
+    ] {
+        public_rekey(algorithm)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn finite_field_rekey() -> Result<(), Box<dyn std::error::Error>> {
+    for algorithm in [
+        "diffie-hellman-group16-sha512",
+        "diffie-hellman-group-exchange-sha256",
+    ] {
+        public_rekey(algorithm)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn server_rekeys_hybrid_with_old_keys_until_newkeys_and_keeps_session_identity()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -226,7 +350,7 @@ fn peer_kexinit_is_consumed_before_authentication_dispatch()
 }
 
 #[test]
-fn rekey_rejects_non_hybrid_and_reentrant_transitions_fail_closed()
+fn rekey_rejects_unsupported_and_reentrant_transitions_fail_closed()
 -> Result<(), Box<dyn std::error::Error>> {
     let signer = signer(43);
     let expected_key = *signer.public_key();
@@ -242,7 +366,7 @@ fn rekey_rejects_non_hybrid_and_reentrant_transitions_fail_closed()
     drop(peer);
 
     let (mut server, mut peer) = complete_raw_initial(&config, expected_key, false)?;
-    let mut non_hybrid = proposal(CURVE25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    let mut non_hybrid = proposal("unsupported-kex", AES128_CTR, HMAC_SHA2_256, false);
     non_hybrid.cookie = [0xb1; 16];
     peer.begin_rekey()?;
     peer.send_rekey(&non_hybrid.encode()?, 20)?;

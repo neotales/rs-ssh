@@ -179,10 +179,13 @@ handshake tests passed. Existing choices and their preference order remain ahead
 of the new names. Strict/non-strict tests cover protected traffic and exact GEX
 message order; independent fixed fixtures cover transcript hashes and multi-block
 key expansion. No SHA-1 group exchange, group1, CBC, 3DES, RC4, HMAC-SHA1, or
-sntrup was added. Rekey support remains the existing ML-KEM-only implementation;
-other initial exchanges still reject unsupported rekey attempts rather than
-silently changing their hash/session contract. No new live-peer evidence is
-claimed by these in-process tests.
+sntrup was added. Post-establishment rekey supports curve25519-sha256,
+ecdh-sha2-nistp256/384/521, diffie-hellman-group16-sha512,
+diffie-hellman-group-exchange-sha256 and mlkem768x25519-sha256. Rekey retains
+the initial algorithm and first exchange hash as the session identifier, and
+uses that algorithm's initial-handshake hash and key derivation. Other names
+remain rejected and failed exchanges are terminal. In-process tests cover
+repeated rekeys and protected traffic; no new live-peer evidence is claimed.
 
 ## Not verified or not claimed
 

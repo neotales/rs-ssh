@@ -312,11 +312,11 @@ impl PacketDisposition {
 /// A compatibility alias for the classification terminology used by transports.
 pub(crate) type PacketClass = PacketDisposition;
 
-/// The maximum number of outbound packets required by one hybrid rekey.
-pub(crate) const REKEY_OUTBOUND_PACKET_SLOTS: u32 = 3;
-/// The maximum number of inbound packets required by one hybrid rekey,
+/// The maximum number of outbound packets required by one rekey (including GEX).
+pub(crate) const REKEY_OUTBOUND_PACKET_SLOTS: u32 = 4;
+/// The maximum number of inbound packets required by one rekey,
 /// including one possible wrong first-KEX guess that must be discarded.
-pub(crate) const REKEY_INBOUND_PACKET_SLOTS: u32 = 4;
+pub(crate) const REKEY_INBOUND_PACKET_SLOTS: u32 = 5;
 
 /// A message observation that can carry the guessed-packet marker from a
 /// KEXINIT without coupling this module to the KEXINIT codec.
@@ -1017,6 +1017,7 @@ impl InitialKexPolicy {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RekeyPolicy {
+    method_remaining: [u8; 2],
     strict_kex: bool,
     inbound_phase: RekeyPhase,
     outbound_phase: RekeyPhase,
@@ -1048,6 +1049,7 @@ impl RekeyPolicy {
     #[must_use]
     pub(crate) fn with_strict_kex(strict_kex: bool) -> Self {
         Self {
+            method_remaining: [1, 1],
             strict_kex,
             inbound_phase: RekeyPhase::Idle,
             outbound_phase: RekeyPhase::Idle,
@@ -1646,6 +1648,7 @@ impl RekeyPolicy {
     }
 
     fn prepare_cycle(&mut self) {
+        self.method_remaining = [1, 1];
         self.inbound_phase = RekeyPhase::KexInit;
         self.outbound_phase = RekeyPhase::KexInit;
         self.inbound_kexinit = false;
@@ -1688,6 +1691,14 @@ impl RekeyPolicy {
     }
 
     fn mark_kex_method(&mut self, direction: Direction) {
+        let index = match direction {
+            Direction::Inbound => 0,
+            Direction::Outbound => 1,
+        };
+        self.method_remaining[index] -= 1;
+        if self.method_remaining[index] != 0 {
+            return;
+        }
         match direction {
             Direction::Inbound => {
                 self.inbound_kex_method = true;
@@ -1751,6 +1762,19 @@ impl Default for SequenceState {
 }
 
 impl SequenceState {
+    /// Enables the two RFC 4419 method packets per rekey direction.
+    pub(crate) fn configure_rekey_group_exchange(&mut self) -> Result<(), SequenceError> {
+        let policy = &mut self.rekey_policy;
+        if !policy.active
+            || policy.inbound_kex_method
+            || policy.outbound_kex_method
+            || policy.method_remaining != [1, 1]
+        {
+            return Err(SequenceError::InvalidState);
+        }
+        policy.method_remaining = [2, 2];
+        Ok(())
+    }
     /// Configures the initial RFC 4419 packet budget before method processing.
     pub(crate) fn configure_group_exchange(&mut self) -> Result<(), SequenceError> {
         self.policy.configure_group_exchange()

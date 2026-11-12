@@ -32,6 +32,9 @@ pub(crate) mod mlkem768_x25519;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod modern;
 
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod rekey;
+
 pub(crate) use curve25519::{CURVE25519_PUBLIC_KEY_LENGTH, Curve25519};
 #[allow(unused_imports)]
 pub(crate) use dh_group16::DhGroup16;

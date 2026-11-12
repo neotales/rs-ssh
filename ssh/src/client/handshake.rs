@@ -599,9 +599,9 @@ where
     ///
     /// The caller can drive the exchange incrementally with
     /// [`Self::advance_rekey`], or use [`Self::rekey`] for a blocking stream.
-    /// Only `mlkem768x25519-sha256` is accepted for this bounded API. The
-    /// original session identifier remains the derivation input for every
-    /// rekey.
+    /// Uses the initial exchange's algorithm: Curve25519, NIST P-256/P-384/P-521,
+    /// group16-SHA512, group-exchange-SHA256 or ML-KEM768/X25519. The original
+    /// session identifier remains the derivation input for every rekey.
     ///
     /// # Errors
     ///
@@ -648,17 +648,26 @@ where
             return Err(error.into());
         }
 
-        if self.initial_algorithm.as_deref() != Some(KEX_MLKEM768X25519_SHA256) {
+        if !self
+            .initial_algorithm
+            .as_deref()
+            .is_some_and(crate::kex::rekey::supported)
+        {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
         let template = self
             .rekey_proposal
             .clone()
             .ok_or(TransportError::InvalidMessage)?;
-        if self.session_id.len() != 32 {
+        if !matches!(self.session_id.len(), 32 | 48 | 64) {
             return Err(HandshakeError::Kex(KexError::InvalidSessionId));
         }
-        let local_kexinit = rekey_kexinit(&template)?;
+        let local_kexinit = rekey_kexinit(
+            &template,
+            self.initial_algorithm
+                .as_deref()
+                .ok_or(HandshakeError::UnsupportedAlgorithm)?,
+        )?;
         let local_kexinit_payload = local_kexinit.encode()?;
         if let Err(error) = self.sequence.begin_rekey() {
             self.abort_rekey();
@@ -673,6 +682,8 @@ where
             peer_guess_is_correct: true,
             protection: None,
             client_kex: None,
+            method_payload: None,
+            group_received: false,
             derived: None,
             client_method_sent: false,
             write_newkeys_sent: false,
@@ -814,7 +825,7 @@ where
                     .ok_or(TransportError::InvalidMessage)?;
                 self.write_rekey_packet(&payload, SSH_MSG_KEXINIT)?;
             }
-            SSH_MSG_KEX_ECDH_INIT => {
+            SSH_MSG_KEX_METHOD_FIRST..=SSH_MSG_KEX_METHOD_LAST => {
                 self.send_client_method()?;
             }
             SSH_MSG_NEWKEYS => {
@@ -879,7 +890,7 @@ where
         let algorithms = local_kexinit.negotiate(&peer_kexinit)?;
         let peer_guess_is_correct =
             !peer_kexinit.first_kex_packet_follows || kex_guess_matches(&peer_kexinit, &algorithms);
-        if algorithms.kex != KEX_MLKEM768X25519_SHA256 {
+        if !crate::kex::rekey::supported(&algorithms.kex) {
             return Err(HandshakeError::UnsupportedAlgorithm);
         }
         let protection = rekey_protection(ProtectionPlan::from_algorithms(
@@ -887,7 +898,16 @@ where
             self.delayed_compression,
         )?);
         self.accept_rekey_kexinit(sequence)?;
-        let client = MlKemClientKex::generate()?;
+        if algorithms.kex == crate::kex::modern::GEX {
+            self.sequence.configure_rekey_group_exchange()?;
+        }
+        let client = crate::kex::rekey::Client::new(&crate::kex::rekey::Transcript {
+            client_version: &self.client_version,
+            server_version: &self.peer_version,
+            client_init: &local_kexinit.encode()?,
+            server_init: payload,
+            algorithm: &algorithms.kex,
+        })?;
         let state = self.rekey.as_mut().ok_or(TransportError::RekeyInProgress)?;
         if state.peer_kexinit.is_some() {
             return Err(TransportError::UnexpectedMessage.into());
@@ -900,6 +920,7 @@ where
             .is_some_and(|kexinit| kexinit.first_kex_packet_follows);
         state.peer_guess_is_correct = peer_guess_is_correct;
         state.protection = Some(protection);
+        state.method_payload = Some(client.init_message()?);
         state.client_kex = Some(client);
         Ok(())
     }
@@ -919,23 +940,26 @@ where
                 .ok_or(TransportError::InvalidMessage)?;
             self.write_rekey_packet(&payload, SSH_MSG_KEXINIT)?;
         }
-        let init_message =
-            if self.write_buffer.pending_message_type() == Some(SSH_MSG_KEX_ECDH_INIT) {
-                self.write_buffer
-                    .pending_payload()
-                    .ok_or(TransportError::InvalidMessage)?
-            } else {
-                let state = self.rekey.as_mut().ok_or(TransportError::RekeyInProgress)?;
-                if state.client_method_sent {
-                    return Ok(());
-                }
-                state
-                    .client_kex
-                    .as_ref()
-                    .ok_or(TransportError::RekeyInProgress)?
-                    .init_message()?
-            };
-        self.write_rekey_packet(&init_message, SSH_MSG_KEX_ECDH_INIT)?;
+        let init_message = if self
+            .write_buffer
+            .pending_message_type()
+            .is_some_and(|message| (30..=49).contains(&message))
+        {
+            self.write_buffer
+                .pending_payload()
+                .ok_or(TransportError::InvalidMessage)?
+        } else {
+            let state = self.rekey.as_mut().ok_or(TransportError::RekeyInProgress)?;
+            if state.client_method_sent {
+                return Ok(());
+            }
+            state
+                .method_payload
+                .as_ref()
+                .ok_or(TransportError::RekeyInProgress)?
+                .clone()
+        };
+        self.write_rekey_packet(&init_message, init_message[0])?;
         self.rekey
             .as_mut()
             .ok_or(TransportError::RekeyInProgress)?
@@ -948,9 +972,6 @@ where
         payload: &[u8],
         sequence: u32,
     ) -> Result<(), HandshakeError> {
-        if payload.first() != Some(&SSH_MSG_KEX_ECDH_REPLY) {
-            return Err(TransportError::UnexpectedMessage.into());
-        }
         let discard_guess = self
             .rekey
             .as_ref()
@@ -958,7 +979,7 @@ where
         if discard_guess {
             let disposition = self.sequence.observe_rekey_observation(
                 Direction::Inbound,
-                PacketObservation::guessed(SSH_MSG_KEX_ECDH_REPLY),
+                PacketObservation::guessed(payload[0]),
             )?;
             if disposition != PacketDisposition::Ignorable {
                 return Err(TransportError::UnexpectedMessage.into());
@@ -970,46 +991,41 @@ where
                 .peer_guessed = false;
             return Ok(());
         }
-        let (client_kexinit, peer_kexinit, protection) = {
+        let (algorithm, protection, group_received) = {
             let state = self.rekey.as_ref().ok_or(TransportError::RekeyInProgress)?;
             if !state.client_method_sent {
                 return Err(TransportError::UnexpectedMessage.into());
             }
             (
-                state.local_kexinit.encode()?,
-                state
-                    .peer_kexinit_payload
-                    .as_ref()
-                    .ok_or(TransportError::RekeyInProgress)?
-                    .clone(),
+                state.local_kexinit.kex_algorithms[0].clone(),
                 state.protection.ok_or(TransportError::RekeyInProgress)?,
+                state.group_received,
             )
         };
-        let context = KexContext::new(
-            &self.client_version,
-            &self.peer_version,
-            client_kexinit,
-            peer_kexinit,
-            KEX_MLKEM768X25519_SHA256,
-        )?;
+        if algorithm == crate::kex::modern::GEX && !group_received {
+            let state = self.rekey.as_mut().ok_or(TransportError::RekeyInProgress)?;
+            let init = state
+                .client_kex
+                .as_mut()
+                .ok_or(TransportError::RekeyInProgress)?
+                .accept_group(payload)?;
+            state.group_received = true;
+            state.method_payload = Some(init);
+            state.client_method_sent = false;
+            state.peer_guessed = false;
+            self.accept_rekey_kex_method(Direction::Inbound, 31, sequence)?;
+            self.send_client_method()?;
+            return Ok(());
+        }
         let client = self
             .rekey
             .as_mut()
             .and_then(|state| state.client_kex.take())
             .ok_or(TransportError::RekeyInProgress)?;
-        let completion = client.complete(&context, payload)?;
-        self.verify_rekey_host_key(
-            &completion.host_key_blob,
-            &completion.signature_blob,
-            &completion.exchange_hash,
-        )?;
-        self.accept_rekey_kex_method(Direction::Inbound, SSH_MSG_KEX_ECDH_REPLY, sequence)?;
-        let derived = derive_keys(
-            &completion.shared_secret,
-            &completion.exchange_hash,
-            &self.session_id,
-            protection.lengths,
-        )?;
+        let completion = client.complete(payload)?;
+        self.verify_rekey_host_key(&completion.host, &completion.signature, &completion.hash)?;
+        self.accept_rekey_kex_method(Direction::Inbound, payload[0], sequence)?;
+        let derived = completion.derive(&algorithm, &self.session_id, protection.lengths)?;
         let state = self.rekey.as_mut().ok_or(TransportError::RekeyInProgress)?;
         state.derived = Some(derived);
         state.peer_guessed = false;
@@ -1206,7 +1222,7 @@ where
         &self,
         host_key_blob: &[u8],
         signature_blob: &[u8],
-        exchange_hash: &[u8; 32],
+        exchange_hash: &[u8],
     ) -> Result<(), HandshakeError> {
         let trusted = self
             .verified_server_host_key
@@ -1277,19 +1293,15 @@ fn is_would_block(error: &HandshakeError) -> bool {
     )
 }
 
-fn rekey_kexinit(template: &KexInit) -> Result<KexInit, HandshakeError> {
+fn rekey_kexinit(template: &KexInit, algorithm: &str) -> Result<KexInit, HandshakeError> {
     if template.reserved != 0 || template.first_kex_packet_follows {
         return Err(HandshakeError::Kex(KexError::InvalidProposal));
     }
-    if !template
-        .kex_algorithms
-        .iter()
-        .any(|algorithm| algorithm == KEX_MLKEM768X25519_SHA256)
-    {
+    if !template.kex_algorithms.iter().any(|name| name == algorithm) {
         return Err(HandshakeError::UnsupportedAlgorithm);
     }
     let mut proposal = template.clone();
-    proposal.kex_algorithms = vec![KEX_MLKEM768X25519_SHA256.to_owned()];
+    proposal.kex_algorithms = vec![algorithm.to_owned()];
     proposal.first_kex_packet_follows = false;
     proposal.reserved = 0;
     getrandom::fill(&mut proposal.cookie).map_err(|_error| HandshakeError::EntropyFailure)?;
