@@ -18,11 +18,21 @@ use std::{
 struct GatedSocket {
     socket: TcpStream,
     allowance: Arc<AtomicUsize>,
+    read_allowance: Arc<AtomicUsize>,
 }
 
 impl Read for GatedSocket {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.socket.read(bytes)
+        let allowed = self.read_allowance.load(Ordering::SeqCst);
+        if allowed == 0 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let length = bytes.len().min(allowed);
+        let count = self.socket.read(&mut bytes[..length])?;
+        if allowed != usize::MAX {
+            self.read_allowance.fetch_sub(count, Ordering::SeqCst);
+        }
+        Ok(count)
     }
 }
 
@@ -77,10 +87,12 @@ fn owned_packet_defers_pong_without_losing_inbound_or_sequence()
     let stream = TcpStream::connect(address)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let allowance = Arc::new(AtomicUsize::new(usize::MAX));
+    let read_allowance = Arc::new(AtomicUsize::new(usize::MAX));
     let mut client = ClientConfig::new().connect(
         GatedSocket {
             socket: stream,
             allowance: Arc::clone(&allowance),
+            read_allowance: Arc::clone(&read_allowance),
         },
         |_| Ok::<(), ()>(()),
     )?;
@@ -105,10 +117,22 @@ fn owned_packet_defers_pong_without_losing_inbound_or_sequence()
         client.read_while_owned(&id)?,
         OwnedInbound::Payload(bytes) if bytes == b"\x5ebefore-ping"
     ));
-    assert!(matches!(
-        client.read_while_owned(&id)?,
-        OwnedInbound::PongDeferred
-    ));
+    let mut blocked_reads = 0;
+    loop {
+        read_allowance.store(1, Ordering::SeqCst);
+        match client.read_while_owned(&id) {
+            Ok(OwnedInbound::PongDeferred) => break,
+            Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                blocked_reads += 1;
+                assert!(blocked_reads < 256);
+                assert_eq!(client.inbound_sequence(), inbound + 1);
+                assert_eq!(client.outbound_sequence(), outbound);
+            }
+            other => panic!("unexpected partial ping result: {other:?}"),
+        }
+    }
+    assert!(blocked_reads > 1);
+    read_allowance.store(usize::MAX, Ordering::SeqCst);
     assert_eq!(client.inbound_sequence(), inbound + 2);
     assert_eq!(client.outbound_sequence(), outbound);
     assert!(matches!(
@@ -172,6 +196,7 @@ fn peer_rekey_while_owned_terminally_disables_protected_io()
         GatedSocket {
             socket: stream,
             allowance: Arc::clone(&allowance),
+            read_allowance: Arc::new(AtomicUsize::new(usize::MAX)),
         },
         |_| Ok::<(), ()>(()),
     )?;
