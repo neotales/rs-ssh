@@ -198,7 +198,12 @@ impl OpenSshPrivateKey {
     ///
     /// Returns [`OpenSshKeyError`] for an invalid container, unsupported
     /// cipher or KDF, a wrong passphrase, malformed private fields, invalid
-    /// padding, or mismatched public and private key components.
+    /// padding, or mismatched public and private key components. RSA component
+    /// magnitudes above 8192 bits are rejected as
+    /// [`OpenSshKeyError::InvalidPublicKey`] or
+    /// [`OpenSshKeyError::InvalidPrivateKey`] before RSA arithmetic. The
+    /// Docker client's 128-round bcrypt limit is its own policy, not a limit
+    /// imposed by this method.
     pub fn parse(bytes: &[u8], passphrase: &mut [u8]) -> Result<Self, OpenSshKeyError> {
         parse_openssh_private_key(bytes, passphrase)
     }
