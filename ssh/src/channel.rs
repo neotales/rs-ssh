@@ -802,6 +802,57 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// reported exactly once; stale or foreign IDs do not change the driver.
     /// Any other write error makes the driver terminal.
     ///
+    /// The driver does not expose its socket. Obtain a separate readiness
+    /// handle from the same socket **before** handing that socket to the SSH
+    /// transport. Wait for writable readiness after `WouldBlock`; do not spin.
+    /// A cloned handle can keep the underlying socket open after the driver is
+    /// dropped, so close that handle too on failure or cancellation.
+    ///
+    /// This example's `prepare` must authenticate and confirm the named channel
+    /// using the socket it receives. `wait_writable` must actually wait for
+    /// writable readiness without retaining another socket handle:
+    ///
+    /// ```no_run
+    /// use std::{io, net::TcpStream};
+    /// use neotales_ssh::{
+    ///     ClientTransport,
+    ///     channel::{ChannelConnection, ChannelId, OwnedChannelDriver, OwnedChannelError},
+    ///     transport::TransportError,
+    /// };
+    ///
+    /// fn send_one(
+    ///     socket: TcpStream,
+    ///     prepare: impl FnOnce(TcpStream)
+    ///         -> Result<ChannelConnection<ClientTransport<TcpStream>>, Box<dyn std::error::Error>>,
+    ///     channel: ChannelId,
+    ///     data: &[u8],
+    ///     mut wait_writable: impl FnMut(&TcpStream) -> io::Result<()>,
+    /// ) -> Result<OwnedChannelDriver<TcpStream>, Box<dyn std::error::Error>> {
+    ///     // Clone before prepare moves the socket into the SSH transport.
+    ///     let readiness = socket.try_clone()?;
+    ///     let connection = prepare(socket)?;
+    ///     // Both handles refer to the same socket; switch only after the
+    ///     // synchronous handshake, authentication and channel confirmation.
+    ///     readiness.set_nonblocking(true)?;
+    ///     let mut driver = OwnedChannelDriver::try_new(connection)
+    ///         .map_err(|_| io::Error::other("SSH transport is not idle"))?;
+    ///     let id = driver.admit_data(channel, data)?;
+    ///     loop {
+    ///         match driver.drive(&id) {
+    ///             Ok(()) => return Ok(driver),
+    ///             Err(OwnedChannelError::Transport(TransportError::Io(error)))
+    ///                 if error.kind() == io::ErrorKind::WouldBlock =>
+    ///             {
+    ///                 wait_writable(&readiness)?;
+    ///             }
+    ///             // Returning drops both driver and readiness, including after
+    ///             // a fatal transport error or a readiness-wait failure.
+    ///             Err(error) => return Err(error.into()),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns busy for a wrong ID, a retryable transport `WouldBlock`, or a
