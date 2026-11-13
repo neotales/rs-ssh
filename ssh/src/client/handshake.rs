@@ -721,8 +721,11 @@ where
     ///
     /// Returns a bounded [`HandshakeError`] for an unestablished transport,
     /// an active/reentrant cycle, an unsupported proposal, or a failure while
-    /// sending KEXINIT. Non-WouldBlock failures terminally disable the
-    /// transport.
+    /// sending KEXINIT. If an owned packet is active, returns
+    /// [`HandshakeError::Transport`] with [`TransportError::OwnedPacketState`]
+    /// without starting a rekey; drive the packet with its identifier or
+    /// discard the transport. Non-WouldBlock failures during the rekey
+    /// terminally disable the transport.
     pub fn begin_rekey(&mut self) -> Result<(), HandshakeError> {
         if self.owned_packet.is_some() {
             return Err(TransportError::OwnedPacketState.into());
@@ -854,7 +857,9 @@ where
 
     /// Advances an active rekey by one protected inbound protocol packet.
     ///
-    /// `Ok(false)` means that no rekey is active. Protected-packet bytes are
+    /// `Ok(false)` means the established transport had no active rekey and no
+    /// owned packet. `Ok(true)` means a rekey step made progress, not
+    /// necessarily that rekey remains active. Protected-packet bytes are
     /// retained by the transport, so a staged caller may retry after
     /// `WouldBlock` at any packet boundary or in the middle of a packet.
     /// Malformed packets, invalid ordering, cryptographic failures, and
@@ -864,7 +869,10 @@ where
     /// # Errors
     ///
     /// Returns a bounded [`HandshakeError`] for a transport, sequence,
-    /// proposal, host-key, or packet-protection failure.
+    /// proposal, host-key, or packet-protection failure. If an owned packet is
+    /// active, returns [`HandshakeError::Transport`] with
+    /// [`TransportError::OwnedPacketState`], even when no rekey is active;
+    /// drive the packet with its identifier or discard the transport.
     pub fn advance_rekey(&mut self) -> Result<bool, HandshakeError> {
         if self.owned_packet.is_some() {
             return Err(TransportError::OwnedPacketState.into());

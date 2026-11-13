@@ -887,6 +887,37 @@ where
     /// identifier and drive it to completion, or discard the transport; losing
     /// every identifier leaves the transport permanently busy.
     ///
+    /// A nonblocking caller must wait for writable readiness after
+    /// `WouldBlock`, rather than immediately retrying in a busy loop. This
+    /// example takes ownership of the transport so any error, including a
+    /// failure while waiting, discards it:
+    ///
+    /// ```no_run
+    /// use std::io::{self, Read, Write};
+    /// use neotales_ssh::{ClientTransport, transport::TransportError};
+    ///
+    /// fn send_owned<S: Read + Write>(
+    ///     mut transport: ClientTransport<S>,
+    ///     payload: &[u8],
+    ///     mut wait_writable: impl FnMut() -> io::Result<()>,
+    /// ) -> Result<ClientTransport<S>, Box<dyn std::error::Error>> {
+    ///     let id = transport.start_owned_packet(payload)?;
+    ///     loop {
+    ///         match transport.drive_owned_packet(&id) {
+    ///             Ok(()) => return Ok(transport),
+    ///             Err(TransportError::Io(error))
+    ///                 if error.kind() == io::ErrorKind::WouldBlock =>
+    ///             {
+    ///                 wait_writable()?;
+    ///             }
+    ///             // Any other error ends this attempt. Dropping transport
+    ///             // prevents further use of an incomplete packet.
+    ///             Err(error) => return Err(error.into()),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Refuses an unestablished or busy transport, an active rekey, or an
@@ -972,8 +1003,10 @@ where
     ///
     /// Returns [`TransportError::NotEstablished`] before NEWKEYS, protection or
     /// framing errors for an invalid payload, and an I/O error if the complete
-    /// packet cannot be written. The sequence number is committed only after
-    /// `write_all` succeeds.
+    /// packet cannot be written. Returns [`TransportError::OwnedPacketState`]
+    /// while an owned packet is active; drive it with its identifier or
+    /// discard the transport. The sequence number is committed only after the
+    /// whole protected packet is written.
     pub fn write_payload(&mut self, payload: &[u8]) -> Result<(), TransportError> {
         if self.owned_packet.is_some() {
             return Err(TransportError::OwnedPacketState);
@@ -1012,8 +1045,10 @@ where
     ///
     /// Returns [`TransportError::NotEstablished`] before NEWKEYS and a typed
     /// framing, protection, I/O, sequence, or rekey error for an invalid
-    /// packet. Once a peer rekey has started, callers using a nonblocking
-    /// stream should resume it with [`ClientTransport::advance_rekey`].
+    /// packet. Returns [`TransportError::OwnedPacketState`] while an owned
+    /// packet is active; drive it with its identifier or discard the transport.
+    /// Once a peer rekey has started, callers using a nonblocking stream should
+    /// resume it with [`ClientTransport::advance_rekey`].
     pub fn read_payload(&mut self) -> Result<Vec<u8>, TransportError> {
         if self.owned_packet.is_some() {
             return Err(TransportError::OwnedPacketState);

@@ -8,6 +8,22 @@ local commands or accept a host key by default.
 user, no port means 22, authentication tries the default `ssh-agent`, and an
 unknown host key is rejected.
 
+## Owned-packet compatibility change
+
+`TransportError::OwnedPacketState` is a new variant of the public exhaustive
+`transport::TransportError` enum. Existing exhaustive matches must add an arm
+for it (or a suitable fallback), so this is a source-breaking API change even
+for callers that do not use owned packets. When an owned packet is active,
+`read_payload`, `write_payload`, `begin_rekey`, and `advance_rekey` refuse to
+proceed. Retain the packet ID and drive it to completion, or discard the
+transport. The owned-packet example in `ClientTransport::start_owned_packet`
+shows nonblocking retry and error handling.
+
+The crate manifest currently says `0.0.0-alpha.2`. This notice does not assign
+a release version: the repository material inspected does not establish a
+versioning policy for `neotales-ssh`, so release status and treatment remain
+to be decided before any publication of this change.
+
 ## Opening a connection
 
 The builder is for anything the destination string cannot express: an explicit
