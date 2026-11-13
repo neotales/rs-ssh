@@ -484,7 +484,13 @@ impl Drop for SharedSecret {
 /// A future finite-field group can implement this trait without changing the
 /// transcript, session-ID, or key-derivation code. Its init/reply codecs decide
 /// whether their RFC message contains an ephemeral public value.
-pub(crate) trait KeyExchange {
+///
+/// `Send` is required because a negotiated mechanism is retained in the
+/// transport's rekey state. That state lives inside a client connection which a
+/// caller may build on one thread and drive from another — the Docker facade's
+/// managed transport, for example, establishes the connection on a blocking
+/// worker and then polls it from the async runtime.
+pub(crate) trait KeyExchange: Send {
     /// Returns the negotiated SSH algorithm name represented by this mechanism.
     fn name(&self) -> &'static str;
 
