@@ -724,6 +724,9 @@ where
     /// sending KEXINIT. Non-WouldBlock failures terminally disable the
     /// transport.
     pub fn begin_rekey(&mut self) -> Result<(), HandshakeError> {
+        if self.owned_packet.is_some() {
+            return Err(TransportError::OwnedPacketState.into());
+        }
         if !self.established {
             return Err(TransportError::NotEstablished.into());
         }
@@ -863,6 +866,9 @@ where
     /// Returns a bounded [`HandshakeError`] for a transport, sequence,
     /// proposal, host-key, or packet-protection failure.
     pub fn advance_rekey(&mut self) -> Result<bool, HandshakeError> {
+        if self.owned_packet.is_some() {
+            return Err(TransportError::OwnedPacketState.into());
+        }
         if !self.established {
             return Err(TransportError::NotEstablished.into());
         }

@@ -584,6 +584,243 @@ where
 }
 
 #[derive(Default)]
+struct WriteGate {
+    active: bool,
+    remaining: usize,
+    fatal: bool,
+}
+
+struct WriteGated<S> {
+    inner: S,
+    gate: Rc<RefCell<WriteGate>>,
+}
+
+impl<S: Read> Read for WriteGated<S> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(bytes)
+    }
+}
+
+impl<S: Write> Write for WriteGated<S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut gate = self.gate.borrow_mut();
+        if gate.fatal {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
+        if gate.active && gate.remaining == 0 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let length = if gate.active {
+            gate.remaining.min(bytes.len())
+        } else {
+            bytes.len()
+        };
+        let count = self.inner.write(&bytes[..length])?;
+        if gate.active {
+            gate.remaining -= count;
+        }
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[test]
+fn owned_packet_survives_every_byte_boundary_and_guards_legacy_io()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut peer, config) = peer_and_config(
+        CURVE25519_SHA256,
+        AES128_CTR,
+        AES128_CTR,
+        HMAC_SHA2_256,
+        HMAC_SHA2_256,
+        true,
+        171,
+        PRE_BANNER,
+        None,
+    )?;
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let stream = WriteGated {
+        inner: peer.client_stream.clone(),
+        gate: Rc::clone(&gate),
+    };
+    let mut transport = config.connect(stream, |_| Ok::<(), Infallible>(()))?;
+    peer.accept_client_newkeys()?;
+    assert!(matches!(
+        transport.start_owned_packet(&[20]),
+        Err(TransportError::InvalidMessage)
+    ));
+    assert_eq!(peer.client_to_server.borrow().len(), 0);
+    let id = transport.start_owned_packet(CLIENT_PAYLOAD)?;
+    assert_eq!(peer.client_to_server.borrow().len(), 0);
+    assert!(matches!(
+        transport.start_owned_packet(b"other"),
+        Err(TransportError::OwnedPacketState)
+    ));
+    assert!(matches!(
+        transport.write_payload(b"other"),
+        Err(TransportError::OwnedPacketState)
+    ));
+    assert!(matches!(
+        transport.read_payload(),
+        Err(TransportError::OwnedPacketState)
+    ));
+    assert!(matches!(
+        transport.begin_rekey(),
+        Err(HandshakeError::Transport(TransportError::OwnedPacketState))
+    ));
+    assert!(matches!(
+        transport.advance_rekey(),
+        Err(HandshakeError::Transport(TransportError::OwnedPacketState))
+    ));
+    gate.borrow_mut().active = true;
+    let mut blocked = 0;
+    loop {
+        gate.borrow_mut().remaining = 1;
+        match transport.drive_owned_packet(&id) {
+            Ok(()) => break,
+            Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                blocked += 1;
+                assert_eq!(transport.outbound_sequence(), 0);
+                assert!(blocked < 256);
+            }
+            other => panic!("unexpected owned-packet result: {other:?}"),
+        }
+    }
+    assert!(blocked > 1);
+    assert_eq!(transport.outbound_sequence(), 1);
+    assert_eq!(peer.read_client_payload()?, CLIENT_PAYLOAD);
+    assert!(matches!(
+        transport.drive_owned_packet(&id),
+        Err(TransportError::OwnedPacketState)
+    ));
+    gate.borrow_mut().active = false;
+    let next = transport.start_owned_packet(PEER_PAYLOAD)?;
+    assert!(matches!(
+        transport.drive_owned_packet(&id),
+        Err(TransportError::OwnedPacketState)
+    ));
+    transport.drive_owned_packet(&next)?;
+    assert_eq!(peer.read_client_payload()?, PEER_PAYLOAD);
+    assert_eq!(transport.outbound_sequence(), 2);
+    transport.write_payload(PEER_PAYLOAD)?;
+    assert_eq!(peer.read_client_payload()?, PEER_PAYLOAD);
+    assert_eq!(transport.outbound_sequence(), 3);
+    Ok(())
+}
+
+#[test]
+fn owned_packet_refuses_existing_legacy_partial_packet() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut peer, config) = peer_and_config(
+        CURVE25519_SHA256,
+        AES128_CTR,
+        AES128_CTR,
+        HMAC_SHA2_256,
+        HMAC_SHA2_256,
+        true,
+        174,
+        PRE_BANNER,
+        None,
+    )?;
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let stream = WriteGated {
+        inner: peer.client_stream.clone(),
+        gate: Rc::clone(&gate),
+    };
+    let mut transport = config.connect(stream, |_| Ok::<(), Infallible>(()))?;
+    peer.accept_client_newkeys()?;
+    {
+        let mut gate = gate.borrow_mut();
+        gate.active = true;
+        gate.remaining = 1;
+    }
+    assert!(
+        matches!(transport.write_payload(CLIENT_PAYLOAD), Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+    );
+    assert!(matches!(
+        transport.start_owned_packet(PEER_PAYLOAD),
+        Err(TransportError::OwnedPacketState)
+    ));
+    assert_eq!(transport.outbound_sequence(), 0);
+    gate.borrow_mut().active = false;
+    transport.write_payload(CLIENT_PAYLOAD)?;
+    assert_eq!(peer.read_client_payload()?, CLIENT_PAYLOAD);
+    assert_eq!(transport.outbound_sequence(), 1);
+    Ok(())
+}
+
+#[test]
+fn owned_packet_rejects_foreign_ids_and_closes_on_fatal_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut first_peer, first_config) = peer_and_config(
+        CURVE25519_SHA256,
+        AES128_CTR,
+        AES128_CTR,
+        HMAC_SHA2_256,
+        HMAC_SHA2_256,
+        true,
+        172,
+        PRE_BANNER,
+        None,
+    )?;
+    let (mut second_peer, second_config) = peer_and_config(
+        CURVE25519_SHA256,
+        AES128_CTR,
+        AES128_CTR,
+        HMAC_SHA2_256,
+        HMAC_SHA2_256,
+        true,
+        173,
+        PRE_BANNER,
+        None,
+    )?;
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let mut first = first_config.connect(
+        WriteGated {
+            inner: first_peer.client_stream.clone(),
+            gate: Rc::clone(&gate),
+        },
+        |_| Ok::<(), Infallible>(()),
+    )?;
+    let mut second = second_config.connect(second_peer.client_stream.clone(), |_| {
+        Ok::<(), Infallible>(())
+    })?;
+    first_peer.accept_client_newkeys()?;
+    second_peer.accept_client_newkeys()?;
+    let first_id = first.start_owned_packet(CLIENT_PAYLOAD)?;
+    let second_id = second.start_owned_packet(PEER_PAYLOAD)?;
+    assert!(matches!(
+        first.drive_owned_packet(&second_id),
+        Err(TransportError::OwnedPacketState)
+    ));
+    assert_eq!(first.outbound_sequence(), 0);
+    {
+        let mut gate = gate.borrow_mut();
+        gate.active = true;
+        gate.remaining = 1;
+    }
+    assert!(
+        matches!(first.drive_owned_packet(&first_id), Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+    );
+    assert_eq!(first.outbound_sequence(), 0);
+    gate.borrow_mut().fatal = true;
+    assert!(
+        matches!(first.drive_owned_packet(&first_id), Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+    );
+    assert!(!first.is_established());
+    assert_eq!(first.outbound_sequence(), 0);
+    assert!(matches!(
+        first.drive_owned_packet(&first_id),
+        Err(TransportError::OwnedPacketState)
+    ));
+    second.drive_owned_packet(&second_id)?;
+    assert_eq!(second_peer.read_client_payload()?, PEER_PAYLOAD);
+    Ok(())
+}
+
+#[derive(Default)]
 struct ChunkGate {
     active: bool,
     remaining: usize,

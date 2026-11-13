@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use neotales_ssh::{Error, MAX_PACKET_CONTENT, build_packet, decode_packet};
 
@@ -97,6 +98,8 @@ pub enum TransportError {
     NotEstablished,
     /// Application or ordinary payload I/O was attempted during a rekey.
     RekeyInProgress,
+    /// An owned outbound packet is active, or its identifier is invalid.
+    OwnedPacketState,
     /// The peer sent `SSH_MSG_DISCONNECT` during the initial handshake.
     PeerDisconnected,
     /// The operating system random-number source failed.
@@ -126,6 +129,7 @@ impl fmt::Display for TransportError {
             Self::RekeyInProgress => {
                 formatter.write_str("SSH transport cannot exchange application data during rekey")
             }
+            Self::OwnedPacketState => formatter.write_str("SSH owned packet state is invalid"),
             Self::PeerDisconnected => formatter.write_str("SSH peer disconnected during handshake"),
             Self::EntropyFailure => {
                 formatter.write_str("SSH transport random-number generation failed")
@@ -147,11 +151,19 @@ impl std::error::Error for TransportError {
             | Self::InvalidMessage
             | Self::NotEstablished
             | Self::RekeyInProgress
+            | Self::OwnedPacketState
             | Self::PeerDisconnected
             | Self::EntropyFailure => None,
         }
     }
 }
+
+/// Identifies one owned outbound packet on the transport that created it.
+///
+/// The identity remains distinct from every other live or retained identifier,
+/// even across transports. It does not reveal packet contents.
+#[derive(Clone, Debug)]
+pub struct OwnedPacketId(Arc<()>);
 
 impl From<io::Error> for TransportError {
     fn from(error: io::Error) -> Self {
@@ -704,6 +716,7 @@ pub struct ClientTransport<S> {
     server_sig_algs: Option<Vec<String>>,
     pub(crate) ext_info: ExtensionState,
     pending_transport_reply: Option<Vec<u8>>,
+    pub(crate) owned_packet: Option<OwnedPacketId>,
     pub(crate) write_protector: Option<PacketProtector>,
     pub(crate) read_protector: Option<PacketProtector>,
     pub(crate) read_buffer: ProtectedReadBuffer,
@@ -756,6 +769,7 @@ where
                 server_sig_algs: None,
                 ext_info: ExtensionState::Disabled,
                 pending_transport_reply: None,
+                owned_packet: None,
                 write_protector: None,
                 read_protector: None,
                 read_buffer: ProtectedReadBuffer::default(),
@@ -865,6 +879,93 @@ where
         self.rekey_terminal()
     }
 
+    /// Seals one ordinary payload and gives its owner an opaque identifier.
+    ///
+    /// No bytes are written until [`Self::drive_owned_packet`]. While this
+    /// packet is active, ordinary reads, writes and rekeys are refused. Rekey
+    /// message numbers are not ordinary payloads. The caller must retain an
+    /// identifier and drive it to completion, or discard the transport; losing
+    /// every identifier leaves the transport permanently busy.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an unestablished or busy transport, an active rekey, or an
+    /// invalid payload. A protection failure terminally disables protected I/O.
+    pub fn start_owned_packet(&mut self, payload: &[u8]) -> Result<OwnedPacketId, TransportError> {
+        if !self.established {
+            return Err(TransportError::NotEstablished);
+        }
+        if self.owned_packet.is_some()
+            || self.write_buffer.is_pending()
+            || self.pending_transport_reply.is_some()
+        {
+            return Err(TransportError::OwnedPacketState);
+        }
+        if self.rekey_active() {
+            return Err(TransportError::RekeyInProgress);
+        }
+        if payload.is_empty() || matches!(payload[0], 20 | 21 | 30..=49) {
+            return Err(TransportError::InvalidMessage);
+        }
+        let sequence = self.sequence.outbound_sequence();
+        if sequence == u32::MAX {
+            return Err(SequenceError::CounterExhausted.into());
+        }
+        let protector = self
+            .write_protector
+            .as_mut()
+            .ok_or(TransportError::NotEstablished)?;
+        if let Err(error) = self
+            .write_buffer
+            .prepare(protector, sequence, payload, None)
+        {
+            return Err(self.fail_protected_write(error));
+        }
+        let id = OwnedPacketId(Arc::new(()));
+        self.owned_packet = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Continues the exact ciphertext associated with `id`.
+    ///
+    /// `WouldBlock` leaves the packet active. Completion commits its sequence
+    /// exactly once and invalidates the identifier. A different or stale
+    /// identifier has no effect. Other write failures disable protected I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a state error for an invalid identifier or an I/O, protection,
+    /// or sequence error when the packet cannot be completed.
+    pub fn drive_owned_packet(&mut self, id: &OwnedPacketId) -> Result<(), TransportError> {
+        if !self
+            .owned_packet
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
+        {
+            return Err(TransportError::OwnedPacketState);
+        }
+        match self.write_buffer.flush(&mut self.stream) {
+            Ok(()) => {}
+            Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(TransportError::Io(error));
+            }
+            Err(error) => return Err(self.fail_protected_write(error)),
+        }
+        let sequence = self.sequence.outbound_sequence();
+        let committed = match self.sequence.commit_outbound() {
+            Ok(committed) => committed,
+            Err(error) => return Err(self.fail_protected_write(error.into())),
+        };
+        if committed != sequence {
+            return Err(self.fail_protected_write(TransportError::InvalidMessage));
+        }
+        if let Err(error) = self.write_buffer.acknowledge(sequence) {
+            return Err(self.fail_protected_write(error));
+        }
+        self.owned_packet = None;
+        Ok(())
+    }
+
     /// Writes one protected payload and commits its outbound sequence number.
     ///
     /// # Errors
@@ -874,6 +975,9 @@ where
     /// packet cannot be written. The sequence number is committed only after
     /// `write_all` succeeds.
     pub fn write_payload(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+        if self.owned_packet.is_some() {
+            return Err(TransportError::OwnedPacketState);
+        }
         if self.rekey.is_some() {
             return Err(TransportError::RekeyInProgress);
         }
@@ -911,6 +1015,9 @@ where
     /// packet. Once a peer rekey has started, callers using a nonblocking
     /// stream should resume it with [`ClientTransport::advance_rekey`].
     pub fn read_payload(&mut self) -> Result<Vec<u8>, TransportError> {
+        if self.owned_packet.is_some() {
+            return Err(TransportError::OwnedPacketState);
+        }
         if self.rekey.is_some() {
             return Err(TransportError::RekeyInProgress);
         }
@@ -1186,6 +1293,7 @@ where
     }
 
     fn fail_protected_write(&mut self, error: TransportError) -> TransportError {
+        self.owned_packet = None;
         self.pending_transport_reply = None;
         self.write_buffer.abort();
         self.read_buffer.clear();
