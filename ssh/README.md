@@ -19,6 +19,13 @@ proceed. Retain the packet ID and drive it to completion, or discard the
 transport. The owned-packet example in `ClientTransport::start_owned_packet`
 shows nonblocking retry and error handling.
 
+For an authenticated connection, `read_while_owned` permits one inbound packet
+per call. It defers at most one transport PONG behind the owned packet and
+refuses further inbound reads until that PONG is sent. Finish the owner, then
+call `drive_deferred_pong` before a new write or local rekey. A peer rekey or
+extension message received through this limited path terminally disables
+protected I/O; this is not yet a full-duplex rekey scheduler.
+
 The crate manifest currently says `0.0.0-alpha.2`. This notice does not assign
 a release version: the repository material inspected does not establish a
 versioning policy for `neotales-ssh`, so release status and treatment remain

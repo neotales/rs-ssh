@@ -165,6 +165,15 @@ impl std::error::Error for TransportError {
 #[derive(Clone, Debug)]
 pub struct OwnedPacketId(Arc<()>);
 
+/// One bounded inbound step while an owned outbound packet is pending.
+#[derive(Debug)]
+pub enum OwnedInbound {
+    /// An ordinary authenticated payload, with its inbound sequence committed.
+    Payload(Vec<u8>),
+    /// A transport ping was consumed and its pong is waiting behind the owner.
+    PongDeferred,
+}
+
 impl From<io::Error> for TransportError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
@@ -716,6 +725,7 @@ pub struct ClientTransport<S> {
     server_sig_algs: Option<Vec<String>>,
     pub(crate) ext_info: ExtensionState,
     pending_transport_reply: Option<Vec<u8>>,
+    pub(crate) deferred_owned_pong: bool,
     pub(crate) owned_packet: Option<OwnedPacketId>,
     pub(crate) write_protector: Option<PacketProtector>,
     pub(crate) read_protector: Option<PacketProtector>,
@@ -769,6 +779,7 @@ where
                 server_sig_algs: None,
                 ext_info: ExtensionState::Disabled,
                 pending_transport_reply: None,
+                deferred_owned_pong: false,
                 owned_packet: None,
                 write_protector: None,
                 read_protector: None,
@@ -882,8 +893,9 @@ where
     /// Seals one ordinary payload and gives its owner an opaque identifier.
     ///
     /// No bytes are written until [`Self::drive_owned_packet`]. While this
-    /// packet is active, ordinary reads, writes and rekeys are refused. Rekey
-    /// message numbers are not ordinary payloads. The caller must retain an
+    /// packet is active, ordinary reads, writes and rekeys are refused.
+    /// [`Self::read_while_owned`] provides a limited authenticated inbound
+    /// path. Rekey message numbers are not ordinary payloads. The caller must retain an
     /// identifier and drive it to completion, or discard the transport; losing
     /// every identifier leaves the transport permanently busy.
     ///
@@ -997,6 +1009,101 @@ where
         Ok(())
     }
 
+    /// Reads at most one packet while the identified outbound packet is owned.
+    ///
+    /// Only authenticated transports may use this method. An inbound ping
+    /// retains one pong behind the owned packet; no further inbound packet can
+    /// be consumed until that pong is sent. Peer rekey and extension messages
+    /// are not supported in this phase and terminally disable protected I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a state error for an invalid owner or a deferred pong, an I/O
+    /// error on incomplete input, or a terminal protocol/protection error.
+    pub fn read_while_owned(&mut self, id: &OwnedPacketId) -> Result<OwnedInbound, TransportError> {
+        if !self
+            .owned_packet
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
+            || self.pending_transport_reply.is_some()
+        {
+            return Err(TransportError::OwnedPacketState);
+        }
+        if !self.authenticated {
+            return Err(TransportError::InvalidMessage);
+        }
+        let (payload, _sequence) = match self.read_protected_packet() {
+            Ok(packet) => packet,
+            Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(TransportError::Io(error));
+            }
+            Err(error) => return Err(self.fail_protected_write(error)),
+        };
+        let Some(message) = payload.first().copied() else {
+            return Err(self.fail_protected_write(TransportError::InvalidMessage));
+        };
+        if matches!(message, 20 | 21 | 30..=49)
+            || message == neotales_ssh::ext_info::SSH_MSG_EXT_INFO
+        {
+            return Err(self.fail_protected_write(TransportError::UnexpectedMessage));
+        }
+        let pong = if message == neotales_ssh::keepalive::SSH_MSG_PING {
+            match neotales_ssh::keepalive::TransportPing::decode(&payload) {
+                Ok(neotales_ssh::keepalive::TransportPing::Ping(data)) => {
+                    match neotales_ssh::keepalive::TransportPing::Pong(data).encode() {
+                        Ok(pong) => Some(pong),
+                        Err(error) => return Err(self.fail_protected_write(error.into())),
+                    }
+                }
+                _ => return Err(self.fail_protected_write(TransportError::InvalidMessage)),
+            }
+        } else {
+            None
+        };
+        if let Err(error) = self.sequence.commit_inbound() {
+            return Err(self.fail_protected_write(error.into()));
+        }
+        self.ext_info = ExtensionState::Complete;
+        if let Some(pong) = pong {
+            self.pending_transport_reply = Some(pong);
+            self.deferred_owned_pong = true;
+            Ok(OwnedInbound::PongDeferred)
+        } else {
+            Ok(OwnedInbound::Payload(payload))
+        }
+    }
+
+    /// Writes a pong deferred by [`Self::read_while_owned`].
+    ///
+    /// The owned packet must finish first. Retry this same operation after
+    /// `WouldBlock`; a fatal write disables protected I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a state error if no deferred pong is ready or the owner is still
+    /// active, or a transport error if the pong cannot be written.
+    pub fn drive_deferred_pong(&mut self) -> Result<(), TransportError> {
+        if self.owned_packet.is_some() || !self.deferred_owned_pong {
+            return Err(TransportError::OwnedPacketState);
+        }
+        let reply = self
+            .pending_transport_reply
+            .take()
+            .ok_or(TransportError::OwnedPacketState)?;
+        match self.write_payload_inner(&reply) {
+            Ok(()) => {
+                self.deferred_owned_pong = false;
+                Ok(())
+            }
+            Err(error) => {
+                if self.established {
+                    self.pending_transport_reply = Some(reply);
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Writes one protected payload and commits its outbound sequence number.
     ///
     /// # Errors
@@ -1004,13 +1111,18 @@ where
     /// Returns [`TransportError::NotEstablished`] before NEWKEYS, protection or
     /// framing errors for an invalid payload, and an I/O error if the complete
     /// packet cannot be written. Returns [`TransportError::OwnedPacketState`]
-    /// while an owned packet is active; drive it with its identifier or
-    /// discard the transport. The sequence number is committed only after the
-    /// whole protected packet is written.
+    /// while an owned packet or its deferred pong is active; drive the owned
+    /// packet and then [`Self::drive_deferred_pong`], or discard the transport.
+    /// The sequence number is committed only after the whole protected packet
+    /// is written.
     pub fn write_payload(&mut self, payload: &[u8]) -> Result<(), TransportError> {
-        if self.owned_packet.is_some() {
+        if self.owned_packet.is_some() || self.deferred_owned_pong {
             return Err(TransportError::OwnedPacketState);
         }
+        self.write_payload_inner(payload)
+    }
+
+    fn write_payload_inner(&mut self, payload: &[u8]) -> Result<(), TransportError> {
         if self.rekey.is_some() {
             return Err(TransportError::RekeyInProgress);
         }
@@ -1047,6 +1159,8 @@ where
     /// framing, protection, I/O, sequence, or rekey error for an invalid
     /// packet. Returns [`TransportError::OwnedPacketState`] while an owned
     /// packet is active; drive it with its identifier or discard the transport.
+    /// After the owner completes, a pong deferred by [`Self::read_while_owned`]
+    /// is written before the next read; `WouldBlock` preserves it for retry.
     /// Once a peer rekey has started, callers using a nonblocking stream should
     /// resume it with [`ClientTransport::advance_rekey`].
     pub fn read_payload(&mut self) -> Result<Vec<u8>, TransportError> {
@@ -1055,6 +1169,9 @@ where
         }
         if self.rekey.is_some() {
             return Err(TransportError::RekeyInProgress);
+        }
+        if self.deferred_owned_pong {
+            self.drive_deferred_pong()?;
         }
         loop {
             if let Some(reply) = self.pending_transport_reply.take()
@@ -1329,6 +1446,7 @@ where
 
     fn fail_protected_write(&mut self, error: TransportError) -> TransportError {
         self.owned_packet = None;
+        self.deferred_owned_pong = false;
         self.pending_transport_reply = None;
         self.write_buffer.abort();
         self.read_buffer.clear();

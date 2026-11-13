@@ -721,13 +721,13 @@ where
     ///
     /// Returns a bounded [`HandshakeError`] for an unestablished transport,
     /// an active/reentrant cycle, an unsupported proposal, or a failure while
-    /// sending KEXINIT. If an owned packet is active, returns
+    /// sending KEXINIT. If an owned packet or its deferred pong is active, returns
     /// [`HandshakeError::Transport`] with [`TransportError::OwnedPacketState`]
-    /// without starting a rekey; drive the packet with its identifier or
+    /// without starting a rekey; drive the packet and its deferred pong, or
     /// discard the transport. Non-WouldBlock failures during the rekey
     /// terminally disable the transport.
     pub fn begin_rekey(&mut self) -> Result<(), HandshakeError> {
-        if self.owned_packet.is_some() {
+        if self.owned_packet.is_some() || self.deferred_owned_pong {
             return Err(TransportError::OwnedPacketState.into());
         }
         if !self.established {
@@ -858,7 +858,7 @@ where
     /// Advances an active rekey by one protected inbound protocol packet.
     ///
     /// `Ok(false)` means the established transport had no active rekey and no
-    /// owned packet. `Ok(true)` means a rekey step made progress, not
+    /// owned packet or deferred pong. `Ok(true)` means a rekey step made progress, not
     /// necessarily that rekey remains active. Protected-packet bytes are
     /// retained by the transport, so a staged caller may retry after
     /// `WouldBlock` at any packet boundary or in the middle of a packet.
@@ -870,11 +870,11 @@ where
     ///
     /// Returns a bounded [`HandshakeError`] for a transport, sequence,
     /// proposal, host-key, or packet-protection failure. If an owned packet is
-    /// active, returns [`HandshakeError::Transport`] with
+    /// or a deferred pong is active, returns [`HandshakeError::Transport`] with
     /// [`TransportError::OwnedPacketState`], even when no rekey is active;
-    /// drive the packet with its identifier or discard the transport.
+    /// drive the packet and its deferred pong, or discard the transport.
     pub fn advance_rekey(&mut self) -> Result<bool, HandshakeError> {
-        if self.owned_packet.is_some() {
+        if self.owned_packet.is_some() || self.deferred_owned_pong {
             return Err(TransportError::OwnedPacketState.into());
         }
         if !self.established {
