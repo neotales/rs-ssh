@@ -1265,12 +1265,28 @@ where
     }
 
     /// Reads one payload and returns its event, or `None` when it carried none.
+    ///
+    /// This is the legacy read adapter: exactly one transport read, then
+    /// exactly one call to [`Self::dispatch_decoded_payload`]. Routing lives in
+    /// the helper so it does not depend on how the payload arrived.
     fn dispatch_payload(&mut self) -> Result<Option<ChannelEvent>, ChannelError> {
         let payload = self
             .transport
             .read_channel_payload()
             .map_err(|_error| ChannelError::Transport)?;
-        let message = parse_message(&payload)?;
+        self.dispatch_decoded_payload(&payload)
+    }
+
+    /// Parses and routes one already-read payload.
+    ///
+    /// The payload is parsed completely before any channel state is mutated.
+    /// Returns `None` only for a connection-level message that carries no
+    /// event.
+    fn dispatch_decoded_payload(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<Option<ChannelEvent>, ChannelError> {
+        let message = parse_message(payload)?;
         let event = match message {
             ParsedMessage::Open(request) => self.apply_open(request),
             ParsedMessage::Confirmation {
