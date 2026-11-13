@@ -32,7 +32,7 @@ use neotales_ssh::{Error as WireError, MAX_PACKET_CONTENT, MIN_PADDING, Reader, 
 use crate::cipher::AES_BLOCK_SIZE;
 use crate::client::ClientTransport;
 use crate::server::ServerTransport;
-use crate::transport::{OwnedPacketId, TransportError};
+use crate::transport::{OwnedInbound, OwnedPacketId, TransportError};
 
 /// SSH message number for `SSH_MSG_CHANNEL_OPEN`.
 pub const SSH_MSG_CHANNEL_OPEN: u8 = 90;
@@ -633,9 +633,10 @@ pub struct ChannelConnection<T> {
 /// Failure of the single-packet owned channel writer.
 #[derive(Debug)]
 pub enum OwnedChannelError {
-    /// A packet is already admitted, or a packet identifier is stale or foreign.
+    /// A packet is already admitted, a packet identifier is stale or foreign,
+    /// or an inbound obligation is outstanding.
     Busy,
-    /// A terminal transport failure has made this driver unusable.
+    /// A terminal transport or channel failure has made this driver unusable.
     Failed,
     /// Channel validation or flow control rejected the request.
     Channel(ChannelError),
@@ -646,7 +647,9 @@ pub enum OwnedChannelError {
 impl fmt::Display for OwnedChannelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Busy => formatter.write_str("an owned channel packet is busy or unknown"),
+            Self::Busy => {
+                formatter.write_str("the owned channel driver is busy with a packet or obligation")
+            }
             Self::Failed => formatter.write_str("the owned channel driver has failed"),
             Self::Channel(error) => write!(formatter, "SSH channel error: {error}"),
             Self::Transport(error) => write!(formatter, "SSH transport error: {error}"),
@@ -668,6 +671,31 @@ impl std::error::Error for OwnedChannelError {
 #[derive(Clone, Debug)]
 pub struct OwnedChannelWriteId(OwnedPacketId);
 
+/// One bounded result from [`OwnedChannelDriver::read_inbound`].
+#[derive(Debug)]
+pub enum OwnedChannelInbound {
+    /// One complete channel event was decoded and delivered unchanged.
+    ///
+    /// The driver never answers a request, never sends a close, and never
+    /// adjusts a window on the caller's behalf. A `Request` or
+    /// `GlobalRequest` that asked for a reply, a channel `OpenRequest`, and a
+    /// `Close` this side has not already sent are obligations the driver
+    /// cannot discharge; see [`OwnedChannelDriver::read_inbound`].
+    Event(ChannelEvent),
+    /// One authenticated payload was consumed and carried no channel event.
+    ///
+    /// This is the result for the RFC 4253 §11 messages the legacy dispatcher
+    /// also drops: `SSH_MSG_IGNORE`, `SSH_MSG_DEBUG` and
+    /// `SSH_MSG_UNIMPLEMENTED`.
+    Consumed,
+    /// An inbound transport ping was consumed and its pong is owed.
+    ///
+    /// No further inbound read is permitted until the admitted data packet
+    /// completes and [`OwnedChannelDriver::drive_deferred_pong`] writes the
+    /// pong. The connection cannot be released while the pong is owed.
+    PongDeferred,
+}
+
 /// Owns a channel connection while admitting and driving one data packet.
 ///
 /// No mutable reference to the connection or transport is exposed. Admission
@@ -677,8 +705,11 @@ pub struct OwnedChannelWriteId(OwnedPacketId);
 /// driver cannot release its connection. Dropping the driver drops its stream,
 /// although other independently held stream handles may remain open.
 ///
-/// This is not a full-duplex scheduler: it does not dispatch inbound traffic,
-/// answer control requests, or handle rekey while a packet is outstanding.
+/// [`Self::read_inbound`] adds one opt-in inbound step while the admitted
+/// packet is active. It is deliberately not a full-duplex scheduler: it does
+/// not loop, does not answer control requests, does not reply to a peer close,
+/// and does not handle rekey. An obligation it cannot discharge blocks further
+/// reads and release, so the caller drops the driver instead.
 ///
 /// The wrapped connection's mutable transport cannot be reached through the
 /// driver:
@@ -691,11 +722,16 @@ pub struct OwnedChannelWriteId(OwnedPacketId);
 ///     let _transport = driver.transport_mut();
 /// }
 /// ```
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct OwnedChannelDriver<S> {
     connection: Box<ChannelConnection<ClientTransport<S>>>,
     pending: bool,
     failed: bool,
+    /// An inbound ping was consumed and its pong has not been written.
+    pong_owed: bool,
+    /// An inbound event requires a protocol reply this driver cannot send.
+    control_owed: bool,
 }
 
 impl<S: Read + Write> OwnedChannelDriver<S> {
@@ -713,6 +749,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             connection: Box::new(connection),
             pending: false,
             failed: false,
+            pong_owed: false,
+            control_owed: false,
         })
     }
 
@@ -733,7 +771,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// # Errors
     ///
     /// Returns busy, failed, channel validation, flow-control or transport
-    /// errors. Rejected admission does not consume remote credit.
+    /// errors. Rejected admission does not consume remote credit. Admission is
+    /// also busy while an inbound pong or an inbound control reply is owed;
+    /// see [`Self::read_inbound`].
     pub fn admit_data(
         &mut self,
         channel: ChannelId,
@@ -742,7 +782,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending {
+        if self.pending || self.pong_owed || self.control_owed {
             return Err(OwnedChannelError::Busy);
         }
         let connection = &mut *self.connection;
@@ -880,10 +920,156 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
-    /// Releases the connection only when no packet is active and no failure
-    /// occurred. On refusal, returns the still-owning driver.
+    /// Consumes exactly one inbound packet while the admitted data packet is active.
+    ///
+    /// This is the opt-in incremental read step for a caller that must keep an
+    /// outbound packet partially written. It performs one authenticated
+    /// transport read and, for an ordinary payload, exactly one call to the
+    /// private decoded-payload dispatcher. It never loops and never answers a
+    /// message, so one packet produces at most one event and no event is
+    /// consumed after an event has been produced.
+    ///
+    /// The driver refuses the read while it has an obligation it cannot
+    /// discharge:
+    ///
+    /// * a pong deferred by an inbound transport ping;
+    /// * a channel open the peer is waiting to be confirmed or refused;
+    /// * a peer close this side has not already answered;
+    /// * a channel request or global request whose `want_reply` is set.
+    ///
+    /// Those events are still returned, but the driver will not consume
+    /// another inbound packet and [`Self::try_into_connection`] refuses to
+    /// release the connection. The driver has no reply path in this change, so
+    /// drop it and its transport instead. That is the deliberate limit: this is
+    /// an inbound step, not a scheduler for control replies or rekey. A data
+    /// event that exhausts the local window is not a reply obligation; adjust
+    /// the window after release if the peer should continue.
+    ///
+    /// `WouldBlock` preserves the partial inbound packet, the admitted outbound
+    /// packet, and every obligation. A stale or foreign identifier returns
+    /// [`OwnedChannelError::Busy`] without reading. A channel parse or protocol
+    /// error after the packet has been consumed makes the driver terminal,
+    /// because that packet cannot be replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns failed, busy, a channel error after a consumed payload, or a
+    /// transport error. A transport `WouldBlock` is returned as
+    /// [`OwnedChannelError::Transport`] and is retryable.
+    pub fn read_inbound(
+        &mut self,
+        id: &OwnedChannelWriteId,
+    ) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if !self.pending || self.pong_owed || self.control_owed {
+            return Err(OwnedChannelError::Busy);
+        }
+        match self.connection.transport.read_while_owned(&id.0) {
+            Ok(OwnedInbound::Payload(payload)) => {
+                match self.connection.dispatch_decoded_payload(&payload) {
+                    Ok(Some(event)) => {
+                        if self.event_owes_control(&event) {
+                            self.control_owed = true;
+                        }
+                        Ok(OwnedChannelInbound::Event(event))
+                    }
+                    Ok(None) => Ok(OwnedChannelInbound::Consumed),
+                    Err(error) => {
+                        self.failed = true;
+                        Err(OwnedChannelError::Channel(error))
+                    }
+                }
+            }
+            Ok(OwnedInbound::PongDeferred) => {
+                self.pong_owed = true;
+                Ok(OwnedChannelInbound::PongDeferred)
+            }
+            Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(OwnedChannelError::Transport(error))
+            }
+        }
+    }
+
+    /// Writes a pong that [`Self::read_inbound`] deferred.
+    ///
+    /// The admitted data packet must complete first. `WouldBlock` preserves the
+    /// pong and is retryable; any other write failure makes the driver
+    /// terminal. A pong is owed only after
+    /// [`OwnedChannelInbound::PongDeferred`], and the connection cannot be
+    /// released until this succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy when no pong is owed or the data packet is still active,
+    /// or a transport error.
+    pub fn drive_deferred_pong(&mut self) -> Result<(), OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.pending || !self.pong_owed {
+            return Err(OwnedChannelError::Busy);
+        }
+        match self.connection.transport.drive_deferred_pong() {
+            Ok(()) => {
+                self.pong_owed = false;
+                Ok(())
+            }
+            Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(OwnedChannelError::Transport(error))
+            }
+        }
+    }
+
+    /// Returns whether an inbound event requires a reply this driver cannot send.
+    fn event_owes_control(&self, event: &ChannelEvent) -> bool {
+        match event {
+            ChannelEvent::OpenRequest(_) => true,
+            ChannelEvent::Close { channel } => self
+                .connection
+                .channel(*channel)
+                .is_some_and(|state| state.remote_close_received() && !state.local_close_sent()),
+            ChannelEvent::Request { want_reply, .. }
+            | ChannelEvent::GlobalRequest { want_reply, .. } => *want_reply,
+            _ => false,
+        }
+    }
+
+    /// Releases the connection only when no packet, obligation, or failure is
+    /// outstanding. On refusal, returns the still-owning driver.
+    ///
+    /// The connection is also retained while an inbound open awaits an answer,
+    /// a peer close awaits this side's close, a pong is deferred, or the
+    /// transport still holds a partial outbound packet. Those are protocol
+    /// obligations the driver has no way to discharge; drop the driver and its
+    /// transport instead.
     pub fn try_into_connection(self) -> Result<ChannelConnection<ClientTransport<S>>, Self> {
-        if self.pending || self.failed {
+        let transport = &self.connection.transport;
+        let close_owed = self
+            .connection
+            .channels()
+            .any(|channel| channel.remote_close_received() && !channel.local_close_sent());
+        if self.pending
+            || self.failed
+            || self.pong_owed
+            || self.control_owed
+            || self.connection.pending_open_count() != 0
+            || close_owed
+            || transport.deferred_owned_pong
+            || transport.owned_packet.is_some()
+            || transport.write_buffer.is_pending()
+        {
             return Err(self);
         }
         Ok(*self.connection)
