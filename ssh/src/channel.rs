@@ -32,6 +32,7 @@ use neotales_ssh::{Error as WireError, MAX_PACKET_CONTENT, MIN_PADDING, Reader, 
 use crate::cipher::AES_BLOCK_SIZE;
 use crate::client::ClientTransport;
 use crate::server::ServerTransport;
+use crate::transport::{OwnedPacketId, TransportError};
 
 /// SSH message number for `SSH_MSG_CHANNEL_OPEN`.
 pub const SSH_MSG_CHANNEL_OPEN: u8 = 90;
@@ -627,6 +628,215 @@ pub struct ChannelConnection<T> {
     closed: std::collections::BTreeMap<ChannelId, u64>,
     /// Monotonic retirement counter used to bound the tombstone map.
     reap_clock: u64,
+}
+
+/// Failure of the single-packet owned channel writer.
+#[derive(Debug)]
+pub enum OwnedChannelError {
+    /// A packet is already admitted, or a packet identifier is stale or foreign.
+    Busy,
+    /// A terminal transport failure has made this driver unusable.
+    Failed,
+    /// Channel validation or flow control rejected the request.
+    Channel(ChannelError),
+    /// The protected transport rejected or could not drive the packet.
+    Transport(TransportError),
+}
+
+impl fmt::Display for OwnedChannelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Busy => formatter.write_str("an owned channel packet is busy or unknown"),
+            Self::Failed => formatter.write_str("the owned channel driver has failed"),
+            Self::Channel(error) => write!(formatter, "SSH channel error: {error}"),
+            Self::Transport(error) => write!(formatter, "SSH transport error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OwnedChannelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Channel(error) => Some(error),
+            Self::Transport(error) => Some(error),
+            Self::Busy | Self::Failed => None,
+        }
+    }
+}
+
+/// Opaque identity of one packet admitted by an [`OwnedChannelDriver`].
+#[derive(Clone, Debug)]
+pub struct OwnedChannelWriteId(OwnedPacketId);
+
+/// Owns a channel connection while admitting and driving one data packet.
+///
+/// No mutable reference to the connection or transport is exposed. Admission
+/// reserves remote window immediately; it does not mean the peer received the
+/// bytes. Dropping the ID does not cancel or roll back the packet: retain a
+/// copy to finish it, or drop the driver and its transport. A failed or busy
+/// driver cannot release its connection. Dropping the driver drops its stream,
+/// although other independently held stream handles may remain open.
+///
+/// This is not a full-duplex scheduler: it does not dispatch inbound traffic,
+/// answer control requests, or handle rekey while a packet is outstanding.
+///
+/// The wrapped connection's mutable transport cannot be reached through the
+/// driver:
+///
+/// ```compile_fail
+/// use std::io::{Read, Write};
+/// use neotales_ssh::channel::OwnedChannelDriver;
+///
+/// fn bypass<S: Read + Write>(driver: &mut OwnedChannelDriver<S>) {
+///     let _transport = driver.transport_mut();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct OwnedChannelDriver<S> {
+    connection: Box<ChannelConnection<ClientTransport<S>>>,
+    pending: bool,
+    failed: bool,
+}
+
+impl<S: Read + Write> OwnedChannelDriver<S> {
+    /// Takes exclusive ownership only of an authenticated, idle transport.
+    ///
+    /// On refusal, the unmodified connection is returned to the caller.
+    pub fn try_new(
+        connection: ChannelConnection<ClientTransport<S>>,
+    ) -> Result<Self, Box<ChannelConnection<ClientTransport<S>>>> {
+        let transport = &connection.transport;
+        if !transport.can_start_owned_channel_driver() {
+            return Err(Box::new(connection));
+        }
+        Ok(Self {
+            connection: Box::new(connection),
+            pending: false,
+            failed: false,
+        })
+    }
+
+    /// Returns a copy of the named channel's state.
+    #[must_use]
+    pub fn channel(&self, channel: ChannelId) -> Option<ChannelState> {
+        self.connection.channel(channel)
+    }
+
+    /// Returns the protected transport's committed outbound sequence.
+    #[must_use]
+    pub fn outbound_sequence(&self) -> u32 {
+        self.connection.transport.outbound_sequence()
+    }
+
+    /// Admits one bounded channel-data packet and reserves its remote credit.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy, failed, channel validation, flow-control or transport
+    /// errors. Rejected admission does not consume remote credit.
+    pub fn admit_data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+    ) -> Result<OwnedChannelWriteId, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.pending {
+            return Err(OwnedChannelError::Busy);
+        }
+        let connection = &mut *self.connection;
+        let state = connection
+            .channels
+            .get_mut(&channel)
+            .ok_or(OwnedChannelError::Channel(ChannelError::UnknownChannel))?;
+        state.writable().map_err(OwnedChannelError::Channel)?;
+        let remote = state
+            .remote_id
+            .ok_or(OwnedChannelError::Channel(ChannelError::InvalidMessage))?;
+        let maximum = usize::try_from(state.remote_maximum_packet_size)
+            .unwrap_or(usize::MAX)
+            .min(MAX_CHANNEL_DATA_SIZE);
+        if data.len() > maximum {
+            return Err(OwnedChannelError::Channel(ChannelError::PacketTooLarge {
+                maximum: u32::try_from(maximum).unwrap_or(u32::MAX),
+                requested: data.len(),
+            }));
+        }
+        let length = u32::try_from(data.len())
+            .map_err(|_| OwnedChannelError::Channel(ChannelError::MessageTooLarge))?;
+        if length > state.remote_window {
+            return Err(OwnedChannelError::Channel(ChannelError::Window(
+                WindowError::Insufficient {
+                    available: state.remote_window,
+                    requested: data.len(),
+                },
+            )));
+        }
+        let mut writer = Writer::new();
+        writer.write_byte(SSH_MSG_CHANNEL_DATA);
+        writer.write_uint32(remote);
+        writer
+            .write_string(data)
+            .map_err(|error| OwnedChannelError::Channel(ChannelError::Wire(error)))?;
+        let id = match connection
+            .transport
+            .start_owned_packet(&writer.into_bytes())
+        {
+            Ok(id) => id,
+            Err(error) => {
+                if !connection.transport.is_established() {
+                    self.failed = true;
+                }
+                return Err(OwnedChannelError::Transport(error));
+            }
+        };
+        state.remote_window -= length;
+        self.pending = true;
+        Ok(OwnedChannelWriteId(id))
+    }
+
+    /// Drives the admitted packet without retaining caller-provided bytes.
+    ///
+    /// `WouldBlock` preserves the packet and reserved credit. Completion is
+    /// reported exactly once; stale or foreign IDs do not change the driver.
+    /// Any other write error makes the driver terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy for a wrong ID, a retryable transport `WouldBlock`, or a
+    /// terminal transport error.
+    pub fn drive(&mut self, id: &OwnedChannelWriteId) -> Result<(), OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if !self.pending {
+            return Err(OwnedChannelError::Busy);
+        }
+        match self.connection.transport.drive_owned_packet(&id.0) {
+            Ok(()) => {
+                self.pending = false;
+                Ok(())
+            }
+            Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(OwnedChannelError::Transport(error))
+            }
+        }
+    }
+
+    /// Releases the connection only when no packet is active and no failure
+    /// occurred. On refusal, returns the still-owning driver.
+    pub fn try_into_connection(self) -> Result<ChannelConnection<ClientTransport<S>>, Self> {
+        if self.pending || self.failed {
+            return Err(self);
+        }
+        Ok(*self.connection)
+    }
 }
 
 /// How many retired local channel identifiers are remembered.

@@ -890,6 +890,15 @@ where
         self.rekey_terminal()
     }
 
+    pub(crate) fn can_start_owned_channel_driver(&self) -> bool {
+        self.established
+            && self.authenticated
+            && self.owned_packet.is_none()
+            && self.pending_transport_reply.is_none()
+            && !self.write_buffer.is_pending()
+            && !self.rekey_active()
+    }
+
     /// Seals one ordinary payload and gives its owner an opaque identifier.
     ///
     /// No bytes are written until [`Self::drive_owned_packet`]. While this
