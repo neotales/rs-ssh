@@ -53,6 +53,11 @@ fn example(pin: &[u8], path: &Path, passphrase: &str) -> Result<(), Box<dyn std:
 }
 ```
 
+OpenSSH identity parsing accepts RSA component magnitudes up to 8192 bits
+(1024 bytes) each, including the modulus, exponents, coefficient and primes.
+Larger components are rejected as invalid key data before RSA integer
+conversion and validation; this applies to plaintext and encrypted containers.
+
 Clone and change only the port:
 
 ```rust,no_run

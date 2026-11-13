@@ -70,6 +70,149 @@ fn aes256_ctr_bcrypt_fixture_parses_with_the_correct_passphrase() -> Result<(), 
 }
 
 #[test]
+fn oversized_rsa_private_exponent_and_coefficient_are_rejected() -> Result<(), Box<dyn Error>> {
+    for oversized in [2_usize, 3] {
+        let mut public = Writer::new();
+        public.write_string("ssh-rsa")?;
+        public.write_mpint(&[3_u8][..])?;
+        public.write_mpint(&[15_u8][..])?;
+        let mut private = Writer::new();
+        private.write_u32(17);
+        private.write_u32(17);
+        private.write_string("ssh-rsa")?;
+        for (index, small) in [15_u8, 3, 7, 2, 3, 5].into_iter().enumerate() {
+            let value = if index == oversized {
+                vec![0x41; 1025]
+            } else {
+                vec![small]
+            };
+            private.write_mpint(&value[..])?;
+        }
+        private.write_string(COMMENT)?;
+        let section = pad_private_section(private.into_bytes(), NONE_BLOCK_SIZE);
+        let fixture = container(b"none", b"none", &[], 1, &public.into_bytes(), &section)?;
+        let mut passphrase = b"synthetic-passphrase".to_vec();
+        assert_eq!(
+            parse_openssh_private_key(&fixture, &mut passphrase).err(),
+            Some(OpenSshKeyError::InvalidPrivateKey)
+        );
+        assert!(passphrase.iter().all(|byte| *byte == 0));
+    }
+    Ok(())
+}
+
+#[test]
+fn rsa_component_limits_apply_to_plaintext_and_encrypted_containers() -> Result<(), Box<dyn Error>>
+{
+    for encrypted in [false, true] {
+        for oversized in 0..6 {
+            let fixture = synthetic_rsa_fixture(Some(oversized), None, 32 * 1024, encrypted)?;
+            let mut passphrase = PASSPHRASE.to_vec();
+            let error = parse_openssh_private_key(&fixture, &mut passphrase).unwrap_err();
+            assert_eq!(error, OpenSshKeyError::InvalidPrivateKey);
+            let rendered = format!("{error} {error:?}");
+            assert!(!rendered.contains("CANARY-RSA"));
+            assert!(!rendered.contains(std::str::from_utf8(PASSPHRASE)?));
+            assert!(passphrase.iter().all(|byte| *byte == 0));
+        }
+        for oversized in 0..2 {
+            let fixture = synthetic_rsa_fixture(None, Some(oversized), 32 * 1024, encrypted)?;
+            let mut passphrase = PASSPHRASE.to_vec();
+            let error = parse_openssh_private_key(&fixture, &mut passphrase).unwrap_err();
+            assert_eq!(error, OpenSshKeyError::InvalidPublicKey);
+            assert!(!format!("{error} {error:?}").contains("CANARY-RSA"));
+            assert!(passphrase.iter().all(|byte| *byte == 0));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rsa_component_limit_accepts_boundary_and_refuses_one_more_byte() -> Result<(), Box<dyn Error>> {
+    // Structurally consistent small factors exercise the parser's limit, not
+    // cryptographic strength; the normal RSA round-trip test uses real primes.
+    for encrypted in [false, true] {
+        let fixture = synthetic_rsa_fixture(Some(2), None, 1024, encrypted)?;
+        let mut passphrase = PASSPHRASE.to_vec();
+        assert!(parse_openssh_private_key(&fixture, &mut passphrase).is_ok());
+        let fixture = synthetic_rsa_fixture(Some(2), None, 1025, encrypted)?;
+        let mut passphrase = PASSPHRASE.to_vec();
+        assert_eq!(
+            parse_openssh_private_key(&fixture, &mut passphrase).err(),
+            Some(OpenSshKeyError::InvalidPrivateKey)
+        );
+    }
+    Ok(())
+}
+
+fn synthetic_rsa_fixture(
+    oversized_private: Option<usize>,
+    oversized_public: Option<usize>,
+    component_length: usize,
+    encrypted: bool,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut large = vec![b'A'; component_length];
+    // Force the canonical positive sign-padding byte, including at the limit.
+    large[0] = 0x80;
+    large[1..11].copy_from_slice(b"CANARY-RSA");
+    let mut public = Writer::new();
+    public.write_string("ssh-rsa")?;
+    for (index, small) in [3_u8, 15].into_iter().enumerate() {
+        let small = [small];
+        positive_mpint(
+            &mut public,
+            if oversized_public == Some(index) {
+                &large
+            } else {
+                &small
+            },
+        )?;
+    }
+    let mut private = Writer::new();
+    private.write_u32(17);
+    private.write_u32(17);
+    private.write_string("ssh-rsa")?;
+    for (index, small) in [15_u8, 3, 7, 2, 3, 5].into_iter().enumerate() {
+        let small = [small];
+        positive_mpint(
+            &mut private,
+            if oversized_private == Some(index) {
+                &large
+            } else {
+                &small
+            },
+        )?;
+    }
+    private.write_string(COMMENT)?;
+    let block = if encrypted {
+        AES_BLOCK_SIZE
+    } else {
+        NONE_BLOCK_SIZE
+    };
+    let mut section = pad_private_section(private.into_bytes(), block);
+    let mut kdf_options = Writer::new();
+    let (cipher_name, kdf_name) = if encrypted {
+        let derived = derive_key(PASSPHRASE, SALT, ROUNDS, 48)?;
+        let mut cipher =
+            ctr::Ctr128BE::<aes::Aes256>::new_from_slices(&derived[..32], &derived[32..])?;
+        cipher.apply_keystream(&mut section);
+        kdf_options.write_string(SALT)?;
+        kdf_options.write_u32(ROUNDS);
+        (b"aes256-ctr".as_slice(), b"bcrypt".as_slice())
+    } else {
+        (b"none".as_slice(), b"none".as_slice())
+    };
+    container(
+        cipher_name,
+        kdf_name,
+        kdf_options.as_bytes(),
+        1,
+        &public.into_bytes(),
+        &section,
+    )
+}
+
+#[test]
 fn wrong_passphrase_fails_without_echoing_the_passphrase() -> Result<(), Box<dyn Error>> {
     let (fixture, _) = encrypted_fixture(&SEED)?;
     let wrong_passphrase = "wrong-passphrase";

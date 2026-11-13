@@ -5,6 +5,8 @@
 //! RSA, or NIST P-256 ECDSA key only.  The returned private components are held in zeroizing
 //! containers so that a caller can pass them to the existing signers without
 //! making another unprotected copy.
+//! RSA public and private component magnitudes are limited to 1024 bytes
+//! (8192 bits) each, before integer conversion and validation arithmetic.
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -34,6 +36,9 @@ const ED25519_PRIVATE_LENGTH: usize = 64;
 const NONE_BLOCK_SIZE: usize = 8;
 const AES_BLOCK_SIZE: usize = 16;
 const DERIVED_KEY_LENGTH: usize = 48;
+// Each RSA component is limited before any BigUint conversion or arithmetic.
+// One additional wire byte may be needed for a positive mpint's sign.
+const MAX_RSA_COMPONENT_BYTES: usize = 1024;
 
 /// A safe error produced while parsing an OpenSSH private-key file.
 ///
@@ -306,7 +311,8 @@ pub type OpenSSHPrivateKey = OpenSshPrivateKey;
 /// Returns [`OpenSshKeyError`] when the container is malformed, uses an
 /// unsupported cipher or KDF, has a mismatched check integer, contains an
 /// unsupported key type, has invalid padding, or has inconsistent public and
-/// private key components.
+/// private key components. RSA components larger than 8192 bits are rejected
+/// as invalid public or private key data.
 pub fn parse_openssh_private_key(
     bytes: &[u8],
     passphrase: &mut [u8],
@@ -725,12 +731,12 @@ fn parse_rsa_private(
     outer_e: &[u8],
     outer_n: &[u8],
 ) -> Result<ParsedPrivate, OpenSshKeyError> {
-    let n_bytes = read_positive_mpint(reader)?;
-    let e_bytes = read_positive_mpint(reader)?;
-    let _private_exponent = read_positive_mpint(reader)?;
-    let _coefficient = read_positive_mpint(reader)?;
-    let p_bytes = read_positive_mpint(reader)?;
-    let q_bytes = read_positive_mpint(reader)?;
+    let n_bytes = read_positive_rsa_mpint(reader)?;
+    let e_bytes = read_positive_rsa_mpint(reader)?;
+    let _private_exponent = read_positive_rsa_mpint(reader)?;
+    let _coefficient = read_positive_rsa_mpint(reader)?;
+    let p_bytes = read_positive_rsa_mpint(reader)?;
+    let q_bytes = read_positive_rsa_mpint(reader)?;
 
     let n = Zeroizing::new(rsa::BigUint::from_bytes_be(n_bytes));
     let e = Zeroizing::new(rsa::BigUint::from_bytes_be(e_bytes));
@@ -779,9 +785,20 @@ fn read_public_string<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], OpenSshKe
 
 fn read_positive_public_mpint<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], OpenSshKeyError> {
     let value = reader
-        .read_mpint()
+        .read_mpint_with_limit(MAX_RSA_COMPONENT_BYTES + 1)
         .map_err(|_error| OpenSshKeyError::InvalidPublicKey)?;
-    positive_magnitude(value).ok_or(OpenSshKeyError::InvalidPublicKey)
+    positive_magnitude(value)
+        .filter(|magnitude| magnitude.len() <= MAX_RSA_COMPONENT_BYTES)
+        .ok_or(OpenSshKeyError::InvalidPublicKey)
+}
+
+fn read_positive_rsa_mpint<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], OpenSshKeyError> {
+    let value = reader
+        .read_mpint_with_limit(MAX_RSA_COMPONENT_BYTES + 1)
+        .map_err(|_error| OpenSshKeyError::InvalidPrivateKey)?;
+    positive_magnitude(value)
+        .filter(|magnitude| magnitude.len() <= MAX_RSA_COMPONENT_BYTES)
+        .ok_or(OpenSshKeyError::InvalidPrivateKey)
 }
 
 fn read_positive_mpint<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8], OpenSshKeyError> {
