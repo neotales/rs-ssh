@@ -66,12 +66,14 @@ it in production unless the capability is intended and reviewed.
 
 The feature adds `ServerTransport::write_rekey_ignorable`, which writes a
 protocol-valid `SSH_MSG_IGNORE` only during an authenticated, active,
-non-strict rekey. It refuses before the rekey starts, in strict-KEX mode, after
-the server has sent NEWKEYS, and while a different protected packet is pending.
-A `WouldBlock` leaves the exact packet pending for a same-data retry; every
-other failure invokes the transport's existing rekey fail-close path. The data
-is not logged or retained beyond the protected packet, and callers must not
-pass secrets.
+non-strict rekey. If no rekey is active, it returns `NotEstablished`,
+`UnauthenticatedMessage`, or `RekeyInProgress` without changing the
+connection; those idle errors are safe because there is no rekey to close.
+Once a rekey is active, an unauthenticated caller, strict-KEX, post-NEWKEYS,
+ordering error, or terminal write failure invokes the transport's existing
+fail-close path. A `WouldBlock` leaves the exact packet pending for a
+same-data retry. The data is not logged or retained beyond the protected
+packet, and callers must not pass secrets.
 
 ## Opening a connection
 
