@@ -1140,7 +1140,7 @@ where
             return Ok(true);
         }
         if self.rekey.is_some() {
-            self.advance_rekey()?;
+            self.advance_retained_rekey()?;
             return Ok(true);
         }
         Ok(false)
@@ -1345,8 +1345,11 @@ where
     /// packet is active; drive it with its identifier or discard the transport.
     /// After the owner completes, a pong deferred by [`Self::read_while_owned`]
     /// is written before the next read; `WouldBlock` preserves it for retry.
-    /// Once a peer rekey has started, callers using a nonblocking stream should
-    /// resume it with [`ClientTransport::advance_rekey`].
+    /// A peer KEXINIT consumed on this blocking path is driven to completion
+    /// internally. A KEXINIT retained by an owned read makes this method return
+    /// [`TransportError::RekeyInProgress`]; a nonblocking caller must advance it
+    /// with [`ClientTransport::advance_retained_peer_rekey`], because
+    /// [`ClientTransport::advance_rekey`] refuses a retained proposal.
     pub fn read_payload(&mut self) -> Result<Vec<u8>, TransportError> {
         if self.owned_packet.is_some() {
             return Err(TransportError::OwnedPacketState);

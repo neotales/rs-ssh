@@ -1367,6 +1367,10 @@ fn retained_peer_kexinit_rejects_public_begin_and_completes_via_retained_path()
     transport.drive_owned_packet(&id)?;
 
     assert!(matches!(
+        transport.advance_rekey(),
+        Err(HandshakeError::Transport(TransportError::OwnedPacketState))
+    ));
+    assert!(matches!(
         transport.begin_rekey(),
         Err(HandshakeError::Transport(TransportError::OwnedPacketState))
     ));
@@ -1380,6 +1384,100 @@ fn retained_peer_kexinit_rejects_public_begin_and_completes_via_retained_path()
     assert_eq!(transport.session_id(), original_session_id.as_slice());
     assert_eq!(peer.borrow().session_id, original_session_id);
     assert!(peer.borrow().saw_rekey);
+    Ok(())
+}
+
+#[test]
+fn retained_peer_kexinit_blocked_local_kexinit_rejects_public_advance_and_resumes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (peer, stream) = Peer::new()?;
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let stream = GatedStream::new(stream, Rc::clone(&gate));
+    let config = ClientConfig::with_kexinit(proposal([0x11; 16], false));
+    let mut transport = config.connect(stream, |_key| Ok::<(), Infallible>(()))?;
+    peer.borrow_mut().drive();
+    transport.authenticated = true;
+    let original_session_id = transport.session_id().to_vec();
+    peer.borrow_mut().initiate_rekey()?;
+
+    let id = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+    assert!(matches!(
+        transport.read_while_owned(&id)?,
+        OwnedInbound::PeerKexInitRetained
+    ));
+    transport.drive_owned_packet(&id)?;
+
+    // The local KEXINIT is partially written and the peer proposal is retained.
+    gate.borrow_mut().arm(1);
+    assert!(matches!(
+        transport.advance_retained_peer_rekey(),
+        Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        transport.advance_rekey(),
+        Err(HandshakeError::Transport(TransportError::OwnedPacketState))
+    ));
+
+    gate.borrow_mut().open();
+    while transport.rekey_active() {
+        transport.advance_retained_peer_rekey()?;
+    }
+    assert!(transport.rekey_complete());
+    assert_eq!(transport.session_id(), original_session_id.as_slice());
+    assert_eq!(peer.borrow().session_id, original_session_id);
+    Ok(())
+}
+
+#[test]
+fn queued_second_pong_preserves_order_after_partial_write() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (peer, stream) = Peer::new()?;
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let stream = GatedStream::new(stream, Rc::clone(&gate));
+    let config = ClientConfig::with_kexinit(proposal([0x11; 16], false));
+    let mut transport = config.connect(stream, |_key| Ok::<(), Infallible>(()))?;
+    peer.borrow_mut().drive();
+    transport.authenticated = true;
+
+    let id = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+    peer.borrow_mut().send_ping(b"one")?;
+    assert!(matches!(
+        transport.read_while_owned(&id)?,
+        OwnedInbound::PongDeferred
+    ));
+    transport.drive_owned_packet(&id)?;
+
+    gate.borrow_mut().arm(1);
+    assert!(matches!(
+        transport.drive_deferred_pong(),
+        Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    let pong_id = transport.deferred_pong_read_id().expect("partial PONG id");
+    peer.borrow_mut().send_ping(b"two")?;
+    assert!(matches!(
+        transport.read_while_deferred_pong(&pong_id)?,
+        OwnedInbound::PongDeferred
+    ));
+
+    gate.borrow_mut().open();
+    transport.drive_deferred_pong()?;
+    transport.drive_deferred_pong()?;
+
+    let (owned, sequence) = peer.borrow_mut().read_protected_client()?;
+    assert_eq!(owned, CLIENT_BEFORE_REKEY);
+    peer.borrow_mut().commit_inbound(sequence)?;
+    let (first, sequence) = peer.borrow_mut().read_protected_client()?;
+    peer.borrow_mut().commit_inbound(sequence)?;
+    let (second, sequence) = peer.borrow_mut().read_protected_client()?;
+    peer.borrow_mut().commit_inbound(sequence)?;
+    assert_eq!(
+        first,
+        neotales_ssh::keepalive::TransportPing::Pong(b"one".to_vec()).encode()?
+    );
+    assert_eq!(
+        second,
+        neotales_ssh::keepalive::TransportPing::Pong(b"two".to_vec()).encode()?
+    );
     Ok(())
 }
 

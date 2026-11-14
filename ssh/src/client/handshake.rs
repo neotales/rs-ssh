@@ -884,11 +884,31 @@ where
     /// # Errors
     ///
     /// Returns a bounded [`HandshakeError`] for a transport, sequence,
-    /// proposal, host-key, or packet-protection failure. If an owned packet is
-    /// or a deferred pong is active, returns [`HandshakeError::Transport`] with
-    /// [`TransportError::OwnedPacketState`], even when no rekey is active;
-    /// drive the packet and its deferred pong, or discard the transport.
+    /// proposal, host-key, or packet-protection failure. If an owned packet,
+    /// a deferred pong, or a retained peer KEXINIT is pending, returns
+    /// [`HandshakeError::Transport`] with [`TransportError::OwnedPacketState`],
+    /// even when no local rekey is active; drive the owned work, or advance a
+    /// retained proposal with [`Self::advance_retained_peer_rekey`].
+    ///
+    /// `Ok(false)` means there is no active local rekey and no retained peer
+    /// proposal. It never means a retained proposal was consumed.
     pub fn advance_rekey(&mut self) -> Result<bool, HandshakeError> {
+        if self.retained_peer_kexinit.is_some() {
+            return Err(TransportError::OwnedPacketState.into());
+        }
+        self.advance_rekey_allowed()
+    }
+
+    /// Advances the local side of a retained peer rekey by one bounded step.
+    ///
+    /// This is the internal counterpart used after
+    /// [`Self::begin_retained_peer_rekey`]; it does not consume the retained
+    /// proposal and never recurses into the public API.
+    pub(crate) fn advance_retained_rekey(&mut self) -> Result<bool, HandshakeError> {
+        self.advance_rekey_allowed()
+    }
+
+    fn advance_rekey_allowed(&mut self) -> Result<bool, HandshakeError> {
         if self.owned_packet.is_some() || self.deferred_owned_pong {
             return Err(TransportError::OwnedPacketState.into());
         }
