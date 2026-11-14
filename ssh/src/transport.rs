@@ -725,6 +725,10 @@ pub struct ClientTransport<S> {
     server_sig_algs: Option<Vec<String>>,
     pub(crate) ext_info: ExtensionState,
     pending_transport_reply: Option<Vec<u8>>,
+    /// One PONG retained behind an actively written PONG.
+    next_transport_pong: Option<Vec<u8>>,
+    /// Identity of the active partially written deferred PONG.
+    pong_write_id: Option<OwnedPacketId>,
     pub(crate) deferred_owned_pong: bool,
     pub(crate) owned_packet: Option<OwnedPacketId>,
     pub(crate) write_protector: Option<PacketProtector>,
@@ -779,6 +783,8 @@ where
                 server_sig_algs: None,
                 ext_info: ExtensionState::Disabled,
                 pending_transport_reply: None,
+                next_transport_pong: None,
+                pong_write_id: None,
                 deferred_owned_pong: false,
                 owned_packet: None,
                 write_protector: None,
@@ -1054,6 +1060,28 @@ where
         self.read_owned_step()
     }
 
+    pub(crate) fn deferred_pong_read_id(&self) -> Option<OwnedPacketId> {
+        self.pong_write_id.clone()
+    }
+
+    pub(crate) fn read_while_deferred_pong(
+        &mut self,
+        id: &OwnedPacketId,
+    ) -> Result<OwnedInbound, TransportError> {
+        if self.owned_packet.is_some()
+            || !self.deferred_owned_pong
+            || self.pending_transport_reply.is_none()
+            || self.next_transport_pong.is_some()
+            || !self
+                .pong_write_id
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
+        {
+            return Err(TransportError::OwnedPacketState);
+        }
+        self.read_owned_step()
+    }
+
     fn read_owned_step(&mut self) -> Result<OwnedInbound, TransportError> {
         if !self.authenticated {
             return Err(TransportError::InvalidMessage);
@@ -1091,8 +1119,15 @@ where
         }
         self.ext_info = ExtensionState::Complete;
         if let Some(pong) = pong {
-            self.pending_transport_reply = Some(pong);
-            self.deferred_owned_pong = true;
+            if self.pong_write_id.is_some() {
+                if self.next_transport_pong.is_some() {
+                    return Err(self.fail_protected_write(TransportError::OwnedPacketState));
+                }
+                self.next_transport_pong = Some(pong);
+            } else {
+                self.pending_transport_reply = Some(pong);
+                self.deferred_owned_pong = true;
+            }
             Ok(OwnedInbound::PongDeferred)
         } else {
             Ok(OwnedInbound::Payload(payload))
@@ -1118,12 +1153,19 @@ where
             .ok_or(TransportError::OwnedPacketState)?;
         match self.write_payload_inner(&reply) {
             Ok(()) => {
-                self.deferred_owned_pong = false;
+                self.pong_write_id = None;
+                self.pending_transport_reply = self.next_transport_pong.take();
+                self.deferred_owned_pong = self.pending_transport_reply.is_some();
                 Ok(())
             }
             Err(error) => {
                 if self.established {
                     self.pending_transport_reply = Some(reply);
+                    if matches!(&error, TransportError::Io(error) if error.kind() == io::ErrorKind::WouldBlock)
+                    {
+                        self.pong_write_id
+                            .get_or_insert_with(|| OwnedPacketId(Arc::new(())));
+                    }
                 }
                 Err(error)
             }
@@ -1474,6 +1516,8 @@ where
         self.owned_packet = None;
         self.deferred_owned_pong = false;
         self.pending_transport_reply = None;
+        self.next_transport_pong = None;
+        self.pong_write_id = None;
         self.write_buffer.abort();
         self.read_buffer.clear();
         self.read_protector = None;
