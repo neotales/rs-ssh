@@ -57,10 +57,12 @@ to be decided before any publication of this change.
 ## Opt-in `test-support` feature
 
 `test-support` is an explicitly opt-in feature, not part of the default feature
-set. Cargo feature unification means enabling it anywhere in a build graph
-enables it for every `neotales-ssh` dependency in that build, including a
-`--all-features` build. Do not enable it in production unless the capability is
-intended and reviewed.
+set. Feature unification is resolver- and dependency-kind-dependent: in this
+workspace's resolver 3, `--all-features` enables it for the package, and a
+normal dependency that enables it unifies it for other normal dependents in
+the same build. Dev-dependency features are not necessarily unified into a
+non-test build, but a dev-dependency is not a security boundary. Do not enable
+it in production unless the capability is intended and reviewed.
 
 The feature adds `ServerTransport::write_rekey_ignorable`, which writes a
 protocol-valid `SSH_MSG_IGNORE` only during an authenticated, active,

@@ -12,9 +12,10 @@ categories = ["cryptography", "network-programming"]
 
 [features]
 # Public opt-in protected-packet counter and controlled-peer
-# `ServerTransport::write_rekey_ignorable` hook. Cargo feature unification can
-# enable these APIs throughout a build graph; review their security implications
-# before enabling this feature. See the README for their contracts.
+# `ServerTransport::write_rekey_ignorable` hook for authenticated, active,
+# non-strict rekeys. Cargo feature unification depends on resolver and dependency
+# kind; dev-dependencies and test builds are not security boundaries. Review the
+# capability before enabling it in production; see the README for contracts.
 test-support = []
 
 [dependencies]

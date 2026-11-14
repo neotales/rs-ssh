@@ -7,21 +7,26 @@ if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     target="$CARGO_TARGET_DIR"
     created=0
 else
-    target="$(pwd)/.feature-surface-target"
+    root="${TMPDIR:-/tmp}/neotales-ssh-feature-surface"
+    mkdir -p "$root"
+    target="$(mktemp -d "$root/target.XXXXXX")"
     created=1
     export CARGO_TARGET_DIR="$target"
 fi
+
+mkdir -p "$target"
+tmp="$(mktemp -d "$target/tmp.XXXXXX")"
+export TMPDIR="$tmp"
+
 cleanup() {
+    if [ -n "${tmp:-}" ]; then
+        rm -rf "$tmp"
+    fi
     if [ "$created" = 1 ]; then
         rm -rf "$target"
     fi
 }
 trap cleanup EXIT
-
-if [ -z "${TMPDIR:-}" ]; then
-    export TMPDIR="$target/tmp"
-    mkdir -p "$TMPDIR"
-fi
 
 docs="$target/doc/neotales_ssh"
 page="$docs/server/struct.ServerTransport.html"

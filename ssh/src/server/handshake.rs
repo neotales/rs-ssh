@@ -1827,35 +1827,41 @@ where
     /// bounded rekey step read a real protected ignored packet without
     /// exposing packet protection or sequence state. It is available only when
     /// the crate is built with the `test-support` feature. That feature is
-    /// opt-in, but Cargo feature unification means enabling it anywhere in a
-    /// build graph enables it for every `neotales-ssh` dependency in that
-    /// build; do not enable it in a production build unless this capability is
-    /// intended and reviewed.
+    /// opt-in. Feature unification is resolver- and dependency-kind-dependent,
+    /// and a dev-dependency or test-only build is not a boundary; do not enable
+    /// it in a production build unless this capability is intended and reviewed.
     ///
-    /// The hook refuses before an authenticated rekey starts, in strict-KEX
-    /// mode, after the server has sent NEWKEYS, and while any other protected
-    /// packet is pending. A `WouldBlock` leaves the exact packet pending;
-    /// retry with the same `data`. Every other failure invokes the transport's
-    /// existing rekey fail-close path and leaves protected I/O unusable.
+    /// If no rekey is active, the hook returns `NotEstablished`,
+    /// `UnauthenticatedMessage`, or `RekeyInProgress` without changing the
+    /// connection; those idle errors are safe because there is no rekey to
+    /// close. Once a rekey is active, an unauthenticated caller, strict-KEX,
+    /// post-NEWKEYS, ordering error, or terminal write failure invokes the
+    /// transport's existing fail-close path and leaves protected I/O unusable.
+    /// A `WouldBlock` leaves the exact packet pending; retry with the same
+    /// `data`.
     ///
     /// The `data` bytes are the IGNORE payload and are not logged or retained
     /// beyond the protected packet. Do not pass secrets.
     ///
     /// # Errors
     ///
-    /// Returns a state, ordering, transport, sequence, or protection error. A
-    /// non-`WouldBlock` failure fails the rekey closed.
+    /// Returns a state, ordering, transport, sequence, or protection error.
+    /// Idle/no-active errors may leave the connection usable. Once a rekey is
+    /// active, every non-`WouldBlock` failure fails it closed.
     #[cfg(feature = "test-support")]
     pub fn write_rekey_ignorable(&mut self, data: &[u8]) -> Result<(), ServerTransportError> {
         const SSH_MSG_IGNORE: u8 = 2;
         if !self.established {
             return Err(ServerTransportError::NotEstablished);
         }
-        if !self.authenticated {
-            return Err(ServerTransportError::UnauthenticatedMessage);
-        }
         if self.rekey.is_none() {
+            if !self.authenticated {
+                return Err(ServerTransportError::UnauthenticatedMessage);
+            }
             return Err(ServerTransportError::RekeyInProgress);
+        }
+        if !self.authenticated {
+            return Err(self.fail_rekey_closed(ServerTransportError::UnauthenticatedMessage));
         }
         if self.sequence.strict_kex() {
             return Err(self.fail_rekey_closed(ServerTransportError::Transport(

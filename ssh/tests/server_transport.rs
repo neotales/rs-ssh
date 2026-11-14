@@ -358,18 +358,46 @@ fn test_support_rekey_ignorable_requires_active_non_strict_rekey()
         server.write_rekey_ignorable(b"x"),
         Err(ServerTransportError::UnauthenticatedMessage)
     ));
+    assert!(server.is_established());
     server.mark_authenticated();
     assert!(matches!(
         server.write_rekey_ignorable(b"x"),
         Err(ServerTransportError::RekeyInProgress)
     ));
     assert!(server.is_established());
+    server.write_payload(&[94, 1])?;
+    assert_eq!(peer.receive_protected()?, [94, 1]);
 
     server.begin_rekey()?;
     peer.begin_rekey()?;
     assert_eq!(peer.receive_protected()?.first(), Some(&20));
+    let outbound_before = server.outbound_sequence();
     server.write_rekey_ignorable(b"x")?;
+    assert_eq!(server.outbound_sequence(), outbound_before + 1);
     assert_eq!(peer.receive_protected()?, [2, 0, 0, 0, 1, b'x']);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn test_support_rekey_ignorable_active_unauthenticated_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(48);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, _peer) = complete_raw_initial(&config, expected_key, false)?;
+
+    server.begin_rekey()?;
+    assert!(matches!(
+        server.write_rekey_ignorable(b"x"),
+        Err(ServerTransportError::UnauthenticatedMessage)
+    ));
+    assert!(server.rekey_is_terminal());
+    assert!(!server.is_established());
+    assert!(matches!(
+        server.write_payload(&[94]),
+        Err(ServerTransportError::NotEstablished)
+    ));
     Ok(())
 }
 
@@ -396,6 +424,40 @@ fn test_support_rekey_ignorable_strict_rekey_fails_closed() -> Result<(), Box<dy
         server.write_payload(&[94]),
         Err(ServerTransportError::NotEstablished)
     ));
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn test_support_rekey_ignorable_after_server_newkeys_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(49);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, false)?;
+    server.mark_authenticated();
+
+    server.begin_rekey()?;
+    peer.begin_rekey()?;
+    assert_eq!(peer.receive_protected()?.first(), Some(&20));
+
+    let mut client_kexinit = proposal(KEX_MLKEM768X25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    client_kexinit.cookie = [0x73; 16];
+    peer.send_rekey(&client_kexinit.encode()?, 20)?;
+    server.advance_rekey()?;
+
+    let client_kex = MlKemClientKex::from_seeds(&[0x91; 64], &[0x92; 32]);
+    peer.send_rekey(&client_kex.init_message()?, 30)?;
+    server.advance_rekey()?;
+    assert_eq!(peer.receive_protected()?.first(), Some(&31));
+    assert_eq!(peer.receive_protected()?, [21]);
+
+    assert!(matches!(
+        server.write_rekey_ignorable(b"x"),
+        Err(ServerTransportError::RekeyInProgress)
+    ));
+    assert!(server.rekey_is_terminal());
+    assert!(!server.is_established());
     Ok(())
 }
 
