@@ -48,6 +48,9 @@ impl Read for GatedSocket {
 impl Write for GatedSocket {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let allowed = self.write_allowance.load(Ordering::SeqCst);
+        if allowed == usize::MAX - 1 {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
         if allowed == 0 {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
@@ -81,6 +84,8 @@ enum PeerStep {
     Raw(Vec<u8>),
     ExpectData(Vec<u8>),
     ExpectPong(Vec<u8>),
+    ExpectGlobalFailure,
+    ExpectTruncatedPacket,
     ExpectOpened(ChannelId),
     ExpectClose(ChannelId),
     Wait(mpsc::Receiver<()>),
@@ -200,6 +205,17 @@ fn run_step(
             match TransportPing::decode(&payload).map_err(|e| e.to_string())? {
                 TransportPing::Pong(data) if data == expected => {}
                 other => return Err(format!("expected client pong, got {other:?}")),
+            }
+        }
+        PeerStep::ExpectGlobalFailure => {
+            match channels.dispatch_one().map_err(|e| e.to_string())? {
+                ChannelEvent::GlobalRequestFailed { .. } => {}
+                other => return Err(format!("expected global failure, got {other:?}")),
+            }
+        }
+        PeerStep::ExpectTruncatedPacket => {
+            if channels.transport_mut().read_payload().is_ok() {
+                return Err("partial reply unexpectedly completed".into());
             }
         }
         PeerStep::ExpectOpened(expected) => {
@@ -596,6 +612,144 @@ fn global_request_with_reply_is_surfaced_without_reply_and_blocks_release()
     release.send(())?;
     peer.join().map_err(|_| "peer panic")??;
     drop(driver);
+    Ok(())
+}
+
+#[test]
+fn consumed_global_request_failure_resumes_one_byte_at_a_time()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut driver, write, _read, sequence, steps, peer) = setup()?;
+    let id = admit_partial(&mut driver, &write)?;
+    steps.send(PeerStep::GlobalRequest { want_reply: true })?;
+    steps.send(PeerStep::ExpectData(b"abc".to_vec()))?;
+    steps.send(PeerStep::ExpectGlobalFailure)?;
+    steps.send(PeerStep::Finish)?;
+    assert!(matches!(
+        driver.read_inbound(&id)?,
+        OwnedChannelInbound::Event(ChannelEvent::GlobalRequest {
+            want_reply: true,
+            ..
+        })
+    ));
+    assert!(matches!(
+        driver.drive_global_failure(),
+        Err(OwnedChannelError::Busy)
+    ));
+    write.store(usize::MAX, Ordering::SeqCst);
+    driver.drive(&id)?;
+    assert_eq!(driver.outbound_sequence(), sequence + 1);
+    let mut blocks = 0;
+    loop {
+        write.store(1, Ordering::SeqCst);
+        match driver.drive_global_failure() {
+            Ok(()) => break,
+            Err(OwnedChannelError::Transport(TransportError::Io(error)))
+                if error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                blocks += 1;
+                assert!(blocks < 256);
+                assert_eq!(driver.outbound_sequence(), sequence + 1);
+                assert!(matches!(
+                    driver.admit_data(0, b"x"),
+                    Err(OwnedChannelError::Busy)
+                ));
+                assert!(matches!(
+                    driver.read_inbound(&id),
+                    Err(OwnedChannelError::Busy)
+                ));
+                driver = driver
+                    .try_into_connection()
+                    .expect_err("partial reply released");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert!(blocks > 1);
+    assert_eq!(driver.outbound_sequence(), sequence + 2);
+    assert!(matches!(
+        driver.drive_global_failure(),
+        Err(OwnedChannelError::Busy)
+    ));
+    assert_eq!(driver.channel(0).unwrap().remote_window(), 14);
+    let connection = driver
+        .try_into_connection()
+        .map_err(|_| "release refused")?;
+    drop(connection);
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn global_failure_fatal_write_prevents_release() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut driver, write, _read, sequence, steps, peer) = setup()?;
+    let id = admit_partial(&mut driver, &write)?;
+    let (release, wait) = mpsc::channel();
+    steps.send(PeerStep::GlobalRequest { want_reply: true })?;
+    steps.send(PeerStep::ExpectData(b"abc".to_vec()))?;
+    steps.send(PeerStep::Wait(wait))?;
+    steps.send(PeerStep::Finish)?;
+    assert!(matches!(
+        driver.read_inbound(&id)?,
+        OwnedChannelInbound::Event(ChannelEvent::GlobalRequest {
+            want_reply: true,
+            ..
+        })
+    ));
+    write.store(usize::MAX, Ordering::SeqCst);
+    driver.drive(&id)?;
+    write.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        driver.drive_global_failure(),
+        Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    write.store(usize::MAX - 1, Ordering::SeqCst);
+    assert!(matches!(
+        driver.drive_global_failure(),
+        Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert_eq!(driver.outbound_sequence(), sequence + 1);
+    assert!(matches!(
+        driver.drive_global_failure(),
+        Err(OwnedChannelError::Failed)
+    ));
+    let driver = driver
+        .try_into_connection()
+        .expect_err("failed driver released");
+    drop(driver);
+    release.send(())?;
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn dropping_driver_during_global_failure_closes_partial_packet()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut driver, write, _read, sequence, steps, peer) = setup()?;
+    let id = admit_partial(&mut driver, &write)?;
+    steps.send(PeerStep::GlobalRequest { want_reply: true })?;
+    steps.send(PeerStep::ExpectData(b"abc".to_vec()))?;
+    steps.send(PeerStep::ExpectTruncatedPacket)?;
+    steps.send(PeerStep::Finish)?;
+    assert!(matches!(
+        driver.read_inbound(&id)?,
+        OwnedChannelInbound::Event(ChannelEvent::GlobalRequest {
+            want_reply: true,
+            ..
+        })
+    ));
+    write.store(usize::MAX, Ordering::SeqCst);
+    driver.drive(&id)?;
+    write.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        driver.drive_global_failure(),
+        Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert_eq!(driver.outbound_sequence(), sequence + 1);
+    drop(driver);
+    peer.join().map_err(|_| "peer panic")??;
     Ok(())
 }
 

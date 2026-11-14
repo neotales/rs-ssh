@@ -671,17 +671,24 @@ impl std::error::Error for OwnedChannelError {
 #[derive(Clone, Debug)]
 pub struct OwnedChannelWriteId(OwnedPacketId);
 
+#[derive(Debug)]
+enum GlobalFailure {
+    Queued,
+    Writing(OwnedPacketId),
+}
+
 /// One bounded result from [`OwnedChannelDriver::read_inbound`].
 #[derive(Debug)]
 pub enum OwnedChannelInbound {
     /// One complete channel event was decoded and delivered unchanged.
     ///
-    /// The driver never answers a request, never sends a close, and never
-    /// adjusts a window on the caller's behalf. When
+    /// The driver never automatically answers a request, sends a close, or
+    /// adjusts a window. When
     /// [`OwnedChannelDriver::read_inbound`] surfaces a `Request` or
     /// `GlobalRequest` that asked for a reply, a channel `OpenRequest`, or a
-    /// `Close` this side has not already sent, the driver cannot discharge
-    /// that obligation and blocks further reads and release; see that method.
+    /// `Close` this side has not already sent, the obligation blocks further
+    /// reads and release. Global requests have an explicit failure reply path;
+    /// the other obligations do not.
     Event(ChannelEvent),
     /// One authenticated payload was consumed and carried no channel event.
     ///
@@ -710,13 +717,14 @@ pub enum OwnedChannelInbound {
 ///
 /// [`Self::read_inbound`] adds one opt-in inbound step while the admitted
 /// packet is active. It is deliberately not a full-duplex scheduler: it does
-/// not loop, does not answer control requests, does not reply to a peer close,
+/// not loop, does not automatically answer requests, does not reply to a peer close,
 /// and does not handle rekey. The admitted data packet can be driven with
 /// [`Self::drive`] unless the driver fails; a deferred pong can then be written
 /// with [`Self::drive_deferred_pong`]. Release is allowed only when no other
-/// obligation or failure remains. An inbound open, an unanswered peer close, or
-/// a request that wants a reply has no driver completion path, so the caller
-/// drops the driver. [`Self::try_new`] refuses a connection that already has a
+/// obligation or failure remains. [`Self::drive_global_failure`] answers one
+/// consumed global request; an inbound open, unanswered peer close, or channel
+/// request that wants a reply has no completion path, so the caller drops the
+/// driver. [`Self::try_new`] refuses a connection that already has a
 /// pending open or an unanswered peer close, so those pre-existing obligations
 /// stay answerable through the legacy API. A global or channel request that was
 /// already delivered to the caller is that caller's to answer and is not
@@ -741,8 +749,10 @@ pub struct OwnedChannelDriver<S> {
     failed: bool,
     /// An inbound ping was consumed and its pong has not been written.
     pong_owed: bool,
-    /// An inbound event requires a protocol reply this driver cannot send.
+    /// An inbound event requires a protocol reply.
     control_owed: bool,
+    /// A global failure is queued, or has been sealed under this ID.
+    global_failure: Option<GlobalFailure>,
 }
 
 impl<S: Read + Write> OwnedChannelDriver<S> {
@@ -759,7 +769,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// the connection over. A transport that is busy for another reason,
     /// including a deferred pong or a partial packet, is also refused; finish
     /// that transport work through the transport API and retry. The driver has
-    /// no reply path, so accepting a connection with an open or close
+    /// no reply path for open or close, so accepting a connection with such an
     /// obligation would leave the caller unable to answer or release it.
     pub fn try_new(
         connection: ChannelConnection<ClientTransport<S>>,
@@ -778,6 +788,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             failed: false,
             pong_owed: false,
             control_owed: false,
+            global_failure: None,
         })
     }
 
@@ -966,12 +977,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///   global request whose `want_reply` is set is surfaced as an event and
     ///   also blocks further reads and release.
     ///
-    /// A deferred pong is the one obligation with a driver completion path. The
-    /// open, close, and request cases are not answerable through this driver,
-    /// so drop it and its transport instead. That is the deliberate limit: this
-    /// is an inbound step, not a scheduler for control replies or rekey. A data
-    /// event that exhausts the local window is not a reply obligation; adjust
-    /// the window after release if the peer should continue.
+    /// A deferred pong and a global failure have driver completion paths. The
+    /// open, close, and channel request cases are not answerable through this
+    /// driver, so drop it and its transport instead. This is not a general
+    /// scheduler for control replies or rekey. A data event that exhausts the
+    /// local window is not a reply obligation; adjust the window after release
+    /// if the peer should continue.
     ///
     /// `WouldBlock` preserves the partial inbound packet, the admitted outbound
     /// packet, and every obligation. A stale or foreign identifier returns
@@ -1000,6 +1011,15 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                     Ok(Some(event)) => {
                         if self.event_owes_control(&event) {
                             self.control_owed = true;
+                            if matches!(
+                                event,
+                                ChannelEvent::GlobalRequest {
+                                    want_reply: true,
+                                    ..
+                                }
+                            ) {
+                                self.global_failure = Some(GlobalFailure::Queued);
+                            }
                         }
                         Ok(OwnedChannelInbound::Event(event))
                     }
@@ -1025,16 +1045,66 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
+    /// Refuses a consumed global request that asked for a reply.
+    ///
+    /// The admitted data and any deferred pong must be complete first. The
+    /// reply occupies at most one protected packet and is retained across
+    /// `WouldBlock`. Reads, new data and release remain blocked until it
+    /// completes. Dropping the driver discards the connection, not just the
+    /// obligation. A non-retryable transport error makes the driver terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy when no global failure is owed or earlier work remains,
+    /// failed after a terminal error, or a transport error.
+    pub fn drive_global_failure(&mut self) -> Result<(), OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.pending || self.pong_owed || self.global_failure.is_none() {
+            return Err(OwnedChannelError::Busy);
+        }
+        if matches!(self.global_failure, Some(GlobalFailure::Queued)) {
+            match self
+                .connection
+                .transport
+                .start_owned_packet(&[SSH_MSG_REQUEST_FAILURE])
+            {
+                Ok(id) => self.global_failure = Some(GlobalFailure::Writing(id)),
+                Err(error) => {
+                    self.failed = true;
+                    return Err(OwnedChannelError::Transport(error));
+                }
+            }
+        }
+        let Some(GlobalFailure::Writing(id)) = self.global_failure.as_ref() else {
+            unreachable!("global failure was admitted");
+        };
+        match self.connection.transport.drive_owned_packet(id) {
+            Ok(()) => {
+                self.global_failure = None;
+                self.control_owed = false;
+                Ok(())
+            }
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(OwnedChannelError::Transport(error))
+            }
+        }
+    }
+
     /// Writes a pong that [`Self::read_inbound`] deferred.
     ///
     /// The admitted data packet must complete first. `WouldBlock` preserves the
     /// pong and is retryable; any other write failure makes the driver
     /// terminal. A pong is owed only after
     /// [`OwnedChannelInbound::PongDeferred`], and the connection cannot be
-    /// released until this succeeds. This is the one inbound obligation with a
-    /// driver completion path; an inbound open, an unanswered peer close, or a
-    /// request that wants a reply has no such path and requires dropping the
-    /// driver.
+    /// released until this succeeds. A global request has its own completion
+    /// path; an inbound open, an unanswered peer close, or a channel request
+    /// that wants a reply requires dropping the driver.
     ///
     /// # Errors
     ///
@@ -1087,8 +1157,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// the same condition.
     ///
     /// The driver has no reply path for an inbound open, a peer close this side
-    /// has not answered, or a request surfaced by [`Self::read_inbound`] that
-    /// asked for a reply. Those keep the connection retained and require
+    /// has not answered, or a channel request surfaced by [`Self::read_inbound`]
+    /// that asked for a reply. Those keep the connection retained and require
     /// dropping the driver and its transport, as does a failed driver.
     /// Pre-existing opens and unanswered closes are refused by
     /// [`Self::try_new`] before the driver takes ownership; a global or channel
