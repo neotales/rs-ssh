@@ -711,19 +711,21 @@ struct CloseReply {
     packet: Option<OwnedPacketId>,
 }
 
-/// One bounded result from [`OwnedChannelDriver::read_inbound`] or
-/// [`OwnedChannelDriver::read_idle`].
+/// One bounded result from [`OwnedChannelDriver::read_inbound`],
+/// [`OwnedChannelDriver::read_idle`], or
+/// [`OwnedChannelDriver::read_while_window_adjustment`].
 #[derive(Debug)]
 pub enum OwnedChannelInbound {
     /// One complete channel event was decoded and delivered unchanged.
     ///
     /// The driver never automatically answers a request, sends a close, or
-    /// adjusts a window. When
-    /// either read step surfaces a `Request` or `GlobalRequest` that asked for
+    /// adjusts a window. When any read step surfaces a `Request` or `GlobalRequest` that asked for
     /// a reply, a channel `OpenRequest`, or a `Close` this side has not already
     /// sent, the obligation blocks further reads and release. Global and
     /// channel requests have explicit failure reply paths; open requests can be
-    /// rejected and a peer close can be answered explicitly.
+    /// rejected and a peer close can be answered explicitly. If the event
+    /// arrives during a window adjustment, that adjustment must complete
+    /// before the reply can be driven.
     Event(ChannelEvent),
     /// One authenticated payload was consumed and carried no channel event.
     ///
@@ -733,9 +735,9 @@ pub enum OwnedChannelInbound {
     Consumed,
     /// An inbound transport ping was consumed and its pong is owed.
     ///
-    /// No further inbound read is permitted until any admitted data packet
-    /// completes and [`OwnedChannelDriver::drive_deferred_pong`] writes the
-    /// pong. The connection cannot be released while the pong is owed.
+    /// No further inbound read is permitted until any admitted data packet or
+    /// window adjustment completes and [`OwnedChannelDriver::drive_deferred_pong`]
+    /// writes the pong. The connection cannot be released while the pong is owed.
     PongDeferred,
 }
 
@@ -1749,7 +1751,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
-    /// Writes a pong that [`Self::read_inbound`] or [`Self::read_idle`] deferred.
+    /// Writes a pong deferred by [`Self::read_inbound`], [`Self::read_idle`],
+    /// or [`Self::read_while_window_adjustment`].
     ///
     /// Any admitted data packet or window adjustment must complete first. `WouldBlock` preserves the
     /// pong and is retryable; any other write failure makes the driver
@@ -1761,8 +1764,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy when no pong is owed or the data packet is still active,
-    /// or a transport error.
+    /// Returns busy when no pong is owed or the data packet or window
+    /// adjustment is still active, or a transport error.
     pub fn drive_deferred_pong(&mut self) -> Result<(), OwnedChannelError> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
