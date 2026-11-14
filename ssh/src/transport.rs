@@ -1345,9 +1345,12 @@ where
     ///   with [`ClientTransport::advance_rekey`] one bounded step at a time,
     ///   then retry `read_payload` for the next application payload.
     /// * When an owned read retained the KEXINIT, this call did not consume it.
-    ///   While an owned packet or deferred PONG is still active, the retained
-    ///   advance reports [`TransportError::OwnedPacketState`]; finish the
-    ///   owned packet and then [`Self::drive_deferred_pong`]. After that, use
+    ///   The retained advance reports [`TransportError::OwnedPacketState`]
+    ///   while an owned packet or deferred PONG is still active. Finish the
+    ///   owned packet first; then, only if [`Self::read_while_owned`] actually
+    ///   deferred a PONG, call [`Self::drive_deferred_pong`]. Calling that
+    ///   method when no PONG is owed also returns `OwnedPacketState`. After
+    ///   both conditions are clear, use
     ///   [`ClientTransport::advance_retained_peer_rekey`]. Do not call
     ///   [`ClientTransport::advance_rekey`], which refuses a retained
     ///   proposal.
@@ -1359,9 +1362,14 @@ where
     /// packet. Returns [`TransportError::OwnedPacketState`] while an owned
     /// packet is active; drive it with its identifier or discard the transport.
     /// Returns [`TransportError::RekeyInProgress`] while a rekey is active,
-    /// including a retained peer proposal. After the owner completes, a pong
-    /// deferred by [`Self::read_while_owned`] is written before the next read;
-    /// `WouldBlock` preserves it for retry.
+    /// including a retained peer proposal.
+    ///
+    /// After the owner completes, a PONG deferred by [`Self::read_while_owned`]
+    /// is written before the next read only when no rekey is active;
+    /// `WouldBlock` preserves it for retry. A retained peer KEXINIT makes this
+    /// method return `RekeyInProgress` before that write. In that case, if a
+    /// PONG is owed, drive it first; otherwise skip `drive_deferred_pong` and
+    /// advance the retained proposal.
     pub fn read_payload(&mut self) -> Result<Vec<u8>, TransportError> {
         if self.owned_packet.is_some() {
             return Err(TransportError::OwnedPacketState);
