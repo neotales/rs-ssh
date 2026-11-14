@@ -880,6 +880,7 @@ where
                 immediate: self.config.immediate_compression,
             },
             rekey: None,
+            protected_packets_read: 0,
         })
     }
 
@@ -1345,6 +1346,12 @@ pub struct ServerTransport<S> {
     established: bool,
     authenticated: bool,
     rekey: Option<ServerRekeyState>,
+    /// Every protected packet read after NEWKEYS, including `PING`,
+    /// `EXT_INFO`, and rekey traffic. Monotonic across rekey sequence resets,
+    /// so a caller can count packets without relying on the wire sequence
+    /// number. This is a read-only diagnostic seam; it does not affect packet
+    /// handling.
+    protected_packets_read: u64,
 }
 
 /// An explicit name for the server state returned before SSH-009 authentication.
@@ -1373,6 +1380,7 @@ impl<S> fmt::Debug for ServerTransport<S> {
             .field("outbound_sequence", &self.sequence.outbound_sequence())
             .field("established", &self.established)
             .field("authenticated", &self.authenticated)
+            .field("protected_packets_read", &self.protected_packets_read)
             .field("host_key", &self.host_key)
             .finish_non_exhaustive()
     }
@@ -1485,9 +1493,25 @@ where
     }
 
     /// Returns the next inbound packet sequence number without consuming it.
+    ///
+    /// This resets at a strict-rekey NEWKEYS, so it is not a monotonic packet
+    /// count. Use [`Self::protected_packets_read`] for that.
     #[must_use]
     pub const fn inbound_sequence(&self) -> u32 {
         self.sequence.inbound_sequence()
+    }
+
+    /// Returns every protected packet read after NEWKEYS, including `PING`,
+    /// `EXT_INFO`, and rekey traffic.
+    ///
+    /// The count is monotonic across strict-rekey sequence resets, unlike
+    /// [`Self::inbound_sequence`]. It is a read-only diagnostic seam for
+    /// callers that must attribute a read to exactly one protected packet; it
+    /// does not affect packet handling or security decisions.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn protected_packets_read(&self) -> u64 {
+        self.protected_packets_read
     }
 
     /// Returns the next outbound packet sequence number without consuming it.
@@ -2427,7 +2451,10 @@ where
             protector,
             sequence,
         ) {
-            Ok(payload) => Ok(payload),
+            Ok(payload) => {
+                self.protected_packets_read = self.protected_packets_read.saturating_add(1);
+                Ok(payload)
+            }
             Err(error) if matches!(error, TransportError::Io(_) | TransportError::Truncated) => {
                 Err(error.into())
             }

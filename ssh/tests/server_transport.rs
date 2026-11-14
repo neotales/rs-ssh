@@ -267,6 +267,7 @@ fn server_rekeys_hybrid_with_old_keys_until_newkeys_and_keeps_session_identity()
     let config = ServerConfig::new(signer);
     let (mut server, mut peer) = complete_raw_initial(&config, expected_key, true)?;
     let original_session_id = server.session_id().to_vec();
+    let packets_before_rekey = server.protected_packets_read();
 
     server.begin_rekey()?;
     peer.begin_rekey()?;
@@ -315,11 +316,22 @@ fn server_rekeys_hybrid_with_old_keys_until_newkeys_and_keeps_session_identity()
     assert_eq!(server.outbound_sequence(), 0);
     assert!(server.rekey_reset_applied(sequence::Direction::Inbound));
     assert!(server.rekey_reset_applied(sequence::Direction::Outbound));
+    // The wire sequence reset to 0, but the monotonic packet counter did not:
+    // it saw every rekey packet and remains usable as a boundary count.
+    let packets_after_rekey = server.protected_packets_read();
+    assert!(
+        packets_after_rekey > packets_before_rekey,
+        "the monotonic packet counter must survive a strict-rekey sequence reset"
+    );
     assert_eq!(server.session_id(), original_session_id.as_slice());
     assert_eq!(server.host_key(), &expected_key);
     peer.install_rekey_protectors(&derived)?;
     peer.send_application(&[50, 1, 2, 3])?;
     assert_eq!(server.read_auth_packet()?, [50, 1, 2, 3]);
+    assert!(
+        server.protected_packets_read() > packets_after_rekey,
+        "the counter must advance for the first post-rekey application packet"
+    );
     server.write_payload(&[94, 9, 8, 7])?;
     assert_eq!(peer.receive_protected()?, [94, 9, 8, 7]);
     assert_eq!(
