@@ -679,6 +679,13 @@ pub struct OwnedWindowAdjustmentId(OwnedPacketId);
 #[derive(Clone, Debug)]
 pub struct OwnedChannelEofId(OwnedPacketId);
 
+/// Opaque identity for reading behind one active channel-failure reply.
+#[derive(Clone, Debug)]
+pub struct OwnedChannelFailureReadId {
+    channel: ChannelId,
+    packet: OwnedPacketId,
+}
+
 #[derive(Debug)]
 struct WindowAdjustment {
     channel: ChannelId,
@@ -691,9 +698,9 @@ enum GlobalFailure {
     Writing(OwnedPacketId),
 }
 
-/// The single obligation accepted behind a writing global reply.
+/// The single obligation accepted behind a writing reply.
 #[derive(Debug)]
-enum NextGlobalObligation {
+enum NextReplyObligation {
     Pong,
     GlobalFailure,
     ChannelFailure {
@@ -733,7 +740,8 @@ struct CloseReply {
 /// [`OwnedChannelDriver::read_idle`], or
 /// [`OwnedChannelDriver::read_while_window_adjustment`], or
 /// [`OwnedChannelDriver::read_while_eof`], or
-/// [`OwnedChannelDriver::read_while_global_failure`].
+/// [`OwnedChannelDriver::read_while_global_failure`], or
+/// [`OwnedChannelDriver::read_while_channel_failure`].
 #[derive(Debug)]
 pub enum OwnedChannelInbound {
     /// One complete channel event was decoded and delivered unchanged.
@@ -744,8 +752,8 @@ pub enum OwnedChannelInbound {
     /// sent, the obligation blocks further reads and release. Global and
     /// channel requests have explicit failure reply paths; open requests can be
     /// rejected and a peer close can be answered explicitly. If the event
-    /// arrives during a window adjustment, EOF or global failure, that packet
-    /// must complete before the reply can be driven.
+    /// arrives during a window adjustment, EOF, global failure or channel
+    /// failure, that packet must complete before the reply can be driven.
     Event(ChannelEvent),
     /// One authenticated payload was consumed and carried no channel event.
     ///
@@ -756,7 +764,7 @@ pub enum OwnedChannelInbound {
     /// An inbound transport ping was consumed and its pong is owed.
     ///
     /// No further inbound read is permitted until any admitted data packet or
-    /// window adjustment, EOF or active global failure completes and
+    /// window adjustment, EOF or active global or channel failure completes and
     /// [`OwnedChannelDriver::drive_deferred_pong`]
     /// writes the pong. The connection cannot be released while the pong is owed.
     PongDeferred,
@@ -811,8 +819,8 @@ pub struct OwnedChannelDriver<S> {
     control_owed: bool,
     /// A global failure is queued, or has been sealed under this ID.
     global_failure: Option<GlobalFailure>,
-    /// One later obligation, distinct from the writing global packet.
-    next_global_obligation: Option<NextGlobalObligation>,
+    /// One later obligation, distinct from the writing reply packet.
+    next_reply_obligation: Option<NextReplyObligation>,
     /// One consumed channel request, retained until its failure is complete.
     channel_failure: Option<ChannelFailure>,
     /// One peer open retained until its rejection has been written.
@@ -859,7 +867,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             pong_owed: false,
             control_owed: false,
             global_failure: None,
-            next_global_obligation: None,
+            next_reply_obligation: None,
             channel_failure: None,
             open_rejection: None,
             close_reply: None,
@@ -1196,8 +1204,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// ID and resume, or drop the driver and all separate socket handles.
     /// Terminal protocol or I/O errors fail the driver; peer rekey is unsupported
     /// and fails closed. Use [`Self::read_while_eof`] for an active EOF and
-    /// [`Self::read_while_global_failure`] for an active global failure;
-    /// reads during other reply writes remain unsupported.
+    /// [`Self::read_while_global_failure`] or [`Self::read_while_channel_failure`]
+    /// for an active failure reply; reads during other reply writes remain unsupported.
     ///
     /// # Errors
     ///
@@ -1328,8 +1336,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// `WouldBlock` retains partial input and the outbound EOF. Retain the ID
     /// and retry after readiness, or drop the driver and any separately held
     /// socket handles. Terminal errors fail the driver. Peer rekey fails
-    /// closed. [`Self::read_while_global_failure`] covers an active global
-    /// failure; reads while other control replies are pending remain unsupported.
+    /// closed. [`Self::read_while_global_failure`] and
+    /// [`Self::read_while_channel_failure`] cover those active replies; reads
+    /// while other control replies are pending remain unsupported.
     ///
     /// # Errors
     ///
@@ -1532,8 +1541,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// A partial read and the active packet survive `WouldBlock`. On
     /// cancellation retain the driver or drop it and its separate socket
     /// handles. Terminal I/O or protocol errors fail the driver; peer rekey is
-    /// unsupported and fails closed. Reads while other reply ciphertext is
-    /// active remain unsupported.
+    /// unsupported and fails closed. [`Self::read_while_channel_failure`]
+    /// covers channel failures; reads while other reply ciphertext is active
+    /// remain unsupported.
     ///
     /// # Errors
     ///
@@ -1543,12 +1553,84 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.next_global_obligation.is_some() {
+        if self.next_reply_obligation.is_some() {
             return Err(OwnedChannelError::Busy);
         }
         let Some(GlobalFailure::Writing(id)) = self.global_failure.as_ref() else {
             return Err(OwnedChannelError::Busy);
         };
+        let id = id.clone();
+        self.read_behind_reply(&id)
+    }
+
+    /// Returns the identity of an active channel-failure reply.
+    ///
+    /// `channel` is the local channel from the request event. This succeeds
+    /// only after [`Self::drive_channel_failure`] has admitted the packet. The
+    /// ID cannot be reused for a later reply on the same channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy for a wrong channel or no active packet, or failed after a
+    /// terminal error.
+    pub fn channel_failure_read_id(
+        &self,
+        channel: ChannelId,
+    ) -> Result<OwnedChannelFailureReadId, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        let Some(failure) = self.channel_failure.as_ref() else {
+            return Err(OwnedChannelError::Busy);
+        };
+        if failure.channel != channel {
+            return Err(OwnedChannelError::Busy);
+        }
+        let Some(packet) = failure.packet.clone() else {
+            return Err(OwnedChannelError::Busy);
+        };
+        Ok(OwnedChannelFailureReadId { channel, packet })
+    }
+
+    /// Reads one authenticated packet behind a partially written channel failure.
+    ///
+    /// `id` comes from [`Self::channel_failure_read_id`] and identifies the
+    /// packet's retained owner. One PING or reply-requiring event can be
+    /// retained behind it; further reads then return busy. Complete the active
+    /// channel failure before driving the promoted reply or PONG.
+    ///
+    /// `WouldBlock` retains partial input. On cancellation keep the driver or
+    /// drop it and separately held socket handles. Fatal I/O or protocol errors
+    /// fail the driver; peer rekey fails closed. Reads during other reply
+    /// ciphertext remain unsupported except for [`Self::read_while_global_failure`].
+    ///
+    /// # Errors
+    ///
+    /// Returns busy for a stale or foreign ID, no active packet or a full next
+    /// slot, failed after a terminal error, or a channel or transport error.
+    pub fn read_while_channel_failure(
+        &mut self,
+        id: &OwnedChannelFailureReadId,
+    ) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.next_reply_obligation.is_some() {
+            return Err(OwnedChannelError::Busy);
+        }
+        let Some(failure) = self.channel_failure.as_ref() else {
+            return Err(OwnedChannelError::Busy);
+        };
+        if failure.channel != id.channel || failure.packet.is_none() {
+            return Err(OwnedChannelError::Busy);
+        }
+        self.read_behind_reply(&id.packet)
+    }
+
+    fn read_behind_reply(
+        &mut self,
+        id: &OwnedPacketId,
+    ) -> Result<OwnedChannelInbound, OwnedChannelError> {
         match self.connection.transport.read_while_owned(id) {
             Ok(OwnedInbound::Payload(payload)) => {
                 let event = match self.connection.dispatch_decoded_payload(&payload) {
@@ -1565,7 +1647,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                     let next = match &event {
                         ChannelEvent::GlobalRequest {
                             want_reply: true, ..
-                        } => NextGlobalObligation::GlobalFailure,
+                        } => NextReplyObligation::GlobalFailure,
                         ChannelEvent::Request {
                             channel,
                             want_reply: true,
@@ -1578,12 +1660,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                                     return Err(OwnedChannelError::Channel(error));
                                 }
                             };
-                            NextGlobalObligation::ChannelFailure {
+                            NextReplyObligation::ChannelFailure {
                                 channel: *channel,
                                 remote,
                             }
                         }
-                        ChannelEvent::OpenRequest(request) => NextGlobalObligation::OpenRejection {
+                        ChannelEvent::OpenRequest(request) => NextReplyObligation::OpenRejection {
                             remote: request.sender_channel(),
                         },
                         ChannelEvent::Close { channel } => {
@@ -1594,7 +1676,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                                     return Err(OwnedChannelError::Channel(error));
                                 }
                             };
-                            NextGlobalObligation::CloseReply {
+                            NextReplyObligation::CloseReply {
                                 channel: *channel,
                                 remote,
                             }
@@ -1604,12 +1686,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                             return Err(OwnedChannelError::Channel(ChannelError::InvalidMessage));
                         }
                     };
-                    self.next_global_obligation = Some(next);
+                    self.next_reply_obligation = Some(next);
                 }
                 Ok(OwnedChannelInbound::Event(event))
             }
             Ok(OwnedInbound::PongDeferred) => {
-                self.next_global_obligation = Some(NextGlobalObligation::Pong);
+                self.next_reply_obligation = Some(NextReplyObligation::Pong);
                 Ok(OwnedChannelInbound::PongDeferred)
             }
             Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
@@ -1623,16 +1705,16 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
-    fn promote_after_global_failure(&mut self) {
+    fn promote_after_reply(&mut self) {
         self.control_owed = false;
-        match self.next_global_obligation.take() {
+        match self.next_reply_obligation.take() {
             None => {}
-            Some(NextGlobalObligation::Pong) => self.pong_owed = true,
-            Some(NextGlobalObligation::GlobalFailure) => {
+            Some(NextReplyObligation::Pong) => self.pong_owed = true,
+            Some(NextReplyObligation::GlobalFailure) => {
                 self.control_owed = true;
                 self.global_failure = Some(GlobalFailure::Queued);
             }
-            Some(NextGlobalObligation::ChannelFailure { channel, remote }) => {
+            Some(NextReplyObligation::ChannelFailure { channel, remote }) => {
                 self.control_owed = true;
                 self.channel_failure = Some(ChannelFailure {
                     channel,
@@ -1640,14 +1722,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                     packet: None,
                 });
             }
-            Some(NextGlobalObligation::OpenRejection { remote }) => {
+            Some(NextReplyObligation::OpenRejection { remote }) => {
                 self.control_owed = true;
                 self.open_rejection = Some(OpenRejection {
                     remote,
                     packet: None,
                 });
             }
-            Some(NextGlobalObligation::CloseReply { channel, remote }) => {
+            Some(NextReplyObligation::CloseReply { channel, remote }) => {
                 self.control_owed = true;
                 self.close_reply = Some(CloseReply {
                     channel,
@@ -1704,7 +1786,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         match self.connection.transport.drive_owned_packet(id) {
             Ok(()) => {
                 self.global_failure = None;
-                self.promote_after_global_failure();
+                self.promote_after_reply();
                 Ok(())
             }
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1723,8 +1805,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// channel is rejected without changing the obligation. Data, a window
     /// adjustment, EOF, a deferred pong and any global failure must complete
     /// first. The protected reply is
-    /// retained across `WouldBlock`; reads, admission and release remain
-    /// blocked until completion. Dropping the driver discards its connection.
+    /// retained across `WouldBlock`; [`Self::read_while_channel_failure`] may
+    /// read with one bounded next obligation once the reply starts. Admission
+    /// and release remain blocked until completion. Dropping the driver
+    /// discards its connection.
     ///
     /// # Errors
     ///
@@ -1771,7 +1855,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         match self.connection.transport.drive_owned_packet(id) {
             Ok(()) => {
                 self.channel_failure = None;
-                self.control_owed = false;
+                self.promote_after_reply();
                 Ok(())
             }
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1959,9 +2043,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
 
     /// Writes a pong deferred by [`Self::read_inbound`], [`Self::read_idle`],
     /// [`Self::read_while_window_adjustment`], [`Self::read_while_eof`], or
-    /// [`Self::read_while_global_failure`].
+    /// [`Self::read_while_global_failure`], or [`Self::read_while_channel_failure`].
     ///
-    /// Any admitted data packet, window adjustment or EOF must complete first.
+    /// Any admitted data packet, window adjustment, EOF or active global or
+    /// channel failure must complete first.
     /// `WouldBlock` preserves the
     /// pong and is retryable; any other write failure makes the driver
     /// terminal. A pong is owed only after
@@ -1972,8 +2057,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy when no pong is owed or the data packet, window adjustment
-    /// or EOF is still active, or a transport error.
+    /// Returns busy when no pong is owed or an earlier packet is still active,
+    /// or a transport error.
     pub fn drive_deferred_pong(&mut self) -> Result<(), OwnedChannelError> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
@@ -2025,11 +2110,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// received behind one of those packets is answered after that packet
     /// completes.
     ///
-    /// If [`Self::read_while_global_failure`] receives a PING or a
+    /// If [`Self::read_while_global_failure`] or
+    /// [`Self::read_while_channel_failure`] receives a PING or a
     /// reply-requiring event, it retains at most one next obligation. Complete
-    /// the active global failure with [`Self::drive_global_failure`] first;
-    /// only then drive the promoted pong or reply. Further reads are blocked
-    /// while that next slot is occupied.
+    /// the active global or channel failure first; only then drive the promoted
+    /// pong or reply. Further reads are blocked while that next slot is occupied.
     ///
     /// Drive a deferred pong with [`Self::drive_deferred_pong`], a global
     /// failure with [`Self::drive_global_failure`], a channel failure with
@@ -2054,7 +2139,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             || self.failed
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
-            || self.next_global_obligation.is_some()
+            || self.next_reply_obligation.is_some()
             || self.pong_owed
             || self.control_owed
             || self.connection.pending_open_count() != 0
