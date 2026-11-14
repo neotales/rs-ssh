@@ -711,15 +711,16 @@ pub enum OwnedChannelInbound {
 /// [`Self::read_inbound`] adds one opt-in inbound step while the admitted
 /// packet is active. It is deliberately not a full-duplex scheduler: it does
 /// not loop, does not answer control requests, does not reply to a peer close,
-/// and does not handle rekey. The admitted data packet is always completable
-/// with [`Self::drive`]; a deferred pong is completable with
-/// [`Self::drive_deferred_pong`] once that packet is complete. An inbound open,
-/// an unanswered peer close, or a request that wants a reply has no driver
-/// completion path, so the caller drops the driver. [`Self::try_new`] refuses a
-/// connection that already has a pending open or an unanswered peer close, so
-/// those pre-existing obligations stay answerable through the legacy API. A
-/// global or channel request that was already delivered to the caller is that
-/// caller's to answer and is not visible to the constructor.
+/// and does not handle rekey. The admitted data packet can be driven with
+/// [`Self::drive`] unless the driver fails; a deferred pong can then be written
+/// with [`Self::drive_deferred_pong`]. Release is allowed only when no other
+/// obligation or failure remains. An inbound open, an unanswered peer close, or
+/// a request that wants a reply has no driver completion path, so the caller
+/// drops the driver. [`Self::try_new`] refuses a connection that already has a
+/// pending open or an unanswered peer close, so those pre-existing obligations
+/// stay answerable through the legacy API. A global or channel request that was
+/// already delivered to the caller is that caller's to answer and is not
+/// visible to the constructor.
 ///
 /// The wrapped connection's mutable transport cannot be reached through the
 /// driver:
@@ -1079,10 +1080,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// Releases the connection only when no admitted packet, obligation, or
     /// failure is outstanding. On refusal, returns the still-owning driver.
     ///
-    /// An admitted data packet is not a reason to drop the driver: complete it
-    /// with [`Self::drive`], then release. A deferred pong is also
-    /// dischargeable: once the data packet is complete, call
-    /// [`Self::drive_deferred_pong`], then release.
+    /// An admitted data packet can be driven with [`Self::drive`] unless the
+    /// driver fails. Once it completes, release is allowed only if no other
+    /// obligation or failure remains. A deferred pong can then be written with
+    /// [`Self::drive_deferred_pong`]; after that, release is allowed only under
+    /// the same condition.
     ///
     /// The driver has no reply path for an inbound open, a peer close this side
     /// has not answered, or a request surfaced by [`Self::read_inbound`] that
