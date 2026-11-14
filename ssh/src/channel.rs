@@ -684,6 +684,12 @@ struct ChannelFailure {
     packet: Option<OwnedPacketId>,
 }
 
+#[derive(Debug)]
+struct OpenRejection {
+    remote: ChannelId,
+    packet: Option<(u32, OwnedPacketId)>,
+}
+
 /// One bounded result from [`OwnedChannelDriver::read_inbound`].
 #[derive(Debug)]
 pub enum OwnedChannelInbound {
@@ -695,7 +701,8 @@ pub enum OwnedChannelInbound {
     /// `GlobalRequest` that asked for a reply, a channel `OpenRequest`, or a
     /// `Close` this side has not already sent, the obligation blocks further
     /// reads and release. Global and channel requests have explicit failure
-    /// reply paths; open and close obligations do not.
+    /// reply paths; open requests can be rejected, while close obligations
+    /// have no completion path.
     Event(ChannelEvent),
     /// One authenticated payload was consumed and carried no channel event.
     ///
@@ -708,8 +715,7 @@ pub enum OwnedChannelInbound {
     /// No further inbound read is permitted until the admitted data packet
     /// completes and [`OwnedChannelDriver::drive_deferred_pong`] writes the
     /// pong. The connection cannot be released while the pong is owed. Unlike
-    /// an inbound open or an unanswered peer close, this obligation has a
-    /// driver completion path.
+    /// an unanswered peer close, this obligation has a driver completion path.
     PongDeferred,
 }
 
@@ -730,8 +736,9 @@ pub enum OwnedChannelInbound {
 /// with [`Self::drive_deferred_pong`]. Release is allowed only when no other
 /// obligation or failure remains. [`Self::drive_global_failure`] answers one
 /// consumed global request; [`Self::drive_channel_failure`] refuses a channel
-/// request. An inbound open or unanswered peer close has no completion path,
-/// so the caller drops the driver. [`Self::try_new`] refuses a connection that already has a
+/// request. [`Self::drive_open_rejection`] rejects an inbound open. An
+/// unanswered peer close has no completion path, so the caller drops the
+/// driver. [`Self::try_new`] refuses a connection that already has a
 /// pending open or an unanswered peer close, so those pre-existing obligations
 /// stay answerable through the legacy API. A global or channel request that was
 /// already delivered to the caller is that caller's to answer and is not
@@ -763,6 +770,8 @@ pub struct OwnedChannelDriver<S> {
     global_failure: Option<GlobalFailure>,
     /// One consumed channel request, retained until its failure is complete.
     channel_failure: Option<ChannelFailure>,
+    /// One peer open retained until its rejection has been written.
+    open_rejection: Option<OpenRejection>,
 }
 
 impl<S: Read + Write> OwnedChannelDriver<S> {
@@ -779,8 +788,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// the connection over. A transport that is busy for another reason,
     /// including a deferred pong or a partial packet, is also refused; finish
     /// that transport work through the transport API and retry. The driver has
-    /// no reply path for open or close, so accepting a connection with such an
-    /// obligation would leave the caller unable to answer or release it.
+    /// no reply path for a pre-existing open or an unanswered close, so
+    /// accepting either would leave the caller unable to answer or release it.
     pub fn try_new(
         connection: ChannelConnection<ClientTransport<S>>,
     ) -> Result<Self, Box<ChannelConnection<ClientTransport<S>>>> {
@@ -800,6 +809,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             control_owed: false,
             global_failure: None,
             channel_failure: None,
+            open_rejection: None,
         })
     }
 
@@ -807,6 +817,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     #[must_use]
     pub fn channel(&self, channel: ChannelId) -> Option<ChannelState> {
         self.connection.channel(channel)
+    }
+
+    /// Returns the number of peer opens awaiting a response.
+    #[must_use]
+    pub fn pending_open_count(&self) -> usize {
+        self.connection.pending_open_count()
     }
 
     /// Returns the protected transport's committed outbound sequence.
@@ -988,9 +1004,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///   global request whose `want_reply` is set is surfaced as an event and
     ///   also blocks further reads and release.
     ///
-    /// A deferred pong, a global failure and a channel failure have driver
-    /// completion paths. The open and close cases are not answerable through
-    /// this driver, so drop it and its transport instead. This is not a general
+    /// A deferred pong, global failure, channel failure and open rejection have
+    /// driver completion paths. The close case is not answerable through this
+    /// driver, so drop it and its transport instead. This is not a general
     /// scheduler for control replies or rekey. A data event that exhausts the
     /// local window is not a reply obligation; adjust the window after release
     /// if the peer should continue.
@@ -1047,6 +1063,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                                 self.channel_failure = Some(ChannelFailure {
                                     channel: *channel,
                                     remote,
+                                    packet: None,
+                                });
+                            }
+                            if let ChannelEvent::OpenRequest(request) = &event {
+                                self.open_rejection = Some(OpenRejection {
+                                    remote: request.sender_channel(),
                                     packet: None,
                                 });
                             }
@@ -1187,6 +1209,98 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
+    /// Rejects the delivered peer open identified by its sender channel.
+    ///
+    /// `reason` must be one of the four RFC 4254 `SSH_OPEN_*` reason constants.
+    /// The description and language are empty SSH strings. After the first
+    /// successful admission, retries must use the same reason. A wrong ID or
+    /// changed reason is busy; an invalid reason is rejected without consuming
+    /// the obligation. Earlier data, deferred pong and control replies must
+    /// complete first. Reads, data admission and release remain blocked until
+    /// the entire rejection is written and its pending open is removed.
+    ///
+    /// Dropping the driver discards its transport, not just the rejection;
+    /// a fatal transport error leaves the driver terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy for a wrong ID, changed reason, missing obligation or
+    /// earlier work, a channel error for an invalid reason, failed after a
+    /// terminal error, or a transport error.
+    pub fn drive_open_rejection(
+        &mut self,
+        remote: ChannelId,
+        reason: u32,
+    ) -> Result<(), OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.pending
+            || self.pong_owed
+            || self.global_failure.is_some()
+            || self.channel_failure.is_some()
+        {
+            return Err(OwnedChannelError::Busy);
+        }
+        let Some(rejection) = self.open_rejection.as_mut() else {
+            return Err(OwnedChannelError::Busy);
+        };
+        if rejection.remote != remote {
+            return Err(OwnedChannelError::Busy);
+        }
+        if !(SSH_OPEN_ADMINISTRATIVELY_PROHIBITED..=SSH_OPEN_RESOURCE_SHORTAGE).contains(&reason) {
+            return Err(OwnedChannelError::Channel(ChannelError::InvalidMessage));
+        }
+        if rejection
+            .packet
+            .as_ref()
+            .is_some_and(|(prior, _)| *prior != reason)
+        {
+            return Err(OwnedChannelError::Busy);
+        }
+        if rejection.packet.is_none() {
+            let mut writer = Writer::new();
+            writer.write_byte(SSH_MSG_CHANNEL_OPEN_FAILURE);
+            writer.write_uint32(remote);
+            writer.write_uint32(reason);
+            writer.write_uint32(0);
+            writer.write_uint32(0);
+            match self
+                .connection
+                .transport
+                .start_owned_packet(&writer.into_bytes())
+            {
+                Ok(id) => rejection.packet = Some((reason, id)),
+                Err(error) => {
+                    self.failed = true;
+                    return Err(OwnedChannelError::Transport(error));
+                }
+            }
+        }
+        let Some((_, id)) = rejection.packet.as_ref() else {
+            self.failed = true;
+            return Err(OwnedChannelError::Transport(TransportError::InvalidMessage));
+        };
+        match self.connection.transport.drive_owned_packet(id) {
+            Ok(()) => {
+                if self.connection.incoming.remove(&remote).is_none() {
+                    self.failed = true;
+                    return Err(OwnedChannelError::Channel(ChannelError::UnknownChannel));
+                }
+                self.open_rejection = None;
+                self.control_owed = false;
+                Ok(())
+            }
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(OwnedChannelError::Transport(error))
+            }
+        }
+    }
+
     /// Writes a pong that [`Self::read_inbound`] deferred.
     ///
     /// The admitted data packet must complete first. `WouldBlock` preserves the
@@ -1194,8 +1308,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// terminal. A pong is owed only after
     /// [`OwnedChannelInbound::PongDeferred`], and the connection cannot be
     /// released until this succeeds. Global and channel requests have their own
-    /// completion paths; an inbound open or unanswered peer close requires
-    /// dropping the driver.
+    /// completion paths; an inbound open can be rejected. An unanswered peer
+    /// close requires dropping the driver.
     ///
     /// # Errors
     ///
@@ -1245,13 +1359,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// driver fails. Once it completes, write any deferred pong with
     /// [`Self::drive_deferred_pong`], then complete any consumed global request
     /// failure with [`Self::drive_global_failure`] or a channel request failure
-    /// with [`Self::drive_channel_failure`]. Release is allowed only
+    /// with [`Self::drive_channel_failure`], or reject an inbound open with
+    /// [`Self::drive_open_rejection`]. Release is allowed only
     /// after all outstanding obligations complete and no failure remains.
     /// Reads are blocked while any obligation is owed, so this driver cannot
     /// consume a request while a pong or another reply is deferred.
     ///
-    /// The driver has no reply path for an inbound open or a peer close this
-    /// side has not answered. Those keep the connection retained and require
+    /// The driver has no reply path for a peer close this side has not
+    /// answered. That keeps the connection retained and requires
     /// dropping the driver and its transport, as does a failed driver.
     /// Pre-existing opens and unanswered closes are refused by
     /// [`Self::try_new`] before the driver takes ownership; a global or channel
