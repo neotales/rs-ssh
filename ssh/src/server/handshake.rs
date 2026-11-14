@@ -880,7 +880,8 @@ where
                 immediate: self.config.immediate_compression,
             },
             rekey: None,
-            protected_packets_read: 0,
+            #[cfg(feature = "test-support")]
+            protected_packets_read: Some(0),
         })
     }
 
@@ -1349,9 +1350,11 @@ pub struct ServerTransport<S> {
     /// Every protected packet read after NEWKEYS, including `PING`,
     /// `EXT_INFO`, and rekey traffic. Monotonic across rekey sequence resets,
     /// so a caller can count packets without relying on the wire sequence
-    /// number. This is a read-only diagnostic seam; it does not affect packet
-    /// handling.
-    protected_packets_read: u64,
+    /// number. `None` means the counter overflowed. Compiled only with the
+    /// `test-support` feature; it is a read-only diagnostic and never feeds a
+    /// protocol or security decision.
+    #[cfg(feature = "test-support")]
+    protected_packets_read: Option<u64>,
 }
 
 /// An explicit name for the server state returned before SSH-009 authentication.
@@ -1380,7 +1383,6 @@ impl<S> fmt::Debug for ServerTransport<S> {
             .field("outbound_sequence", &self.sequence.outbound_sequence())
             .field("established", &self.established)
             .field("authenticated", &self.authenticated)
-            .field("protected_packets_read", &self.protected_packets_read)
             .field("host_key", &self.host_key)
             .finish_non_exhaustive()
     }
@@ -1505,12 +1507,14 @@ where
     /// `EXT_INFO`, and rekey traffic.
     ///
     /// The count is monotonic across strict-rekey sequence resets, unlike
-    /// [`Self::inbound_sequence`]. It is a read-only diagnostic seam for
-    /// callers that must attribute a read to exactly one protected packet; it
+    /// [`Self::inbound_sequence`]. `Some(count)` is accurate; `None` means the
+    /// counter overflowed and must be treated as ambiguous. This is a
+    /// read-only diagnostic available only with the `test-support` feature; it
     /// does not affect packet handling or security decisions.
+    #[cfg(feature = "test-support")]
     #[doc(hidden)]
     #[must_use]
-    pub const fn protected_packets_read(&self) -> u64 {
+    pub const fn protected_packets_read(&self) -> Option<u64> {
         self.protected_packets_read
     }
 
@@ -2452,7 +2456,11 @@ where
             sequence,
         ) {
             Ok(payload) => {
-                self.protected_packets_read = self.protected_packets_read.saturating_add(1);
+                #[cfg(feature = "test-support")]
+                {
+                    self.protected_packets_read =
+                        next_protected_packet_count(self.protected_packets_read);
+                }
                 Ok(payload)
             }
             Err(error) if matches!(error, TransportError::Io(_) | TransportError::Truncated) => {
@@ -2770,4 +2778,31 @@ fn validate_config(config: &ServerConfig) -> Result<(), HandshakeError> {
         return Err(HandshakeError::Kex(KexError::InvalidProposal));
     }
     Ok(())
+}
+
+/// Advances the `test-support` protected-packet counter.
+///
+/// Returns `None` once the counter would overflow, so a fixture can fail
+/// closed instead of silently reusing a saturated count. The field and
+/// accessor are `test-support`-gated; this helper is also compiled for the
+/// crate's own unit test of the boundary.
+#[cfg(any(test, feature = "test-support"))]
+fn next_protected_packet_count(current: Option<u64>) -> Option<u64> {
+    current.and_then(|count| count.checked_add(1))
+}
+
+#[cfg(test)]
+mod test_support_tests {
+    use super::next_protected_packet_count;
+
+    #[test]
+    fn protected_packet_count_overflow_is_observable() {
+        assert_eq!(next_protected_packet_count(Some(0)), Some(1));
+        assert_eq!(
+            next_protected_packet_count(Some(u64::MAX - 1)),
+            Some(u64::MAX)
+        );
+        assert_eq!(next_protected_packet_count(Some(u64::MAX)), None);
+        assert_eq!(next_protected_packet_count(None), None);
+    }
 }

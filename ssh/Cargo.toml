@@ -10,6 +10,12 @@ readme = "README.md"
 keywords = ["ssh", "sftp", "scp", "cryptography", "network-programming"]
 categories = ["cryptography", "network-programming"]
 
+[features]
+# Exposes read-only diagnostics used only by this repository's tests. It does
+# not change protocol behavior or security decisions and is not enabled by
+# default. Normal builds, including the published crate, do not enable it.
+test-support = []
+
 [dependencies]
 aes = { workspace = true, features = ["zeroize"] }
 aes-gcm = { workspace = true, features = ["zeroize"] }
