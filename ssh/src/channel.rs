@@ -709,7 +709,9 @@ pub enum OwnedChannelInbound {
 /// packet is active. It is deliberately not a full-duplex scheduler: it does
 /// not loop, does not answer control requests, does not reply to a peer close,
 /// and does not handle rekey. An obligation it cannot discharge blocks further
-/// reads and release, so the caller drops the driver instead.
+/// reads and release, so the caller drops the driver instead. [`Self::try_new`]
+/// refuses a connection that already has an unanswered open or close reply, so
+/// those pre-existing obligations stay answerable through the legacy API.
 ///
 /// The wrapped connection's mutable transport cannot be reached through the
 /// driver:
@@ -735,14 +737,23 @@ pub struct OwnedChannelDriver<S> {
 }
 
 impl<S: Read + Write> OwnedChannelDriver<S> {
-    /// Takes exclusive ownership only of an authenticated, idle transport.
+    /// Takes exclusive ownership only of an authenticated, idle transport with
+    /// no unanswered inbound open or close reply.
     ///
-    /// On refusal, the unmodified connection is returned to the caller.
+    /// A connection that already holds a pending open request, or a peer close
+    /// this side has not answered, is refused. The unmodified connection is
+    /// returned so the caller can answer that obligation with the legacy
+    /// channel API and retry. The driver has no reply path, so accepting the
+    /// connection would leave the caller unable to answer or release it.
     pub fn try_new(
         connection: ChannelConnection<ClientTransport<S>>,
     ) -> Result<Self, Box<ChannelConnection<ClientTransport<S>>>> {
         let transport = &connection.transport;
-        if !transport.can_start_owned_channel_driver() {
+        let control_owed = connection.pending_open_count() != 0
+            || connection
+                .channels()
+                .any(|channel| channel.remote_close_received() && !channel.local_close_sent());
+        if !transport.can_start_owned_channel_driver() || control_owed {
             return Err(Box::new(connection));
         }
         Ok(Self {
@@ -1053,7 +1064,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// a peer close awaits this side's close, a pong is deferred, or the
     /// transport still holds a partial outbound packet. Those are protocol
     /// obligations the driver has no way to discharge; drop the driver and its
-    /// transport instead.
+    /// transport instead. Pre-existing obligations are refused by
+    /// [`Self::try_new`] before the driver takes ownership.
     pub fn try_into_connection(self) -> Result<ChannelConnection<ClientTransport<S>>, Self> {
         let transport = &self.connection.transport;
         let close_owed = self

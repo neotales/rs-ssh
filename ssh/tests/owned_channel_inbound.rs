@@ -13,10 +13,10 @@ use std::{
 };
 
 use neotales_ssh::{
-    ClientConfig, ServerConfig,
+    ClientConfig, ClientTransport, ServerConfig, ServerTransport,
     channel::{
-        ChannelConnection, ChannelError, ChannelEvent, OwnedChannelDriver, OwnedChannelError,
-        OwnedChannelInbound, OwnedChannelWriteId,
+        ChannelConnection, ChannelError, ChannelEvent, ChannelId, OwnedChannelDriver,
+        OwnedChannelError, OwnedChannelInbound, OwnedChannelWriteId,
     },
     hostkey::Ed25519Signer,
     keepalive::{GlobalRequest, TransportPing},
@@ -81,6 +81,8 @@ enum PeerStep {
     Raw(Vec<u8>),
     ExpectData(Vec<u8>),
     ExpectPong(Vec<u8>),
+    ExpectOpened(ChannelId),
+    ExpectClose(ChannelId),
     Wait(mpsc::Receiver<()>),
     Finish,
 }
@@ -128,79 +130,110 @@ fn run_peer(
         .map_err(|e| e.to_string())?;
     ready.send(()).map_err(|e| e.to_string())?;
     for step in commands {
-        match step {
-            PeerStep::Data(data) => {
-                channels.write_data(7, &data).map_err(|e| e.to_string())?;
-            }
-            PeerStep::Window(bytes) => {
-                channels
-                    .increase_local_window(7, bytes)
-                    .map_err(|e| e.to_string())?;
-            }
-            PeerStep::Eof => channels.send_eof(7).map_err(|e| e.to_string())?,
-            PeerStep::Close => channels.send_close(7).map_err(|e| e.to_string())?,
-            PeerStep::Ping(data) => {
-                let payload = TransportPing::Ping(data)
-                    .encode()
-                    .map_err(|e| e.to_string())?;
-                channels
-                    .transport_mut()
-                    .write_payload(&payload)
-                    .map_err(|e| e.to_string())?;
-            }
-            PeerStep::GlobalRequest { want_reply } => {
-                let request = if want_reply {
-                    GlobalRequest::keepalive_with_reply()
-                } else {
-                    GlobalRequest::keepalive()
-                };
-                let payload = request.encode().map_err(|e| e.to_string())?;
-                channels
-                    .transport_mut()
-                    .write_payload(&payload)
-                    .map_err(|e| e.to_string())?;
-            }
-            PeerStep::Open(local) => channels
-                .open_channel(local, b"session", &[])
-                .map_err(|e| e.to_string())?,
-            PeerStep::Request {
-                request_type,
-                want_reply,
-            } => channels
-                .send_request(7, &request_type, want_reply, b"")
-                .map_err(|e| e.to_string())?,
-            PeerStep::Raw(payload) => channels
-                .transport_mut()
-                .write_payload(&payload)
-                .map_err(|e| e.to_string())?,
-            PeerStep::ExpectData(expected) => {
-                match channels.dispatch_one().map_err(|e| e.to_string())? {
-                    ChannelEvent::Data { channel: 7, data } if data == expected => {}
-                    other => return Err(format!("expected client data, got {other:?}")),
-                }
-            }
-            PeerStep::ExpectPong(expected) => {
-                let payload = channels
-                    .transport_mut()
-                    .read_payload()
-                    .map_err(|e| e.to_string())?;
-                match TransportPing::decode(&payload).map_err(|e| e.to_string())? {
-                    TransportPing::Pong(data) if data == expected => {}
-                    other => return Err(format!("expected client pong, got {other:?}")),
-                }
-            }
-            PeerStep::Wait(release) => {
-                release
-                    .recv_timeout(Duration::from_secs(5))
-                    .map_err(|e| e.to_string())?;
-            }
-            PeerStep::Finish => break,
+        if !run_step(&mut channels, step)? {
+            break;
         }
     }
     Ok(())
 }
 
-fn setup() -> Result<Fixture, Box<dyn std::error::Error>> {
+fn run_step(
+    channels: &mut ChannelConnection<ServerTransport<TcpStream>>,
+    step: PeerStep,
+) -> Result<bool, String> {
+    match step {
+        PeerStep::Data(data) => {
+            channels.write_data(7, &data).map_err(|e| e.to_string())?;
+        }
+        PeerStep::Window(bytes) => {
+            channels
+                .increase_local_window(7, bytes)
+                .map_err(|e| e.to_string())?;
+        }
+        PeerStep::Eof => channels.send_eof(7).map_err(|e| e.to_string())?,
+        PeerStep::Close => channels.send_close(7).map_err(|e| e.to_string())?,
+        PeerStep::Ping(data) => {
+            let payload = TransportPing::Ping(data)
+                .encode()
+                .map_err(|e| e.to_string())?;
+            channels
+                .transport_mut()
+                .write_payload(&payload)
+                .map_err(|e| e.to_string())?;
+        }
+        PeerStep::GlobalRequest { want_reply } => {
+            let request = if want_reply {
+                GlobalRequest::keepalive_with_reply()
+            } else {
+                GlobalRequest::keepalive()
+            };
+            let payload = request.encode().map_err(|e| e.to_string())?;
+            channels
+                .transport_mut()
+                .write_payload(&payload)
+                .map_err(|e| e.to_string())?;
+        }
+        PeerStep::Open(local) => channels
+            .open_channel(local, b"session", &[])
+            .map_err(|e| e.to_string())?,
+        PeerStep::Request {
+            request_type,
+            want_reply,
+        } => channels
+            .send_request(7, &request_type, want_reply, b"")
+            .map_err(|e| e.to_string())?,
+        PeerStep::Raw(payload) => channels
+            .transport_mut()
+            .write_payload(&payload)
+            .map_err(|e| e.to_string())?,
+        PeerStep::ExpectData(expected) => {
+            match channels.dispatch_one().map_err(|e| e.to_string())? {
+                ChannelEvent::Data { channel: 7, data } if data == expected => {}
+                other => return Err(format!("expected client data, got {other:?}")),
+            }
+        }
+        PeerStep::ExpectPong(expected) => {
+            let payload = channels
+                .transport_mut()
+                .read_payload()
+                .map_err(|e| e.to_string())?;
+            match TransportPing::decode(&payload).map_err(|e| e.to_string())? {
+                TransportPing::Pong(data) if data == expected => {}
+                other => return Err(format!("expected client pong, got {other:?}")),
+            }
+        }
+        PeerStep::ExpectOpened(expected) => {
+            match channels.dispatch_one().map_err(|e| e.to_string())? {
+                ChannelEvent::Opened(channel) if channel == expected => {}
+                other => return Err(format!("expected opened channel, got {other:?}")),
+            }
+        }
+        PeerStep::ExpectClose(expected) => {
+            match channels.dispatch_one().map_err(|e| e.to_string())? {
+                ChannelEvent::Close { channel } if channel == expected => {}
+                other => return Err(format!("expected client close, got {other:?}")),
+            }
+        }
+        PeerStep::Wait(release) => {
+            release
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|e| e.to_string())?;
+        }
+        PeerStep::Finish => return Ok(false),
+    }
+    Ok(true)
+}
+
+struct Harness {
+    connection: ChannelConnection<ClientTransport<GatedSocket>>,
+    write_allowance: Arc<AtomicUsize>,
+    read_allowance: Arc<AtomicUsize>,
+    sequence: u32,
+    steps: mpsc::Sender<PeerStep>,
+    peer: Peer,
+}
+
+fn setup_connection() -> Result<Harness, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let address = listener.local_addr()?;
     let (ready, opened) = mpsc::channel();
@@ -231,7 +264,26 @@ fn setup() -> Result<Fixture, Box<dyn std::error::Error>> {
     opened.recv_timeout(Duration::from_secs(5))?;
     assert!(matches!(channels.dispatch_one()?, ChannelEvent::Opened(0)));
     let sequence = channels.transport().outbound_sequence();
-    let driver = OwnedChannelDriver::try_new(channels).map_err(|_| "driver refused")?;
+    Ok(Harness {
+        connection: channels,
+        write_allowance,
+        read_allowance,
+        sequence,
+        steps,
+        peer,
+    })
+}
+
+fn setup() -> Result<Fixture, Box<dyn std::error::Error>> {
+    let Harness {
+        connection,
+        write_allowance,
+        read_allowance,
+        sequence,
+        steps,
+        peer,
+    } = setup_connection()?;
+    let driver = OwnedChannelDriver::try_new(connection).map_err(|_| "driver refused")?;
     Ok((
         driver,
         write_allowance,
@@ -673,6 +725,92 @@ fn inbound_would_block_preserves_packet_and_obligations() -> Result<(), Box<dyn 
         .try_into_connection()
         .map_err(|_| "release refused")?;
     drop(channels);
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn try_new_refuses_pending_open_and_retry_succeeds_after_answer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Harness {
+        mut connection,
+        steps,
+        peer,
+        ..
+    } = setup_connection()?;
+    let (release, wait) = mpsc::channel();
+    steps.send(PeerStep::Open(9))?;
+    steps.send(PeerStep::Wait(wait))?;
+    steps.send(PeerStep::ExpectOpened(9))?;
+    steps.send(PeerStep::Finish)?;
+
+    let event = connection.dispatch_one()?;
+    let ChannelEvent::OpenRequest(request) = event else {
+        panic!("expected open request, got {event:?}");
+    };
+    assert_eq!(request.sender_channel(), 9);
+    assert_eq!(connection.pending_open_count(), 1);
+    let channel_zero = connection.channel(0).expect("channel 0");
+    let sequence = connection.transport().outbound_sequence();
+
+    let Err(connection) = OwnedChannelDriver::try_new(connection) else {
+        panic!("accepted a connection with a pending open")
+    };
+    let mut connection = *connection;
+    assert_eq!(connection.pending_open_count(), 1);
+    assert_eq!(connection.channel(0).expect("channel 0"), channel_zero);
+    assert_eq!(connection.transport().outbound_sequence(), sequence);
+
+    connection.confirm_open_with_limits(9, 9, 17, 128)?;
+    assert_eq!(connection.pending_open_count(), 0);
+    assert!(connection.channel(9).is_some());
+
+    let driver = OwnedChannelDriver::try_new(connection).map_err(|_| "retry refused")?;
+    assert!(driver.channel(9).is_some());
+    assert_eq!(driver.channel(0).expect("channel 0"), channel_zero);
+    release.send(())?;
+    drop(driver);
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn try_new_refuses_close_reply_and_retry_succeeds_after_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Harness {
+        mut connection,
+        steps,
+        peer,
+        ..
+    } = setup_connection()?;
+    let (release, wait) = mpsc::channel();
+    steps.send(PeerStep::Close)?;
+    steps.send(PeerStep::Wait(wait))?;
+    steps.send(PeerStep::ExpectClose(7))?;
+    steps.send(PeerStep::Finish)?;
+
+    assert!(matches!(
+        connection.dispatch_one()?,
+        ChannelEvent::Close { channel: 0 }
+    ));
+    let channel_zero = connection.channel(0).expect("channel 0");
+    assert!(channel_zero.remote_close_received());
+    assert!(!channel_zero.local_close_sent());
+
+    let Err(connection) = OwnedChannelDriver::try_new(connection) else {
+        panic!("accepted a connection with an unanswered close")
+    };
+    let mut connection = *connection;
+    assert_eq!(connection.channel(0).expect("channel 0"), channel_zero);
+    assert_eq!(connection.channel_count(), 1);
+
+    connection.send_close(0)?;
+    assert!(connection.channel(0).is_none());
+    assert_eq!(connection.channel_count(), 0);
+
+    let driver = OwnedChannelDriver::try_new(connection).map_err(|_| "retry refused")?;
+    release.send(())?;
+    drop(driver);
     peer.join().map_err(|_| "peer panic")??;
     Ok(())
 }
