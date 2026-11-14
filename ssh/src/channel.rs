@@ -721,8 +721,7 @@ pub enum OwnedChannelInbound {
     ///
     /// No further inbound read is permitted until the admitted data packet
     /// completes and [`OwnedChannelDriver::drive_deferred_pong`] writes the
-    /// pong. The connection cannot be released while the pong is owed. Unlike
-    /// other deferred obligations, this obligation has a driver completion path.
+    /// pong. The connection cannot be released while the pong is owed.
     PongDeferred,
 }
 
@@ -828,7 +827,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         self.connection.channel(channel)
     }
 
-    /// Returns whether this local channel ID has been retired after both closes.
+    /// Returns whether a tombstone for this local channel ID is currently remembered.
+    ///
+    /// Tombstones have bounded retention and an ID can be reused. Therefore,
+    /// `false` does not prove that the ID was never retired.
     #[must_use]
     pub fn is_retired_channel(&self, channel: ChannelId) -> bool {
         self.connection.is_retired_channel(channel)
