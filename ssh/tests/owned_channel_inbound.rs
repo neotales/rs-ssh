@@ -20,6 +20,7 @@ use neotales_ssh::{
     },
     hostkey::Ed25519Signer,
     keepalive::{GlobalRequest, TransportPing},
+    server::ServerTransportError,
     transport::TransportError,
 };
 
@@ -213,11 +214,7 @@ fn run_step(
                 other => return Err(format!("expected global failure, got {other:?}")),
             }
         }
-        PeerStep::ExpectTruncatedPacket => {
-            if channels.transport_mut().read_payload().is_ok() {
-                return Err("partial reply unexpectedly completed".into());
-            }
-        }
+        PeerStep::ExpectTruncatedPacket => expect_truncated(channels.transport_mut())?,
         PeerStep::ExpectOpened(expected) => {
             match channels.dispatch_one().map_err(|e| e.to_string())? {
                 ChannelEvent::Opened(channel) if channel == expected => {}
@@ -238,6 +235,23 @@ fn run_step(
         PeerStep::Finish => return Ok(false),
     }
     Ok(true)
+}
+
+fn expect_truncated(transport: &mut ServerTransport<TcpStream>) -> Result<(), String> {
+    match transport.read_payload() {
+        Err(ServerTransportError::Transport(TransportError::Truncated)) => Ok(()),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Err(format!("peer timed out waiting for EOF: {error}"))
+        }
+        other => Err(format!(
+            "expected truncated packet after EOF, got {other:?}"
+        )),
+    }
 }
 
 struct Harness {

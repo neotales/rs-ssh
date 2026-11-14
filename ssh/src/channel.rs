@@ -1151,10 +1151,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// failure is outstanding. On refusal, returns the still-owning driver.
     ///
     /// An admitted data packet can be driven with [`Self::drive`] unless the
-    /// driver fails. Once it completes, release is allowed only if no other
-    /// obligation or failure remains. A deferred pong can then be written with
-    /// [`Self::drive_deferred_pong`]; after that, release is allowed only under
-    /// the same condition.
+    /// driver fails. Once it completes, write any deferred pong with
+    /// [`Self::drive_deferred_pong`], then complete any consumed global request
+    /// failure with [`Self::drive_global_failure`]. Release is allowed only
+    /// after all outstanding obligations complete and no failure remains.
+    /// Reads are blocked while either obligation is owed, so this driver
+    /// cannot consume a global request while a pong is deferred.
     ///
     /// The driver has no reply path for an inbound open, a peer close this side
     /// has not answered, or a channel request surfaced by [`Self::read_inbound`]
