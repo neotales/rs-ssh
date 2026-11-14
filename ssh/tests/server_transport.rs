@@ -345,6 +345,145 @@ fn server_rekeys_hybrid_with_old_keys_until_newkeys_and_keeps_session_identity()
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn test_support_rekey_ignorable_requires_active_non_strict_rekey()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(43);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, false)?;
+
+    assert!(matches!(
+        server.write_rekey_ignorable(b"x"),
+        Err(ServerTransportError::UnauthenticatedMessage)
+    ));
+    server.mark_authenticated();
+    assert!(matches!(
+        server.write_rekey_ignorable(b"x"),
+        Err(ServerTransportError::RekeyInProgress)
+    ));
+    assert!(server.is_established());
+
+    server.begin_rekey()?;
+    peer.begin_rekey()?;
+    assert_eq!(peer.receive_protected()?.first(), Some(&20));
+    server.write_rekey_ignorable(b"x")?;
+    assert_eq!(peer.receive_protected()?, [2, 0, 0, 0, 1, b'x']);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn test_support_rekey_ignorable_strict_rekey_fails_closed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let signer = signer(44);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, _peer) = complete_raw_initial(&config, expected_key, true)?;
+    server.mark_authenticated();
+
+    server.begin_rekey()?;
+    assert!(matches!(
+        server.write_rekey_ignorable(b"x"),
+        Err(ServerTransportError::Transport(TransportError::Sequence(
+            sequence::SequenceError::StrictViolation
+        )))
+    ));
+    assert!(server.rekey_is_terminal());
+    assert!(!server.is_established());
+    assert!(matches!(
+        server.write_payload(&[94]),
+        Err(ServerTransportError::NotEstablished)
+    ));
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn test_support_rekey_ignorable_terminal_write_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(45);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let (mut server, _peer) =
+        complete_raw_initial_with_write_gate(&config, expected_key, false, Rc::clone(&gate))?;
+    server.mark_authenticated();
+
+    server.begin_rekey()?;
+    gate.borrow_mut().fail();
+    let error = server.write_rekey_ignorable(b"x").unwrap_err();
+    assert!(matches!(
+        error,
+        ServerTransportError::Transport(TransportError::Io(ref error))
+            if error.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert!(server.rekey_is_terminal());
+    assert!(!server.is_established());
+    assert!(matches!(
+        server.write_payload(&[94]),
+        Err(ServerTransportError::NotEstablished)
+    ));
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn test_support_rekey_ignorable_would_block_resumes_the_same_packet()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(46);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let (mut server, mut peer) =
+        complete_raw_initial_with_write_gate(&config, expected_key, false, Rc::clone(&gate))?;
+    server.mark_authenticated();
+
+    server.begin_rekey()?;
+    peer.begin_rekey()?;
+    assert_eq!(peer.receive_protected()?.first(), Some(&20));
+    gate.borrow_mut().arm(1);
+    assert!(matches!(
+        server.write_rekey_ignorable(b"x"),
+        Err(ServerTransportError::Transport(TransportError::Io(ref error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    gate.borrow_mut().open();
+    server.write_rekey_ignorable(b"x")?;
+    assert_eq!(peer.receive_protected()?, [2, 0, 0, 0, 1, b'x']);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn test_support_rekey_ignorable_pending_other_packet_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(47);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let (mut server, _peer) =
+        complete_raw_initial_with_write_gate(&config, expected_key, false, Rc::clone(&gate))?;
+    server.mark_authenticated();
+
+    gate.borrow_mut().arm(1);
+    assert!(matches!(
+        server.begin_rekey(),
+        Err(ServerTransportError::Transport(TransportError::Io(ref error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        server.write_rekey_ignorable(b"x"),
+        Err(ServerTransportError::Transport(
+            TransportError::OwnedPacketState
+        ))
+    ));
+    assert!(server.rekey_is_terminal());
+    assert!(!server.is_established());
+    Ok(())
+}
+
 #[test]
 fn peer_kexinit_is_consumed_before_authentication_dispatch()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1385,6 +1524,7 @@ impl ReadGate {
 struct WriteGate {
     active: bool,
     remaining: usize,
+    terminal: bool,
 }
 
 impl WriteGate {
@@ -1396,6 +1536,10 @@ impl WriteGate {
     fn open(&mut self) {
         self.active = false;
         self.remaining = 0;
+    }
+
+    fn fail(&mut self) {
+        self.terminal = true;
     }
 
     fn limit(&self, requested: usize) -> usize {
@@ -1473,6 +1617,16 @@ impl Read for Stream<'_> {
 
 impl Write for Stream<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self
+            .write_gate
+            .as_ref()
+            .is_some_and(|gate| gate.borrow().terminal)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "test terminal write failure",
+            ));
+        }
         let allowed = self
             .write_gate
             .as_ref()

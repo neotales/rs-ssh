@@ -11,9 +11,10 @@ keywords = ["ssh", "sftp", "scp", "cryptography", "network-programming"]
 categories = ["cryptography", "network-programming"]
 
 [features]
-# Public opt-in diagnostics and controlled peer hooks for test fixtures. This
-# feature is selectable and Cargo feature unification can enable it indirectly;
-# see the README for the security and diagnostic contracts.
+# Public opt-in protected-packet counter and controlled-peer
+# `ServerTransport::write_rekey_ignorable` hook. Cargo feature unification can
+# enable these APIs throughout a build graph; review their security implications
+# before enabling this feature. See the README for their contracts.
 test-support = []
 
 [dependencies]

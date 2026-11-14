@@ -1820,48 +1820,95 @@ where
         self.write_payload(payload)
     }
 
-    /// Test-only: writes a protocol-valid `SSH_MSG_IGNORE` while a non-strict
-    /// rekey is active.
+    /// Opt-in `test-support` API: writes a protocol-valid `SSH_MSG_IGNORE`
+    /// during an authenticated, active, non-strict rekey.
     ///
-    /// This is compiled only with the `test-support` feature. It exists so a
-    /// controlled peer can make the client's rekey read a real protected
-    /// ignored packet without exposing packet protection or sequence state.
-    /// On `WouldBlock`, retry with the same `data`; the pending packet is
-    /// retained. Do not call it while another protected write is pending.
+    /// This method exists so a controlled peer fixture can make the client's
+    /// bounded rekey step read a real protected ignored packet without
+    /// exposing packet protection or sequence state. It is available only when
+    /// the crate is built with the `test-support` feature. That feature is
+    /// opt-in, but Cargo feature unification means enabling it anywhere in a
+    /// build graph enables it for every `neotales-ssh` dependency in that
+    /// build; do not enable it in a production build unless this capability is
+    /// intended and reviewed.
+    ///
+    /// The hook refuses before an authenticated rekey starts, in strict-KEX
+    /// mode, after the server has sent NEWKEYS, and while any other protected
+    /// packet is pending. A `WouldBlock` leaves the exact packet pending;
+    /// retry with the same `data`. Every other failure invokes the transport's
+    /// existing rekey fail-close path and leaves protected I/O unusable.
+    ///
+    /// The `data` bytes are the IGNORE payload and are not logged or retained
+    /// beyond the protected packet. Do not pass secrets.
     ///
     /// # Errors
     ///
-    /// Returns a transport or sequence error. A non-`WouldBlock` failure fails
-    /// the rekey closed.
+    /// Returns a state, ordering, transport, sequence, or protection error. A
+    /// non-`WouldBlock` failure fails the rekey closed.
     #[cfg(feature = "test-support")]
-    #[doc(hidden)]
     pub fn write_rekey_ignorable(&mut self, data: &[u8]) -> Result<(), ServerTransportError> {
         const SSH_MSG_IGNORE: u8 = 2;
+        if !self.established {
+            return Err(ServerTransportError::NotEstablished);
+        }
+        if !self.authenticated {
+            return Err(ServerTransportError::UnauthenticatedMessage);
+        }
         if self.rekey.is_none() {
             return Err(ServerTransportError::RekeyInProgress);
         }
+        if self.sequence.strict_kex() {
+            return Err(self.fail_rekey_closed(ServerTransportError::Transport(
+                TransportError::Sequence(SequenceError::StrictViolation),
+            )));
+        }
+        if self
+            .rekey
+            .as_ref()
+            .is_some_and(|state| state.server_newkeys_sent)
+        {
+            return Err(self.fail_rekey_closed(ServerTransportError::RekeyInProgress));
+        }
         let mut writer = neotales_ssh::Writer::new();
         writer.write_byte(SSH_MSG_IGNORE);
-        writer
-            .write_string(data)
-            .map_err(|error| ServerTransportError::Transport(TransportError::Wire(error)))?;
+        if let Err(error) = writer.write_string(data) {
+            return Err(self
+                .fail_rekey_closed(ServerTransportError::Transport(TransportError::Wire(error))));
+        }
         let payload = writer.into_bytes();
-        self.sequence.classify_rekey_outbound(SSH_MSG_IGNORE)?;
-        let sequence = self.write_protected_rekey_packet(&payload, SSH_MSG_IGNORE)?;
-        let disposition = self.sequence.observe_rekey_outbound(SSH_MSG_IGNORE)?;
-        if disposition != PacketDisposition::Ignorable {
-            return Err(ServerTransportError::Transport(
-                TransportError::UnexpectedMessage,
-            ));
+        if self.write_buffer.is_pending() {
+            let resumes_same_packet = self.write_buffer.pending_message_type()
+                == Some(SSH_MSG_IGNORE)
+                && self.write_buffer.pending_payload().as_deref() == Some(payload.as_slice());
+            if !resumes_same_packet {
+                return Err(self.fail_rekey_closed(ServerTransportError::Transport(
+                    TransportError::OwnedPacketState,
+                )));
+            }
         }
-        let committed = self.sequence.commit_outbound()?;
-        if committed != sequence {
-            return Err(ServerTransportError::Transport(
-                TransportError::InvalidMessage,
-            ));
+        let result = (|| -> Result<(), ServerTransportError> {
+            self.sequence.classify_rekey_outbound(SSH_MSG_IGNORE)?;
+            let sequence = self.write_protected_rekey_packet(&payload, SSH_MSG_IGNORE)?;
+            let disposition = self.sequence.observe_rekey_outbound(SSH_MSG_IGNORE)?;
+            if disposition != PacketDisposition::Ignorable {
+                return Err(ServerTransportError::Transport(
+                    TransportError::UnexpectedMessage,
+                ));
+            }
+            let committed = self.sequence.commit_outbound()?;
+            if committed != sequence {
+                return Err(ServerTransportError::Transport(
+                    TransportError::InvalidMessage,
+                ));
+            }
+            self.write_buffer.acknowledge(sequence)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if is_would_block_error(&error) => Err(error),
+            Err(error) => Err(self.fail_rekey_closed(error)),
         }
-        self.write_buffer.acknowledge(sequence)?;
-        Ok(())
     }
 
     fn begin_rekey_internal(&mut self) -> Result<(), ServerTransportError> {

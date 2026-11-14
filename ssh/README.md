@@ -54,6 +54,23 @@ a release version: the repository material inspected does not establish a
 versioning policy for `neotales-ssh`, so release status and treatment remain
 to be decided before any publication of this change.
 
+## Opt-in `test-support` feature
+
+`test-support` is an explicitly opt-in feature, not part of the default feature
+set. Cargo feature unification means enabling it anywhere in a build graph
+enables it for every `neotales-ssh` dependency in that build, including a
+`--all-features` build. Do not enable it in production unless the capability is
+intended and reviewed.
+
+The feature adds `ServerTransport::write_rekey_ignorable`, which writes a
+protocol-valid `SSH_MSG_IGNORE` only during an authenticated, active,
+non-strict rekey. It refuses before the rekey starts, in strict-KEX mode, after
+the server has sent NEWKEYS, and while a different protected packet is pending.
+A `WouldBlock` leaves the exact packet pending for a same-data retry; every
+other failure invokes the transport's existing rekey fail-close path. The data
+is not logged or retained beyond the protected packet, and callers must not
+pass secrets.
+
 ## Opening a connection
 
 The builder is for anything the destination string cannot express: an explicit
