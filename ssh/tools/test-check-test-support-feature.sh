@@ -55,7 +55,7 @@ inherited="$fixture/inherited"
 mkdir -p "$inherited/doc/neotales_ssh/server"
 printf 'keep\n' >"$inherited/sentinel"
 printf 'real-doc\n' >"$inherited/doc/neotales_ssh/server/struct.ServerTransport.html"
-inherited_hash="$(sha256sum "$inherited/doc/neotales_ssh/server/struct.ServerTransport.html" | cut -d' ' -f1)"
+cp "$inherited/doc/neotales_ssh/server/struct.ServerTransport.html" "$fixture/inherited-doc.copy"
 
 export CARGO_TARGET_DIR="$inherited"
 env -u CARGO_TARGET_DIR PATH="$fixture/bin:$PATH" TMPDIR="$fixture/tmp" \
@@ -78,7 +78,7 @@ if [ ! -f "$inherited/sentinel" ]; then
     echo "the default invocation removed the inherited sentinel" >&2
     exit 1
 fi
-if [ "$(sha256sum "$inherited/doc/neotales_ssh/server/struct.ServerTransport.html" | cut -d' ' -f1)" != "$inherited_hash" ]; then
+if ! cmp -s "$inherited/doc/neotales_ssh/server/struct.ServerTransport.html" "$fixture/inherited-doc.copy"; then
     echo "the default invocation overwrote inherited generated docs" >&2
     exit 1
 fi
@@ -96,7 +96,7 @@ if [ ! -f "$fixture/.feature-surface-target/sentinel" ]; then
     echo "the matrix script removed a pre-existing checkout sentinel on the explicit run" >&2
     exit 1
 fi
-if [ "$(sha256sum "$inherited/doc/neotales_ssh/server/struct.ServerTransport.html" | cut -d' ' -f1)" != "$inherited_hash" ]; then
+if ! cmp -s "$inherited/doc/neotales_ssh/server/struct.ServerTransport.html" "$fixture/inherited-doc.copy"; then
     echo "the explicit invocation overwrote inherited generated docs" >&2
     exit 1
 fi
