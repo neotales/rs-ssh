@@ -85,6 +85,7 @@ enum PeerStep {
     Raw(Vec<u8>),
     ExpectData(Vec<u8>),
     ExpectDataOn(ChannelId, Vec<u8>),
+    ExpectWindow(u32),
     AcceptSecond,
     ExpectPong(Vec<u8>),
     ExpectGlobalFailure,
@@ -198,6 +199,7 @@ fn run_step(
             .map_err(|e| e.to_string())?,
         PeerStep::ExpectData(expected) => expect_data(channels, 7, &expected)?,
         PeerStep::ExpectDataOn(channel, expected) => expect_data(channels, channel, &expected)?,
+        PeerStep::ExpectWindow(expected) => expect_window(channels, expected)?,
         PeerStep::AcceptSecond => accept_second(channels)?,
         PeerStep::ExpectPong(expected) => {
             let payload = channels
@@ -274,6 +276,19 @@ fn accept_second(
     channels
         .confirm_open_with_limits(request.sender_channel(), 8, 17, 128)
         .map_err(|e| e.to_string())
+}
+
+fn expect_window(
+    channels: &mut ChannelConnection<ServerTransport<TcpStream>>,
+    expected: u32,
+) -> Result<(), String> {
+    match channels.dispatch_one().map_err(|e| e.to_string())? {
+        ChannelEvent::WindowAdjusted {
+            channel: 7,
+            available,
+        } if available == expected => Ok(()),
+        other => Err(format!("expected window adjustment, got {other:?}")),
+    }
 }
 
 fn expect_data(
@@ -471,6 +486,199 @@ fn idle_read_delivers_data_window_and_eof_once() -> Result<(), Box<dyn std::erro
     assert!(matches!(
         driver.read_idle()?,
         OwnedChannelInbound::Event(ChannelEvent::Eof { channel: 0 })
+    ));
+    drop(
+        driver
+            .try_into_connection()
+            .map_err(|_| "release refused")?,
+    );
+    release.send(())?;
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn owned_window_adjustment_retries_and_separates_credits() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut driver, write, _read, sequence, steps, peer) = setup()?;
+    steps.send(PeerStep::Data(b"12345".to_vec()))?;
+    steps.send(PeerStep::ExpectWindow(65_533))?;
+    steps.send(PeerStep::ExpectWindow(65_536))?;
+    steps.send(PeerStep::ExpectTruncatedPacket)?;
+    steps.send(PeerStep::Finish)?;
+    assert!(
+        matches!(driver.read_idle()?, OwnedChannelInbound::Event(ChannelEvent::Data { channel: 0, data }) if data == b"12345")
+    );
+    assert!(matches!(
+        driver.admit_window_adjustment(9, 1),
+        Err(OwnedChannelError::Channel(ChannelError::UnknownChannel))
+    ));
+    assert!(matches!(
+        driver.admit_window_adjustment(0, 0),
+        Err(OwnedChannelError::Channel(
+            ChannelError::InvalidWindowAdjustment
+        ))
+    ));
+    assert!(matches!(
+        driver.admit_window_adjustment(0, u32::MAX),
+        Err(OwnedChannelError::Channel(ChannelError::Window(_)))
+    ));
+    let id = driver.admit_window_adjustment(0, 2)?;
+    let mut blocks = 0;
+    loop {
+        write.store(1, Ordering::SeqCst);
+        match driver.drive_window_adjustment(&id) {
+            Ok(updated) => {
+                assert_eq!(updated, 65_533);
+                break;
+            }
+            Err(OwnedChannelError::Transport(TransportError::Io(error)))
+                if error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                blocks += 1;
+                assert!(blocks < 256);
+                assert_eq!(driver.channel(0).unwrap().local_window(), 65_531);
+                assert_eq!(driver.outbound_sequence(), sequence);
+                assert!(matches!(
+                    driver.admit_window_adjustment(0, 3),
+                    Err(OwnedChannelError::Busy)
+                ));
+                assert!(matches!(driver.read_idle(), Err(OwnedChannelError::Busy)));
+                assert!(matches!(
+                    driver.admit_data(0, b"x"),
+                    Err(OwnedChannelError::Busy)
+                ));
+                driver = driver
+                    .try_into_connection()
+                    .expect_err("window packet released");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert!(blocks > 1);
+    assert!(matches!(
+        driver.drive_window_adjustment(&id),
+        Err(OwnedChannelError::Busy)
+    ));
+    let next = driver.admit_window_adjustment(0, 3)?;
+    assert!(matches!(
+        driver.drive_window_adjustment(&id),
+        Err(OwnedChannelError::Busy)
+    ));
+    write.store(usize::MAX, Ordering::SeqCst);
+    assert_eq!(driver.drive_window_adjustment(&next)?, 65_536);
+    assert_eq!(driver.outbound_sequence(), sequence + 2);
+    drop(
+        driver
+            .try_into_connection()
+            .map_err(|_| "release refused")?,
+    );
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn foreign_window_id_cannot_advance_packet() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut first, first_write, _read, sequence, steps, peer) = setup()?;
+    let (mut second, _write2, _read2, _sequence2, steps2, peer2) = setup()?;
+    let (release, wait) = mpsc::channel();
+    steps.send(PeerStep::ExpectWindow(65_537))?;
+    steps.send(PeerStep::ExpectTruncatedPacket)?;
+    steps.send(PeerStep::Finish)?;
+    steps2.send(PeerStep::Wait(wait))?;
+    steps2.send(PeerStep::Finish)?;
+    let id = first.admit_window_adjustment(0, 1)?;
+    let foreign = second.admit_window_adjustment(0, 1)?;
+    first_write.store(usize::MAX, Ordering::SeqCst);
+    assert!(matches!(
+        first.drive_window_adjustment(&foreign),
+        Err(OwnedChannelError::Busy)
+    ));
+    assert_eq!(first.channel(0).unwrap().local_window(), 65_536);
+    assert_eq!(first.outbound_sequence(), sequence);
+    assert_eq!(first.drive_window_adjustment(&id)?, 65_537);
+    drop(first.try_into_connection().map_err(|_| "release refused")?);
+    drop(second);
+    release.send(())?;
+    peer.join().map_err(|_| "peer panic")??;
+    peer2.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn partial_window_adjustment_fatal_and_cancel_leave_credit_uncommitted()
+-> Result<(), Box<dyn std::error::Error>> {
+    for fatal in [false, true] {
+        let (mut driver, write, _read, sequence, steps, peer) = setup()?;
+        steps.send(PeerStep::ExpectTruncatedPacket)?;
+        steps.send(PeerStep::Finish)?;
+        let id = driver.admit_window_adjustment(0, 1)?;
+        write.store(1, Ordering::SeqCst);
+        assert!(matches!(driver.drive_window_adjustment(&id),
+            Err(OwnedChannelError::Transport(TransportError::Io(error))) if error.kind() == io::ErrorKind::WouldBlock));
+        if fatal {
+            write.store(usize::MAX - 1, Ordering::SeqCst);
+            assert!(matches!(driver.drive_window_adjustment(&id),
+                Err(OwnedChannelError::Transport(TransportError::Io(error))) if error.kind() == io::ErrorKind::BrokenPipe));
+            assert!(matches!(
+                driver.drive_window_adjustment(&id),
+                Err(OwnedChannelError::Failed)
+            ));
+        }
+        assert_eq!(driver.channel(0).unwrap().local_window(), 65_536);
+        assert_eq!(driver.outbound_sequence(), sequence);
+        let driver = driver
+            .try_into_connection()
+            .expect_err("partial adjustment released");
+        drop(driver);
+        peer.join().map_err(|_| "peer panic")??;
+    }
+    Ok(())
+}
+
+#[test]
+fn window_adjustment_accepts_maximum_and_rejects_overflow() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut driver, write, _read, sequence, steps, peer) = setup()?;
+    steps.send(PeerStep::ExpectWindow(u32::MAX))?;
+    steps.send(PeerStep::ExpectTruncatedPacket)?;
+    steps.send(PeerStep::Finish)?;
+    let id = driver.admit_window_adjustment(0, u32::MAX - 65_536)?;
+    write.store(usize::MAX, Ordering::SeqCst);
+    assert_eq!(driver.drive_window_adjustment(&id)?, u32::MAX);
+    assert!(matches!(
+        driver.admit_window_adjustment(0, 1),
+        Err(OwnedChannelError::Channel(ChannelError::Window(_)))
+    ));
+    assert_eq!(driver.outbound_sequence(), sequence + 1);
+    drop(
+        driver
+            .try_into_connection()
+            .map_err(|_| "release refused")?,
+    );
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn window_adjustment_rejects_locally_closed_channel() -> Result<(), Box<dyn std::error::Error>> {
+    let Harness {
+        mut connection,
+        write_allowance: _write,
+        read_allowance: _read,
+        sequence: _,
+        steps,
+        peer,
+    } = setup_connection()?;
+    let (release, wait) = mpsc::channel();
+    steps.send(PeerStep::ExpectClose(7))?;
+    steps.send(PeerStep::Wait(wait))?;
+    steps.send(PeerStep::Finish)?;
+    connection.send_close(0)?;
+    let mut driver = OwnedChannelDriver::try_new(connection).map_err(|_| "driver refused")?;
+    assert!(matches!(
+        driver.admit_window_adjustment(0, 1),
+        Err(OwnedChannelError::Channel(ChannelError::InvalidMessage))
     ));
     drop(
         driver

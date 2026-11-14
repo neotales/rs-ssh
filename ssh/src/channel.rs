@@ -671,6 +671,16 @@ impl std::error::Error for OwnedChannelError {
 #[derive(Clone, Debug)]
 pub struct OwnedChannelWriteId(OwnedPacketId);
 
+/// Opaque identity of one admitted outbound window adjustment.
+#[derive(Clone, Debug)]
+pub struct OwnedWindowAdjustmentId(OwnedPacketId);
+
+#[derive(Debug)]
+struct WindowAdjustment {
+    channel: ChannelId,
+    updated: u32,
+}
+
 #[derive(Debug)]
 enum GlobalFailure {
     Queued,
@@ -780,6 +790,8 @@ pub struct OwnedChannelDriver<S> {
     open_rejection: Option<OpenRejection>,
     /// One peer close awaiting its corresponding local close.
     close_reply: Option<CloseReply>,
+    /// One admitted window adjustment; local credit is committed on completion.
+    window_adjustment: Option<WindowAdjustment>,
 }
 
 impl<S: Read + Write> OwnedChannelDriver<S> {
@@ -819,6 +831,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             channel_failure: None,
             open_rejection: None,
             close_reply: None,
+            window_adjustment: None,
         })
     }
 
@@ -855,7 +868,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// Returns busy, failed, channel validation, flow-control or transport
     /// errors. Rejected admission does not consume remote credit. Admission is
-    /// also busy while an inbound pong or an inbound control reply is owed;
+    /// also busy while an adjustment, inbound pong or control reply is owed;
     /// see [`Self::read_inbound`].
     pub fn admit_data(
         &mut self,
@@ -865,7 +878,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending || self.pong_owed || self.control_owed {
+        if self.pending || self.pong_owed || self.control_owed || self.window_adjustment.is_some() {
             return Err(OwnedChannelError::Busy);
         }
         let connection = &mut *self.connection;
@@ -1003,6 +1016,121 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
+    /// Admits one bounded local-window adjustment without yet granting credit.
+    ///
+    /// The increment is sealed into one protected packet. Local window is
+    /// updated only by successful [`Self::drive_window_adjustment`]. Reads,
+    /// new admissions and release are blocked until completion. The caller
+    /// must retain this ID or drop the driver; dropping an ID does not cancel
+    /// the packet. Additional consumed credit remains the caller's separate
+    /// responsibility and must be admitted as a later adjustment.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy or failed, a channel validation/window overflow error, or
+    /// a transport error. Rejected admission does not change the window.
+    pub fn admit_window_adjustment(
+        &mut self,
+        channel: ChannelId,
+        increment: u32,
+    ) -> Result<OwnedWindowAdjustmentId, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.pending || self.pong_owed || self.control_owed || self.window_adjustment.is_some() {
+            return Err(OwnedChannelError::Busy);
+        }
+        if increment == 0 {
+            return Err(OwnedChannelError::Channel(
+                ChannelError::InvalidWindowAdjustment,
+            ));
+        }
+        let state = self
+            .connection
+            .channels
+            .get(&channel)
+            .ok_or(OwnedChannelError::Channel(ChannelError::UnknownChannel))?;
+        state.active().map_err(OwnedChannelError::Channel)?;
+        if state.local_close_sent {
+            return Err(OwnedChannelError::Channel(ChannelError::InvalidMessage));
+        }
+        let remote = state
+            .remote_id
+            .ok_or(OwnedChannelError::Channel(ChannelError::InvalidMessage))?;
+        let updated =
+            state
+                .local_window
+                .checked_add(increment)
+                .ok_or(OwnedChannelError::Channel(ChannelError::Window(
+                    WindowError::AdjustmentOverflow {
+                        current: state.local_window,
+                        increment,
+                    },
+                )))?;
+        let mut writer = Writer::new();
+        writer.write_byte(SSH_MSG_CHANNEL_WINDOW_ADJUST);
+        writer.write_uint32(remote);
+        writer.write_uint32(increment);
+        let id = match self
+            .connection
+            .transport
+            .start_owned_packet(&writer.into_bytes())
+        {
+            Ok(id) => id,
+            Err(error) => {
+                if !self.connection.transport.is_established() {
+                    self.failed = true;
+                }
+                return Err(OwnedChannelError::Transport(error));
+            }
+        };
+        self.window_adjustment = Some(WindowAdjustment { channel, updated });
+        Ok(OwnedWindowAdjustmentId(id))
+    }
+
+    /// Drives the exact admitted adjustment and returns the updated local window.
+    ///
+    /// `WouldBlock` retains the packet and leaves credit unchanged. Completion
+    /// updates credit exactly once; stale or foreign IDs return busy without
+    /// changes. Other write errors make the driver terminal. On cancellation
+    /// drop the driver and any independently held readiness socket handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy for a stale or foreign ID, failed after a terminal error,
+    /// or a transport error, including retryable `WouldBlock`.
+    pub fn drive_window_adjustment(
+        &mut self,
+        id: &OwnedWindowAdjustmentId,
+    ) -> Result<u32, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        let Some(adjustment) = self.window_adjustment.as_ref() else {
+            return Err(OwnedChannelError::Busy);
+        };
+        let (channel, updated) = (adjustment.channel, adjustment.updated);
+        match self.connection.transport.drive_owned_packet(&id.0) {
+            Ok(()) => {
+                let Some(state) = self.connection.channels.get_mut(&channel) else {
+                    self.failed = true;
+                    return Err(OwnedChannelError::Channel(ChannelError::UnknownChannel));
+                };
+                state.local_window = updated;
+                self.window_adjustment = None;
+                Ok(updated)
+            }
+            Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(OwnedChannelError::Transport(error))
+            }
+        }
+    }
+
     /// Consumes exactly one inbound packet while the admitted data packet is active.
     ///
     /// This is the opt-in incremental read step for a caller that must keep an
@@ -1071,14 +1199,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy for an active data write or an obligation, failed after
-    /// a terminal error, a channel error for a consumed invalid packet, or a
-    /// transport error. `WouldBlock` is retryable.
+    /// Returns busy for an active data write, window adjustment or obligation,
+    /// failed after a terminal error, a channel error for a consumed invalid
+    /// packet, or a transport error. `WouldBlock` is retryable.
     pub fn read_idle(&mut self) -> Result<OwnedChannelInbound, OwnedChannelError> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending || self.pong_owed || self.control_owed {
+        if self.pending || self.pong_owed || self.control_owed || self.window_adjustment.is_some() {
             return Err(OwnedChannelError::Busy);
         }
         let result = self.connection.transport.read_idle_owned();
@@ -1504,8 +1632,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// packet, obligation, or failure is outstanding. On refusal, returns the
     /// still-owning driver.
     ///
-    /// An admitted data packet can be driven with [`Self::drive`] unless the
-    /// driver fails. Once it completes, write any deferred pong with
+    /// An admitted data packet can be driven with [`Self::drive`], and an
+    /// admitted window adjustment with [`Self::drive_window_adjustment`], unless
+    /// the driver fails. Once earlier work completes, write any deferred pong with
     /// [`Self::drive_deferred_pong`], then complete any consumed global request
     /// failure with [`Self::drive_global_failure`] or a channel request failure
     /// with [`Self::drive_channel_failure`], or reject an inbound open with
@@ -1528,6 +1657,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             .any(|channel| channel.remote_close_received() && !channel.local_close_sent());
         if self.pending
             || self.failed
+            || self.window_adjustment.is_some()
             || self.pong_owed
             || self.control_owed
             || self.connection.pending_open_count() != 0
