@@ -721,13 +721,28 @@ where
     ///
     /// Returns a bounded [`HandshakeError`] for an unestablished transport,
     /// an active/reentrant cycle, an unsupported proposal, or a failure while
-    /// sending KEXINIT. If an owned packet or its deferred pong is active, returns
-    /// [`HandshakeError::Transport`] with [`TransportError::OwnedPacketState`]
-    /// without starting a rekey; drive the packet and its deferred pong, or
-    /// discard the transport. Non-WouldBlock failures during the rekey
-    /// terminally disable the transport.
+    /// sending KEXINIT. If an owned packet, its deferred pong, or a retained
+    /// peer KEXINIT is pending, returns [`HandshakeError::Transport`] with
+    /// [`TransportError::OwnedPacketState`] without starting a competing
+    /// exchange; drive the owned work or use
+    /// [`Self::advance_retained_peer_rekey`] for the retained proposal.
+    /// Non-WouldBlock failures during the rekey terminally disable the
+    /// transport.
     pub fn begin_rekey(&mut self) -> Result<(), HandshakeError> {
+        self.begin_rekey_inner(false)
+    }
+
+    /// Starts the local side of a peer-initiated rekey whose KEXINIT was
+    /// retained by the owned-packet read path.
+    pub(crate) fn begin_retained_peer_rekey(&mut self) -> Result<(), HandshakeError> {
+        self.begin_rekey_inner(true)
+    }
+
+    fn begin_rekey_inner(&mut self, allow_retained: bool) -> Result<(), HandshakeError> {
         if self.owned_packet.is_some() || self.deferred_owned_pong {
+            return Err(TransportError::OwnedPacketState.into());
+        }
+        if !allow_retained && self.retained_peer_kexinit.is_some() {
             return Err(TransportError::OwnedPacketState.into());
         }
         if !self.established {

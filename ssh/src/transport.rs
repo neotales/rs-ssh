@@ -1121,7 +1121,7 @@ where
                 self.retained_peer_kexinit = None;
                 return Err(self.fail_protected_write(TransportError::UnexpectedMessage));
             }
-            if let Err(error) = self.begin_rekey() {
+            if let Err(error) = self.begin_retained_peer_rekey() {
                 let error: TransportError = error.into();
                 if matches!(&error, TransportError::Io(io) if io.kind() == io::ErrorKind::WouldBlock)
                 {
@@ -1235,8 +1235,10 @@ where
 
     /// Writes a pong deferred by [`Self::read_while_owned`].
     ///
-    /// The owned packet must finish first. Retry this same operation after
-    /// `WouldBlock`; a fatal write disables protected I/O.
+    /// The owned packet must finish first. If a peer KEXINIT was retained while
+    /// this exact PONG was partially written, the PONG may still finish before
+    /// the rekey starts; no new payload is accepted. Retry this same operation
+    /// after `WouldBlock`; a fatal write disables protected I/O.
     ///
     /// # Errors
     ///
@@ -1250,7 +1252,7 @@ where
             .pending_transport_reply
             .take()
             .ok_or(TransportError::OwnedPacketState)?;
-        match self.write_payload_inner(&reply) {
+        match self.write_payload_inner_with_retained(&reply, false) {
             Ok(()) => {
                 self.pong_write_id = None;
                 self.pending_transport_reply = self.next_transport_pong.take();
@@ -1290,7 +1292,22 @@ where
     }
 
     fn write_payload_inner(&mut self, payload: &[u8]) -> Result<(), TransportError> {
-        if self.rekey_active() {
+        self.write_payload_inner_with_retained(payload, true)
+    }
+
+    /// Completes one exact already-owned PONG before a retained rekey starts.
+    ///
+    /// `reject_retained` is false only for [`Self::drive_deferred_pong`], which
+    /// already holds the exact PONG. An active rekey still refuses the write.
+    fn write_payload_inner_with_retained(
+        &mut self,
+        payload: &[u8],
+        reject_retained: bool,
+    ) -> Result<(), TransportError> {
+        if self.rekey.is_some()
+            || self.sequence.rekey_active()
+            || (reject_retained && self.retained_peer_kexinit.is_some())
+        {
             return Err(TransportError::RekeyInProgress);
         }
         let sequence = match self.write_protected_packet(payload) {

@@ -147,6 +147,7 @@ impl Write for Stream {
 struct WriteGate {
     active: bool,
     remaining: usize,
+    terminal: bool,
 }
 
 impl WriteGate {
@@ -158,6 +159,10 @@ impl WriteGate {
     fn open(&mut self) {
         self.active = false;
         self.remaining = 0;
+    }
+
+    fn fail(&mut self) {
+        self.terminal = true;
     }
 }
 
@@ -180,6 +185,12 @@ impl Read for GatedStream {
 
 impl Write for GatedStream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.gate.borrow().terminal {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "test terminal client write failure",
+            ));
+        }
         let allowed = {
             let gate = self.gate.borrow_mut();
             if !gate.active {
@@ -453,6 +464,29 @@ impl Peer {
         for _ in 0..count {
             self.send_protected_packet(&[SSH_MSG_IGNORE, 0, 0, 0, 0], SSH_MSG_IGNORE)?;
         }
+        Ok(())
+    }
+
+    fn send_ping(&mut self, data: &[u8]) -> Result<(), String> {
+        let payload = neotales_ssh::keepalive::TransportPing::Ping(data.to_vec())
+            .encode()
+            .map_err(|error| error.to_string())?;
+        let sequence = self.sequence.outbound_sequence();
+        let protector = self
+            .write_protector
+            .as_mut()
+            .ok_or_else(|| "test peer has no write protector".to_owned())?;
+        let padding = protection_padding(payload.len(), protector.suite());
+        let packet = protector
+            .seal(sequence, &payload, &padding)
+            .map_err(|error| error.to_string())?;
+        self.server_bytes
+            .borrow_mut()
+            .write_all(&packet)
+            .map_err(|error| error.to_string())?;
+        self.sequence
+            .commit_outbound()
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -1211,6 +1245,141 @@ fn retained_peer_kexinit_behind_partial_data_completes_bidirectional_rekey()
         peer.received_application.back().map(Vec::as_slice),
         Some(CLIENT_AFTER_REKEY)
     );
+    Ok(())
+}
+
+#[test]
+fn retained_peer_kexinit_behind_partial_pong_completes_before_rekey()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (peer, stream) = Peer::new()?;
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let stream = GatedStream::new(stream, Rc::clone(&gate));
+    let config = ClientConfig::with_kexinit(proposal([0x11; 16], false));
+    let mut transport = config.connect(stream, |_key| Ok::<(), Infallible>(()))?;
+    peer.borrow_mut().drive();
+    transport.authenticated = true;
+    let original_session_id = transport.session_id().to_vec();
+
+    // A PING is read behind an owned packet and deferred.
+    let id = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+    peer.borrow_mut().send_ping(b"pong")?;
+    assert!(matches!(
+        transport.read_while_owned(&id)?,
+        OwnedInbound::PongDeferred
+    ));
+    transport.drive_owned_packet(&id)?;
+
+    // The PONG is partially written.
+    gate.borrow_mut().arm(1);
+    assert!(matches!(
+        transport.drive_deferred_pong(),
+        Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    let pong_id = transport.deferred_pong_read_id().expect("partial PONG id");
+
+    // A valid KEXINIT arrives while the PONG is partial and is retained.
+    peer.borrow_mut().initiate_rekey()?;
+    assert!(matches!(
+        transport.read_while_deferred_pong(&pong_id)?,
+        OwnedInbound::PeerKexInitRetained
+    ));
+    assert!(transport.rekey_active());
+
+    // The exact already-owned PONG finishes before the rekey starts.
+    gate.borrow_mut().open();
+    transport.drive_deferred_pong()?;
+
+    while transport.rekey_active() {
+        transport.advance_retained_peer_rekey()?;
+    }
+    assert!(transport.rekey_complete());
+    assert_eq!(transport.session_id(), original_session_id.as_slice());
+    assert_eq!(peer.borrow().session_id, original_session_id);
+
+    let pong = neotales_ssh::keepalive::TransportPing::Pong(b"pong".to_vec()).encode()?;
+    assert_eq!(
+        peer.borrow().received_application.get(1).map(Vec::as_slice),
+        Some(pong.as_slice())
+    );
+    Ok(())
+}
+
+#[test]
+fn retained_peer_kexinit_behind_partial_pong_terminal_write_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (peer, stream) = Peer::new()?;
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let stream = GatedStream::new(stream, Rc::clone(&gate));
+    let config = ClientConfig::with_kexinit(proposal([0x11; 16], false));
+    let mut transport = config.connect(stream, |_key| Ok::<(), Infallible>(()))?;
+    peer.borrow_mut().drive();
+    transport.authenticated = true;
+
+    let id = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+    peer.borrow_mut().send_ping(b"pong")?;
+    assert!(matches!(
+        transport.read_while_owned(&id)?,
+        OwnedInbound::PongDeferred
+    ));
+    transport.drive_owned_packet(&id)?;
+    gate.borrow_mut().arm(1);
+    assert!(matches!(
+        transport.drive_deferred_pong(),
+        Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    let pong_id = transport.deferred_pong_read_id().expect("partial PONG id");
+    peer.borrow_mut().initiate_rekey()?;
+    assert!(matches!(
+        transport.read_while_deferred_pong(&pong_id)?,
+        OwnedInbound::PeerKexInitRetained
+    ));
+
+    gate.borrow_mut().fail();
+    assert!(matches!(
+        transport.drive_deferred_pong(),
+        Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe
+    ));
+    assert!(!transport.is_established());
+    assert!(!transport.rekey_active());
+    assert!(matches!(
+        transport.write_payload(CLIENT_AFTER_REKEY),
+        Err(TransportError::NotEstablished)
+    ));
+    Ok(())
+}
+
+#[test]
+fn retained_peer_kexinit_rejects_public_begin_and_completes_via_retained_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (peer, stream) = Peer::new()?;
+    let config = ClientConfig::with_kexinit(proposal([0x11; 16], false));
+    let mut transport = config.connect(stream, |_key| Ok::<(), Infallible>(()))?;
+    peer.borrow_mut().drive();
+    transport.authenticated = true;
+    let original_session_id = transport.session_id().to_vec();
+    peer.borrow_mut().initiate_rekey()?;
+
+    let id = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+    assert!(matches!(
+        transport.read_while_owned(&id)?,
+        OwnedInbound::PeerKexInitRetained
+    ));
+    transport.drive_owned_packet(&id)?;
+
+    assert!(matches!(
+        transport.begin_rekey(),
+        Err(HandshakeError::Transport(TransportError::OwnedPacketState))
+    ));
+    assert!(transport.rekey_active());
+    assert!(!transport.rekey_complete());
+
+    while transport.rekey_active() {
+        transport.advance_retained_peer_rekey()?;
+    }
+    assert!(transport.rekey_complete());
+    assert_eq!(transport.session_id(), original_session_id.as_slice());
+    assert_eq!(peer.borrow().session_id, original_session_id);
+    assert!(peer.borrow().saw_rekey);
     Ok(())
 }
 
