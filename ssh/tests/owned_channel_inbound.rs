@@ -3529,6 +3529,43 @@ fn peer_kexinit_behind_active_packet_is_retained_once() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn peer_kexinit_behind_partial_window_is_retained_once() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut driver, write, _read, sequence, steps, peer) = setup()?;
+    let (signalled, signal) = mpsc::channel();
+    steps.send(PeerStep::BeginRekeyOnly(signalled))?;
+    let id = driver.admit_window_adjustment(0, 1)?;
+    write.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        driver.drive_window_adjustment(&id),
+        Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    let inbound_before = driver.inbound_sequence();
+    signal.recv_timeout(Duration::from_secs(5))?;
+    assert!(matches!(
+        driver.read_while_window_adjustment(&id)?,
+        OwnedChannelInbound::PeerRekey
+    ));
+    assert!(driver.rekey_active());
+    assert_eq!(driver.inbound_sequence(), inbound_before + 1);
+    assert_eq!(driver.outbound_sequence(), sequence);
+    write.store(usize::MAX, Ordering::SeqCst);
+    assert_eq!(driver.drive_window_adjustment(&id)?, 65_537);
+    assert_eq!(driver.outbound_sequence(), sequence + 1);
+    assert!(matches!(
+        driver.admit_data(0, b"x"),
+        Err(OwnedChannelError::Busy)
+    ));
+    let driver = driver
+        .try_into_connection()
+        .expect_err("released with a retained peer KEXINIT");
+    drop(driver);
+    steps.send(PeerStep::Finish)?;
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
 fn peer_initiated_rekey_at_idle_completes_and_preserves_data()
 -> Result<(), Box<dyn std::error::Error>> {
     let (mut driver, _write, _read, _sequence, steps, peer) = setup()?;

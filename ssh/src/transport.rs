@@ -1081,19 +1081,22 @@ where
         self.read_owned_step()
     }
 
-    /// Starts or advances the rekey for a retained peer KEXINIT.
+    /// Starts or advances the rekey for a retained peer KEXINIT by one bounded
+    /// step.
     ///
     /// The retained KEXINIT was authenticated and its inbound sequence number
-    /// was committed when it arrived. This method sends the local KEXINIT under
-    /// the old keys, observes the retained proposal without committing its
-    /// sequence a second time, sends the client KEX method, and drives the
-    /// exchange to completion or to `WouldBlock`. The original session
-    /// identifier remains the NEWKEYS derivation input.
+    /// was committed when it arrived. The first call sends the local KEXINIT
+    /// under the old keys and observes the retained proposal without
+    /// committing its sequence a second time. Later calls advance one rekey
+    /// packet or one pending rekey write at a time, so a nonblocking caller can
+    /// apply its own step budget. The original session identifier remains the
+    /// NEWKEYS derivation input.
     ///
     /// The caller must have finished every owned packet and deferred pong; an
     /// active one returns [`TransportError::OwnedPacketState`]. Unsupported
     /// proposals, malformed or out-of-order rekey packets, and protection
-    /// failures fail closed and disable protected I/O.
+    /// failures fail closed and disable protected I/O. A `WouldBlock` keeps the
+    /// retained proposal and the active rekey state for a retry.
     ///
     /// Returns `Ok(true)` when a rekey was started or advanced and `Ok(false)`
     /// when neither a retained KEXINIT nor an active rekey exists.
@@ -1120,23 +1123,27 @@ where
             }
             if let Err(error) = self.begin_rekey() {
                 let error: TransportError = error.into();
-                if !matches!(&error, TransportError::Io(io) if io.kind() == io::ErrorKind::WouldBlock)
+                if matches!(&error, TransportError::Io(io) if io.kind() == io::ErrorKind::WouldBlock)
                 {
-                    self.retained_peer_kexinit = None;
+                    return Err(error);
                 }
-                return Err(error);
+                // The peer has already sent KEXINIT and expects the exchange.
+                // No nonretryable start failure may leave protected I/O usable.
+                return Err(self.fail_protected_write(error));
             }
             let Some(payload) = self.retained_peer_kexinit.take() else {
                 return Err(self.fail_protected_write(TransportError::InvalidMessage));
             };
-            self.accept_retained_peer_kexinit(&payload)?;
-        }
-        while self.rekey.is_some() {
-            if let Err(error) = self.advance_rekey() {
-                return Err(error.into());
+            if let Err(error) = self.accept_retained_peer_kexinit(&payload) {
+                return Err(self.fail_protected_write(error));
             }
+            return Ok(true);
         }
-        Ok(true)
+        if self.rekey.is_some() {
+            self.advance_rekey()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(crate) fn deferred_pong_read_id(&self) -> Option<OwnedPacketId> {

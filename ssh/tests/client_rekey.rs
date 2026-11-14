@@ -51,11 +51,14 @@ use msg::kexinit::{
 };
 use neotales_ssh::build_packet_default;
 use sequence::{Direction, PacketDisposition, SSH_MSG_NEWKEYS, SequenceState};
-use transport::{TransportError, read_eam_payload, read_protected_packet};
+use transport::{OwnedInbound, TransportError, read_eam_payload, read_protected_packet};
 
 const SERVER_VERSION: &str = "SSH-2.0-neotales-ssh-rekey-peer";
 const CLIENT_PAYLOAD: &[u8] = b"client-after-rekey";
+const CLIENT_BEFORE_REKEY: &[u8] = b"client-before-rekey";
+const CLIENT_AFTER_REKEY: &[u8] = b"client-after-second-rekey";
 const PEER_PAYLOAD: &[u8] = b"peer-after-rekey";
+const SSH_MSG_IGNORE: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PeerPhase {
@@ -429,14 +432,26 @@ impl Peer {
     }
 
     fn drive_rekey_kexinit(&mut self) -> Result<(), String> {
-        let (payload, sequence) = self.read_protected_client()?;
-        if payload.first() != Some(&SSH_MSG_KEXINIT) {
-            return Err("rekey client KEXINIT had the wrong type".to_owned());
+        loop {
+            let (payload, sequence) = self.read_protected_client()?;
+            if payload.first() == Some(&SSH_MSG_KEXINIT) {
+                self.phase = PeerPhase::AwaitRekeyKexMethod;
+                self.process_rekey_kexinit(&payload, sequence)?;
+                if self.server_rekey_kexinit_sent {
+                    self.drive_rekey_kex()?;
+                }
+                return Ok(());
+            }
+            // A peer may still send application data between this KEXINIT and
+            // its own; the old keys remain in force until NEWKEYS.
+            self.commit_inbound(sequence)?;
+            self.received_application.push_back(payload);
         }
-        self.phase = PeerPhase::AwaitRekeyKexMethod;
-        self.process_rekey_kexinit(&payload, sequence)?;
-        if self.server_rekey_kexinit_sent {
-            self.drive_rekey_kex()?;
+    }
+
+    fn send_ignored(&mut self, count: usize) -> Result<(), String> {
+        for _ in 0..count {
+            self.send_protected_packet(&[SSH_MSG_IGNORE, 0, 0, 0, 0], SSH_MSG_IGNORE)?;
         }
         Ok(())
     }
@@ -1061,6 +1076,141 @@ fn client_peer_initiated_rekey_resumes_split_local_kexinit()
     assert!(!transport.rekey_active());
     assert!(transport.rekey_complete());
     assert_eq!(transport.read_payload()?, PEER_PAYLOAD);
+    Ok(())
+}
+
+#[test]
+fn retained_peer_kexinit_nonretryable_start_failure_disables_protected_io()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (peer, stream) = Peer::new()?;
+    let config = ClientConfig::with_kexinit(proposal([0x11; 16], false));
+    let mut transport = config.connect(stream, |_key| Ok::<(), Infallible>(()))?;
+    peer.borrow_mut().drive();
+    // The rekey harness has no userauth phase; owned reads require the
+    // transport's authenticated flag.
+    transport.authenticated = true;
+    peer.borrow_mut().initiate_rekey()?;
+
+    let id = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+    assert!(matches!(
+        transport.read_while_owned(&id)?,
+        OwnedInbound::PeerKexInitRetained
+    ));
+    transport.drive_owned_packet(&id)?;
+    transport.initial_algorithm = Some("not-a-rekey-algorithm".to_owned());
+    assert!(matches!(
+        transport.advance_retained_peer_rekey(),
+        Err(TransportError::UnexpectedMessage)
+    ));
+    assert!(!transport.is_established());
+    assert!(!transport.rekey_active());
+    assert!(matches!(
+        transport.write_payload(CLIENT_AFTER_REKEY),
+        Err(TransportError::NotEstablished)
+    ));
+    assert!(matches!(
+        transport.read_payload(),
+        Err(TransportError::NotEstablished)
+    ));
+    Ok(())
+}
+
+#[test]
+fn retained_peer_rekey_ignored_packets_advance_one_per_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (peer, stream) = Peer::new()?;
+    let config = ClientConfig::with_kexinit(proposal([0x11; 16], false));
+    let mut transport = config.connect(stream, |_key| Ok::<(), Infallible>(()))?;
+    peer.borrow_mut().drive();
+    // The rekey harness has no userauth phase; owned reads require the
+    // transport's authenticated flag.
+    transport.authenticated = true;
+    peer.borrow_mut().initiate_rekey()?;
+
+    let id = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+    assert!(matches!(
+        transport.read_while_owned(&id)?,
+        OwnedInbound::PeerKexInitRetained
+    ));
+    transport.drive_owned_packet(&id)?;
+    let inbound_before = transport.inbound_sequence();
+    peer.borrow_mut().send_ignored(16)?;
+
+    // The first call starts the rekey and accepts the retained proposal.
+    assert!(transport.advance_retained_peer_rekey()?);
+    assert_eq!(transport.inbound_sequence(), inbound_before);
+    // The next call sends the client KEX method without reading the queue.
+    assert!(transport.advance_retained_peer_rekey()?);
+    assert_eq!(transport.inbound_sequence(), inbound_before);
+    // Each later call consumes exactly one ignored packet, not the queue.
+    for step in 1..=16 {
+        assert!(transport.rekey_active());
+        assert!(transport.advance_retained_peer_rekey()?);
+        assert_eq!(transport.inbound_sequence(), inbound_before + step);
+    }
+    assert!(transport.rekey_active());
+    Ok(())
+}
+
+#[test]
+fn retained_peer_kexinit_behind_partial_data_completes_bidirectional_rekey()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (peer, stream) = Peer::new()?;
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let stream = GatedStream::new(stream, Rc::clone(&gate));
+    let config = ClientConfig::with_kexinit(proposal([0x11; 16], false));
+    let mut transport = config.connect(stream, |_key| Ok::<(), Infallible>(()))?;
+    peer.borrow_mut().drive();
+    // The rekey harness has no userauth phase; owned reads require the
+    // transport's authenticated flag.
+    transport.authenticated = true;
+    let original_session_id = transport.session_id().to_vec();
+    peer.borrow_mut().send_application_after_rekey = true;
+    peer.borrow_mut().initiate_rekey()?;
+
+    let id = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+    gate.borrow_mut().arm(1);
+    assert!(matches!(
+        transport.drive_owned_packet(&id),
+        Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        transport.read_while_owned(&id)?,
+        OwnedInbound::PeerKexInitRetained
+    ));
+    gate.borrow_mut().open();
+    transport.drive_owned_packet(&id)?;
+
+    while transport.rekey_active() {
+        transport.advance_retained_peer_rekey()?;
+    }
+    assert!(transport.rekey_complete());
+    assert_eq!(transport.session_id(), original_session_id.as_slice());
+    assert_eq!(peer.borrow().session_id, original_session_id);
+
+    // The peer sends an application payload after its NEWKEYS.
+    assert_eq!(transport.read_payload()?, PEER_PAYLOAD);
+    assert_eq!(
+        peer.borrow().sequence.outbound_sequence(),
+        transport.inbound_sequence()
+    );
+
+    // Both directions carry application payloads under the new keys.
+    transport.write_payload(CLIENT_AFTER_REKEY)?;
+    peer.borrow_mut().drive();
+    let peer = peer.borrow();
+    assert_eq!(
+        peer.sequence.inbound_sequence(),
+        transport.outbound_sequence()
+    );
+    assert_eq!(
+        peer.received_application.front().map(Vec::as_slice),
+        Some(CLIENT_BEFORE_REKEY)
+    );
+    assert_eq!(
+        peer.received_application.back().map(Vec::as_slice),
+        Some(CLIENT_AFTER_REKEY)
+    );
     Ok(())
 }
 

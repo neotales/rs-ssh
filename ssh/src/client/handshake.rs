@@ -985,7 +985,11 @@ where
             return Ok(true);
         }
 
-        let (payload, sequence) = self.read_rekey_packet()?;
+        let Some((payload, sequence)) = self.read_rekey_packet()? else {
+            // One ignorable packet was consumed. Returning progress keeps the
+            // step bounded; a staged caller advances again when ready.
+            return Ok(true);
+        };
         let message_type = payload
             .first()
             .copied()
@@ -1271,29 +1275,23 @@ where
         Ok(())
     }
 
-    fn read_rekey_packet(&mut self) -> Result<(Vec<u8>, u32), HandshakeError> {
-        loop {
-            let (payload, sequence) = self.read_protected_packet()?;
-            let message_type = payload
-                .first()
-                .copied()
-                .ok_or(TransportError::InvalidMessage)?;
-            match message_type {
-                SSH_MSG_IGNORE | SSH_MSG_DEBUG | SSH_MSG_UNIMPLEMENTED => {
-                    let disposition = self.sequence.observe_rekey_inbound(message_type)?;
-                    if disposition != PacketDisposition::Ignorable {
-                        return Err(TransportError::UnexpectedMessage.into());
-                    }
-                    self.commit_rekey_direction(Direction::Inbound, sequence)?;
+    fn read_rekey_packet(&mut self) -> Result<Option<(Vec<u8>, u32)>, HandshakeError> {
+        let (payload, sequence) = self.read_protected_packet()?;
+        let message_type = payload
+            .first()
+            .copied()
+            .ok_or(TransportError::InvalidMessage)?;
+        match message_type {
+            SSH_MSG_IGNORE | SSH_MSG_DEBUG | SSH_MSG_UNIMPLEMENTED => {
+                let disposition = self.sequence.observe_rekey_inbound(message_type)?;
+                if disposition != PacketDisposition::Ignorable {
+                    return Err(TransportError::UnexpectedMessage.into());
                 }
-                SSH_MSG_DISCONNECT => return Err(TransportError::PeerDisconnected.into()),
-                SSH_MSG_KEXINIT
-                | SSH_MSG_NEWKEYS
-                | SSH_MSG_KEX_METHOD_FIRST..=SSH_MSG_KEX_METHOD_LAST => {
-                    return Ok((payload, sequence));
-                }
-                _ => return Ok((payload, sequence)),
+                self.commit_rekey_direction(Direction::Inbound, sequence)?;
+                Ok(None)
             }
+            SSH_MSG_DISCONNECT => Err(TransportError::PeerDisconnected.into()),
+            _ => Ok(Some((payload, sequence))),
         }
     }
 
