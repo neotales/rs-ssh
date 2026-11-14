@@ -713,7 +713,8 @@ struct CloseReply {
 
 /// One bounded result from [`OwnedChannelDriver::read_inbound`],
 /// [`OwnedChannelDriver::read_idle`], or
-/// [`OwnedChannelDriver::read_while_window_adjustment`].
+/// [`OwnedChannelDriver::read_while_window_adjustment`], or
+/// [`OwnedChannelDriver::read_while_eof`].
 #[derive(Debug)]
 pub enum OwnedChannelInbound {
     /// One complete channel event was decoded and delivered unchanged.
@@ -724,7 +725,7 @@ pub enum OwnedChannelInbound {
     /// sent, the obligation blocks further reads and release. Global and
     /// channel requests have explicit failure reply paths; open requests can be
     /// rejected and a peer close can be answered explicitly. If the event
-    /// arrives during a window adjustment, that adjustment must complete
+    /// arrives during a window adjustment or EOF, that packet must complete
     /// before the reply can be driven.
     Event(ChannelEvent),
     /// One authenticated payload was consumed and carried no channel event.
@@ -736,7 +737,7 @@ pub enum OwnedChannelInbound {
     /// An inbound transport ping was consumed and its pong is owed.
     ///
     /// No further inbound read is permitted until any admitted data packet or
-    /// window adjustment completes and [`OwnedChannelDriver::drive_deferred_pong`]
+    /// window adjustment or EOF completes and [`OwnedChannelDriver::drive_deferred_pong`]
     /// writes the pong. The connection cannot be released while the pong is owed.
     PongDeferred,
 }
@@ -1171,8 +1172,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// `WouldBlock` preserves partial input and the outbound packet. Retain the
     /// ID and resume, or drop the driver and all separate socket handles.
     /// Terminal protocol or I/O errors fail the driver; peer rekey is unsupported
-    /// and fails closed. This method does not support reads during EOF or other
-    /// control writes.
+    /// and fails closed. Use [`Self::read_while_eof`] for an active EOF;
+    /// reads during other control writes remain unsupported.
     ///
     /// # Errors
     ///
@@ -1194,10 +1195,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
 
     /// Admits one outbound channel EOF without yet changing channel state.
     ///
-    /// Earlier data and control work must be completed first. Reads, other
-    /// admissions and release are blocked until [`Self::drive_eof`] completes
-    /// the packet. After completion the read half remains usable until peer
-    /// closure. The ID must be retained; dropping it does not cancel the EOF.
+    /// Earlier data and control work must be completed first. Other admissions
+    /// and release are blocked until [`Self::drive_eof`] completes the packet.
+    /// [`Self::read_while_eof`] may read one packet per step while it is active.
+    /// After completion the read half remains usable until peer closure. The ID
+    /// must be retained; dropping it does not cancel the EOF.
     ///
     /// # Errors
     ///
@@ -1288,6 +1290,38 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                 Err(OwnedChannelError::Transport(error))
             }
         }
+    }
+
+    /// Reads one authenticated packet while the identified outbound EOF is active.
+    ///
+    /// Events use the same bounded handling as [`Self::read_inbound`]. One
+    /// reply-requiring event or PING is retained behind the EOF; further reads
+    /// stop until the EOF and that reply complete. In particular, a peer CLOSE
+    /// is delivered and retained even if it arrives while EOF is partial. The
+    /// EOF completes before the corresponding CLOSE reply and its local state
+    /// is set only when its own packet completes.
+    ///
+    /// `WouldBlock` retains partial input and the outbound EOF. Retain the ID
+    /// and retry after readiness, or drop the driver and any separately held
+    /// socket handles. Terminal errors fail the driver. Peer rekey fails
+    /// closed. Reads while other control replies are pending remain unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy for a stale or foreign ID or an owed reply, failed after a
+    /// terminal error, or a channel or transport error.
+    pub fn read_while_eof(
+        &mut self,
+        id: &OwnedChannelEofId,
+    ) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.pending_eof.is_none() || self.pong_owed || self.control_owed {
+            return Err(OwnedChannelError::Busy);
+        }
+        let result = self.connection.transport.read_while_owned(&id.0);
+        self.handle_owned_inbound(result)
     }
 
     /// Consumes exactly one inbound packet while the admitted data packet is active.
@@ -1462,7 +1496,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
 
     /// Refuses a consumed global request that asked for a reply.
     ///
-    /// Any admitted data or window adjustment and deferred pong must complete first. The
+    /// Any admitted data, window adjustment or EOF and deferred pong must
+    /// complete first. The
     /// reply occupies at most one protected packet and is retained across
     /// `WouldBlock`. Reads, new data and release remain blocked until it
     /// completes. Dropping the driver discards the connection, not just the
@@ -1478,6 +1513,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
         if self.pending
             || self.window_adjustment.is_some()
+            || self.pending_eof.is_some()
             || self.pong_owed
             || self.global_failure.is_none()
         {
@@ -1519,7 +1555,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// `channel` is the local channel from the delivered event. A wrong
     /// channel is rejected without changing the obligation. Data, a window
-    /// adjustment, a deferred pong and any global failure must complete first. The protected reply is
+    /// adjustment, EOF, a deferred pong and any global failure must complete
+    /// first. The protected reply is
     /// retained across `WouldBlock`; reads, admission and release remain
     /// blocked until completion. Dropping the driver discards its connection.
     ///
@@ -1533,6 +1570,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
         if self.pending
             || self.window_adjustment.is_some()
+            || self.pending_eof.is_some()
             || self.pong_owed
             || self.global_failure.is_some()
         {
@@ -1608,6 +1646,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
         if self.pending
             || self.window_adjustment.is_some()
+            || self.pending_eof.is_some()
             || self.pong_owed
             || self.global_failure.is_some()
             || self.channel_failure.is_some()
@@ -1692,6 +1731,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
         if self.pending
             || self.window_adjustment.is_some()
+            || self.pending_eof.is_some()
             || self.pong_owed
             || self.global_failure.is_some()
             || self.channel_failure.is_some()
@@ -1752,9 +1792,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     }
 
     /// Writes a pong deferred by [`Self::read_inbound`], [`Self::read_idle`],
-    /// or [`Self::read_while_window_adjustment`].
+    /// [`Self::read_while_window_adjustment`], or [`Self::read_while_eof`].
     ///
-    /// Any admitted data packet or window adjustment must complete first. `WouldBlock` preserves the
+    /// Any admitted data packet, window adjustment or EOF must complete first.
+    /// `WouldBlock` preserves the
     /// pong and is retryable; any other write failure makes the driver
     /// terminal. A pong is owed only after
     /// [`OwnedChannelInbound::PongDeferred`], and the connection cannot be
@@ -1764,13 +1805,17 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy when no pong is owed or the data packet or window
-    /// adjustment is still active, or a transport error.
+    /// Returns busy when no pong is owed or the data packet, window adjustment
+    /// or EOF is still active, or a transport error.
     pub fn drive_deferred_pong(&mut self) -> Result<(), OwnedChannelError> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending || self.window_adjustment.is_some() || !self.pong_owed {
+        if self.pending
+            || self.window_adjustment.is_some()
+            || self.pending_eof.is_some()
+            || !self.pong_owed
+        {
             return Err(OwnedChannelError::Busy);
         }
         match self.connection.transport.drive_deferred_pong() {
