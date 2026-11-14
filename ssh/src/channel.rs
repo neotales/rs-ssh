@@ -691,6 +691,24 @@ enum GlobalFailure {
     Writing(OwnedPacketId),
 }
 
+/// The single obligation accepted behind a writing global reply.
+#[derive(Debug)]
+enum NextGlobalObligation {
+    Pong,
+    GlobalFailure,
+    ChannelFailure {
+        channel: ChannelId,
+        remote: ChannelId,
+    },
+    OpenRejection {
+        remote: ChannelId,
+    },
+    CloseReply {
+        channel: ChannelId,
+        remote: ChannelId,
+    },
+}
+
 #[derive(Debug)]
 struct ChannelFailure {
     channel: ChannelId,
@@ -714,7 +732,8 @@ struct CloseReply {
 /// One bounded result from [`OwnedChannelDriver::read_inbound`],
 /// [`OwnedChannelDriver::read_idle`], or
 /// [`OwnedChannelDriver::read_while_window_adjustment`], or
-/// [`OwnedChannelDriver::read_while_eof`].
+/// [`OwnedChannelDriver::read_while_eof`], or
+/// [`OwnedChannelDriver::read_while_global_failure`].
 #[derive(Debug)]
 pub enum OwnedChannelInbound {
     /// One complete channel event was decoded and delivered unchanged.
@@ -725,8 +744,8 @@ pub enum OwnedChannelInbound {
     /// sent, the obligation blocks further reads and release. Global and
     /// channel requests have explicit failure reply paths; open requests can be
     /// rejected and a peer close can be answered explicitly. If the event
-    /// arrives during a window adjustment or EOF, that packet must complete
-    /// before the reply can be driven.
+    /// arrives during a window adjustment, EOF or global failure, that packet
+    /// must complete before the reply can be driven.
     Event(ChannelEvent),
     /// One authenticated payload was consumed and carried no channel event.
     ///
@@ -737,7 +756,8 @@ pub enum OwnedChannelInbound {
     /// An inbound transport ping was consumed and its pong is owed.
     ///
     /// No further inbound read is permitted until any admitted data packet or
-    /// window adjustment or EOF completes and [`OwnedChannelDriver::drive_deferred_pong`]
+    /// window adjustment, EOF or active global failure completes and
+    /// [`OwnedChannelDriver::drive_deferred_pong`]
     /// writes the pong. The connection cannot be released while the pong is owed.
     PongDeferred,
 }
@@ -791,6 +811,8 @@ pub struct OwnedChannelDriver<S> {
     control_owed: bool,
     /// A global failure is queued, or has been sealed under this ID.
     global_failure: Option<GlobalFailure>,
+    /// One later obligation, distinct from the writing global packet.
+    next_global_obligation: Option<NextGlobalObligation>,
     /// One consumed channel request, retained until its failure is complete.
     channel_failure: Option<ChannelFailure>,
     /// One peer open retained until its rejection has been written.
@@ -837,6 +859,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             pong_owed: false,
             control_owed: false,
             global_failure: None,
+            next_global_obligation: None,
             channel_failure: None,
             open_rejection: None,
             close_reply: None,
@@ -1172,8 +1195,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// `WouldBlock` preserves partial input and the outbound packet. Retain the
     /// ID and resume, or drop the driver and all separate socket handles.
     /// Terminal protocol or I/O errors fail the driver; peer rekey is unsupported
-    /// and fails closed. Use [`Self::read_while_eof`] for an active EOF;
-    /// reads during other control writes remain unsupported.
+    /// and fails closed. Use [`Self::read_while_eof`] for an active EOF and
+    /// [`Self::read_while_global_failure`] for an active global failure;
+    /// reads during other reply writes remain unsupported.
     ///
     /// # Errors
     ///
@@ -1304,7 +1328,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// `WouldBlock` retains partial input and the outbound EOF. Retain the ID
     /// and retry after readiness, or drop the driver and any separately held
     /// socket handles. Terminal errors fail the driver. Peer rekey fails
-    /// closed. Reads while other control replies are pending remain unsupported.
+    /// closed. [`Self::read_while_global_failure`] covers an active global
+    /// failure; reads while other control replies are pending remain unsupported.
     ///
     /// # Errors
     ///
@@ -1494,14 +1519,155 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
+    /// Reads one authenticated packet behind a partially written global failure.
+    ///
+    /// This step is available only once the global failure packet has been
+    /// admitted by [`Self::drive_global_failure`]. The active packet remains
+    /// the sole protected writer. A PING or reply-requiring event occupies one
+    /// separate bounded next-obligation slot, after which further reads are
+    /// busy. Complete the active global failure first, then drive the deferred
+    /// pong or reply using its corresponding method. Inbound data and window
+    /// events are delivered one at a time without queuing.
+    ///
+    /// A partial read and the active packet survive `WouldBlock`. On
+    /// cancellation retain the driver or drop it and its separate socket
+    /// handles. Terminal I/O or protocol errors fail the driver; peer rekey is
+    /// unsupported and fails closed. Reads while other reply ciphertext is
+    /// active remain unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy if the packet is not writing or the next slot is occupied,
+    /// failed after a terminal error, or a channel or transport error.
+    pub fn read_while_global_failure(&mut self) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.next_global_obligation.is_some() {
+            return Err(OwnedChannelError::Busy);
+        }
+        let Some(GlobalFailure::Writing(id)) = self.global_failure.as_ref() else {
+            return Err(OwnedChannelError::Busy);
+        };
+        match self.connection.transport.read_while_owned(id) {
+            Ok(OwnedInbound::Payload(payload)) => {
+                let event = match self.connection.dispatch_decoded_payload(&payload) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        self.failed = true;
+                        return Err(OwnedChannelError::Channel(error));
+                    }
+                };
+                let Some(event) = event else {
+                    return Ok(OwnedChannelInbound::Consumed);
+                };
+                if self.event_owes_control(&event) {
+                    let next = match &event {
+                        ChannelEvent::GlobalRequest {
+                            want_reply: true, ..
+                        } => NextGlobalObligation::GlobalFailure,
+                        ChannelEvent::Request {
+                            channel,
+                            want_reply: true,
+                            ..
+                        } => {
+                            let remote = match self.connection.remote_channel(*channel) {
+                                Ok(remote) => remote,
+                                Err(error) => {
+                                    self.failed = true;
+                                    return Err(OwnedChannelError::Channel(error));
+                                }
+                            };
+                            NextGlobalObligation::ChannelFailure {
+                                channel: *channel,
+                                remote,
+                            }
+                        }
+                        ChannelEvent::OpenRequest(request) => NextGlobalObligation::OpenRejection {
+                            remote: request.sender_channel(),
+                        },
+                        ChannelEvent::Close { channel } => {
+                            let remote = match self.connection.remote_channel(*channel) {
+                                Ok(remote) => remote,
+                                Err(error) => {
+                                    self.failed = true;
+                                    return Err(OwnedChannelError::Channel(error));
+                                }
+                            };
+                            NextGlobalObligation::CloseReply {
+                                channel: *channel,
+                                remote,
+                            }
+                        }
+                        _ => {
+                            self.failed = true;
+                            return Err(OwnedChannelError::Channel(ChannelError::InvalidMessage));
+                        }
+                    };
+                    self.next_global_obligation = Some(next);
+                }
+                Ok(OwnedChannelInbound::Event(event))
+            }
+            Ok(OwnedInbound::PongDeferred) => {
+                self.next_global_obligation = Some(NextGlobalObligation::Pong);
+                Ok(OwnedChannelInbound::PongDeferred)
+            }
+            Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(OwnedChannelError::Transport(error))
+            }
+        }
+    }
+
+    fn promote_after_global_failure(&mut self) {
+        self.control_owed = false;
+        match self.next_global_obligation.take() {
+            None => {}
+            Some(NextGlobalObligation::Pong) => self.pong_owed = true,
+            Some(NextGlobalObligation::GlobalFailure) => {
+                self.control_owed = true;
+                self.global_failure = Some(GlobalFailure::Queued);
+            }
+            Some(NextGlobalObligation::ChannelFailure { channel, remote }) => {
+                self.control_owed = true;
+                self.channel_failure = Some(ChannelFailure {
+                    channel,
+                    remote,
+                    packet: None,
+                });
+            }
+            Some(NextGlobalObligation::OpenRejection { remote }) => {
+                self.control_owed = true;
+                self.open_rejection = Some(OpenRejection {
+                    remote,
+                    packet: None,
+                });
+            }
+            Some(NextGlobalObligation::CloseReply { channel, remote }) => {
+                self.control_owed = true;
+                self.close_reply = Some(CloseReply {
+                    channel,
+                    remote,
+                    packet: None,
+                });
+            }
+        }
+    }
+
     /// Refuses a consumed global request that asked for a reply.
     ///
     /// Any admitted data, window adjustment or EOF and deferred pong must
     /// complete first. The
     /// reply occupies at most one protected packet and is retained across
-    /// `WouldBlock`. Reads, new data and release remain blocked until it
-    /// completes. Dropping the driver discards the connection, not just the
-    /// obligation. A non-retryable transport error makes the driver terminal.
+    /// `WouldBlock`. Once it starts, [`Self::read_while_global_failure`] may
+    /// read with one bounded next obligation; new data and release remain
+    /// blocked until the reply completes. Dropping the driver discards the
+    /// connection, not just the obligation. A non-retryable transport error
+    /// makes the driver terminal.
     ///
     /// # Errors
     ///
@@ -1538,7 +1704,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         match self.connection.transport.drive_owned_packet(id) {
             Ok(()) => {
                 self.global_failure = None;
-                self.control_owed = false;
+                self.promote_after_global_failure();
                 Ok(())
             }
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1792,7 +1958,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     }
 
     /// Writes a pong deferred by [`Self::read_inbound`], [`Self::read_idle`],
-    /// [`Self::read_while_window_adjustment`], or [`Self::read_while_eof`].
+    /// [`Self::read_while_window_adjustment`], [`Self::read_while_eof`], or
+    /// [`Self::read_while_global_failure`].
     ///
     /// Any admitted data packet, window adjustment or EOF must complete first.
     /// `WouldBlock` preserves the
@@ -1881,6 +2048,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             || self.failed
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
+            || self.next_global_obligation.is_some()
             || self.pong_owed
             || self.control_owed
             || self.connection.pending_open_count() != 0
