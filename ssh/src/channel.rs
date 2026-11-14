@@ -2021,16 +2021,22 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// An admitted data packet can be driven with [`Self::drive`], an admitted
     /// window adjustment with [`Self::drive_window_adjustment`], and an EOF
-    /// with [`Self::drive_eof`], unless the driver fails. Once earlier work
-    /// completes, write any deferred pong with
-    /// [`Self::drive_deferred_pong`], then complete any consumed global request
-    /// failure with [`Self::drive_global_failure`] or a channel request failure
-    /// with [`Self::drive_channel_failure`], or reject an inbound open with
-    /// [`Self::drive_open_rejection`], or answer a peer close with
-    /// [`Self::drive_close_reply`]. Release is allowed only
-    /// after all outstanding obligations complete and no failure remains.
-    /// Reads are blocked while any obligation is owed, so this driver cannot
-    /// consume a request while a pong or another reply is deferred.
+    /// with [`Self::drive_eof`], unless the driver fails. Any obligation
+    /// received behind one of those packets is answered after that packet
+    /// completes.
+    ///
+    /// If [`Self::read_while_global_failure`] receives a PING or a
+    /// reply-requiring event, it retains at most one next obligation. Complete
+    /// the active global failure with [`Self::drive_global_failure`] first;
+    /// only then drive the promoted pong or reply. Further reads are blocked
+    /// while that next slot is occupied.
+    ///
+    /// Drive a deferred pong with [`Self::drive_deferred_pong`], a global
+    /// failure with [`Self::drive_global_failure`], a channel failure with
+    /// [`Self::drive_channel_failure`], an open rejection with
+    /// [`Self::drive_open_rejection`], or a peer-close reply with
+    /// [`Self::drive_close_reply`]. Release is allowed only after all
+    /// outstanding obligations complete and no failure remains.
     ///
     /// A failed driver must be dropped along with its transport. Pre-existing
     /// opens and unanswered closes are refused by
