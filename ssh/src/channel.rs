@@ -1207,11 +1207,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// `WouldBlock` preserves the packet and leaves local EOF unset; wait for
     /// writability before retrying. A successful completion sets local EOF
-    /// exactly once; stale or foreign IDs are busy. Other write errors leave the
-    /// driver terminal. If cancellation or an error interrupts the operation,
-    /// whether the peer saw the EOF may be unknown: retain the same ID and
+    /// exactly once; stale or foreign IDs are busy. If cancellation or a
+    /// retryable `WouldBlock` interrupts the operation, retain the same ID and
     /// resume, or discard the driver and all independently held socket handles.
-    /// Do not send a replacement EOF on that connection.
+    /// Other write errors make the driver terminal and require discarding it
+    /// and those handles. In either case the peer's observed outcome may be
+    /// unknown; do not send a replacement EOF on that connection.
     ///
     /// # Errors
     ///
