@@ -1338,14 +1338,16 @@ where
     /// A peer KEXINIT has two distinct nonblocking paths:
     ///
     /// * When this call consumes the KEXINIT itself, it starts the peer rekey
-    ///   immediately. If the stream returns `WouldBlock` while sending the
-    ///   local KEXINIT or KEX method, this call returns that I/O error with the
-    ///   rekey active. A retry of `read_payload` returns
-    ///   [`TransportError::RekeyInProgress`]; finish with
-    ///   [`ClientTransport::advance_rekey`] one bounded step at a time, then
-    ///   retry `read_payload` for the next application payload.
-    /// * When an owned read retained the KEXINIT, this call did not consume
-    ///   it. It returns `RekeyInProgress` immediately; finish with
+    ///   immediately. A `WouldBlock` may occur while writing the local KEXINIT,
+    ///   KEX method, or NEWKEYS, or while reading a later rekey packet; this
+    ///   call returns that I/O error with the rekey active. A retry of
+    ///   `read_payload` returns [`TransportError::RekeyInProgress`]; finish
+    ///   with [`ClientTransport::advance_rekey`] one bounded step at a time,
+    ///   then retry `read_payload` for the next application payload.
+    /// * When an owned read retained the KEXINIT, this call did not consume it.
+    ///   While an owned packet or deferred PONG is still active, the retained
+    ///   advance reports [`TransportError::OwnedPacketState`]; finish the
+    ///   owned packet and then [`Self::drive_deferred_pong`]. After that, use
     ///   [`ClientTransport::advance_retained_peer_rekey`]. Do not call
     ///   [`ClientTransport::advance_rekey`], which refuses a retained
     ///   proposal.
@@ -1356,13 +1358,10 @@ where
     /// framing, protection, I/O, sequence, or rekey error for an invalid
     /// packet. Returns [`TransportError::OwnedPacketState`] while an owned
     /// packet is active; drive it with its identifier or discard the transport.
-    /// After the owner completes, a pong deferred by [`Self::read_while_owned`]
-    /// is written before the next read; `WouldBlock` preserves it for retry.
-    /// A peer KEXINIT consumed on this blocking path is driven to completion
-    /// internally. A KEXINIT retained by an owned read makes this method return
-    /// [`TransportError::RekeyInProgress`]; a nonblocking caller must advance it
-    /// with [`ClientTransport::advance_retained_peer_rekey`], because
-    /// [`ClientTransport::advance_rekey`] refuses a retained proposal.
+    /// Returns [`TransportError::RekeyInProgress`] while a rekey is active,
+    /// including a retained peer proposal. After the owner completes, a pong
+    /// deferred by [`Self::read_while_owned`] is written before the next read;
+    /// `WouldBlock` preserves it for retry.
     pub fn read_payload(&mut self) -> Result<Vec<u8>, TransportError> {
         if self.owned_packet.is_some() {
             return Err(TransportError::OwnedPacketState);
