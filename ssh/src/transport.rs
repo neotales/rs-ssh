@@ -172,6 +172,13 @@ pub enum OwnedInbound {
     Payload(Vec<u8>),
     /// A transport ping was consumed and its pong is waiting behind the owner.
     PongDeferred,
+    /// A peer `SSH_MSG_KEXINIT` was authenticated and retained.
+    ///
+    /// The packet's inbound sequence number is committed exactly once. No
+    /// channel payload was produced and no rekey packet is written while the
+    /// owned packet is active. Finish the owned packet, then advance the
+    /// retained rekey with [`ClientTransport::advance_retained_peer_rekey`].
+    PeerKexInitRetained,
 }
 
 impl From<io::Error> for TransportError {
@@ -743,6 +750,10 @@ pub struct ClientTransport<S> {
     pub(crate) initial_algorithm: Option<String>,
     pub(crate) rekey_proposal: Option<KexInit>,
     pub(crate) rekey: Option<ClientRekeyState>,
+    /// An authenticated peer KEXINIT that arrived while an owned protected
+    /// packet was active. Its inbound sequence number is already committed, so
+    /// the deferred rekey must observe it without committing again.
+    pub(crate) retained_peer_kexinit: Option<Vec<u8>>,
 }
 
 impl<S> fmt::Debug for ClientTransport<S> {
@@ -799,6 +810,7 @@ where
                 initial_algorithm: None,
                 rekey_proposal: None,
                 rekey: None,
+                retained_peer_kexinit: None,
             },
             peer_version,
         ))
@@ -861,9 +873,13 @@ where
     }
 
     /// Returns whether a post-establishment rekey is currently active.
+    ///
+    /// A retained peer KEXINIT counts as active: the transport is waiting for
+    /// the safe boundary at which it can answer it, and application payloads
+    /// are refused in the meantime.
     #[must_use]
     pub fn rekey_active(&self) -> bool {
-        self.rekey.is_some() || self.sequence.rekey_active()
+        self.rekey.is_some() || self.sequence.rekey_active() || self.retained_peer_kexinit.is_some()
     }
 
     /// Returns the current post-establishment rekey phase.
@@ -1032,8 +1048,13 @@ where
     ///
     /// Only authenticated transports may use this method. An inbound ping
     /// retains one pong behind the owned packet; no further inbound packet can
-    /// be consumed until that pong is sent. Peer rekey and extension messages
-    /// are not supported in this phase and terminally disable protected I/O.
+    /// be consumed until that pong is sent. A peer `SSH_MSG_KEXINIT` is
+    /// authenticated and retained as [`OwnedInbound::PeerKexInitRetained`]:
+    /// its sequence number is committed once, the owned packet can still be
+    /// driven to completion, and the rekey itself waits for
+    /// [`Self::advance_retained_peer_rekey`] at a safe boundary. Extension
+    /// messages and rekey messages other than KEXINIT still terminally disable
+    /// protected I/O.
     ///
     /// # Errors
     ///
@@ -1058,6 +1079,64 @@ where
             return Err(TransportError::OwnedPacketState);
         }
         self.read_owned_step()
+    }
+
+    /// Starts or advances the rekey for a retained peer KEXINIT.
+    ///
+    /// The retained KEXINIT was authenticated and its inbound sequence number
+    /// was committed when it arrived. This method sends the local KEXINIT under
+    /// the old keys, observes the retained proposal without committing its
+    /// sequence a second time, sends the client KEX method, and drives the
+    /// exchange to completion or to `WouldBlock`. The original session
+    /// identifier remains the NEWKEYS derivation input.
+    ///
+    /// The caller must have finished every owned packet and deferred pong; an
+    /// active one returns [`TransportError::OwnedPacketState`]. Unsupported
+    /// proposals, malformed or out-of-order rekey packets, and protection
+    /// failures fail closed and disable protected I/O.
+    ///
+    /// Returns `Ok(true)` when a rekey was started or advanced and `Ok(false)`
+    /// when neither a retained KEXINIT nor an active rekey exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a state, I/O, negotiation, KEX, host-key, sequence, or
+    /// protection error. A non-`WouldBlock` failure is terminal.
+    pub fn advance_retained_peer_rekey(&mut self) -> Result<bool, TransportError> {
+        if self.owned_packet.is_some() || self.deferred_owned_pong {
+            return Err(TransportError::OwnedPacketState);
+        }
+        if !self.established {
+            return Err(TransportError::NotEstablished);
+        }
+        if self.retained_peer_kexinit.is_some() {
+            if self
+                .rekey
+                .as_ref()
+                .is_some_and(|state| state.peer_kexinit.is_some())
+            {
+                self.retained_peer_kexinit = None;
+                return Err(self.fail_protected_write(TransportError::UnexpectedMessage));
+            }
+            if let Err(error) = self.begin_rekey() {
+                let error: TransportError = error.into();
+                if !matches!(&error, TransportError::Io(io) if io.kind() == io::ErrorKind::WouldBlock)
+                {
+                    self.retained_peer_kexinit = None;
+                }
+                return Err(error);
+            }
+            let Some(payload) = self.retained_peer_kexinit.take() else {
+                return Err(self.fail_protected_write(TransportError::InvalidMessage));
+            };
+            self.accept_retained_peer_kexinit(&payload)?;
+        }
+        while self.rekey.is_some() {
+            if let Err(error) = self.advance_rekey() {
+                return Err(error.into());
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn deferred_pong_read_id(&self) -> Option<OwnedPacketId> {
@@ -1086,6 +1165,9 @@ where
         if !self.authenticated {
             return Err(TransportError::InvalidMessage);
         }
+        if self.rekey_active() {
+            return Err(TransportError::OwnedPacketState);
+        }
         let (payload, _sequence) = match self.read_protected_packet() {
             Ok(packet) => packet,
             Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1096,9 +1178,19 @@ where
         let Some(message) = payload.first().copied() else {
             return Err(self.fail_protected_write(TransportError::InvalidMessage));
         };
-        if matches!(message, 20 | 21 | 30..=49)
-            || message == neotales_ssh::ext_info::SSH_MSG_EXT_INFO
-        {
+        if message == crate::msg::kexinit::SSH_MSG_KEXINIT {
+            match KexInit::decode(&payload) {
+                Ok(kexinit) if kexinit.reserved == 0 => {}
+                _ => return Err(self.fail_protected_write(TransportError::UnexpectedMessage)),
+            }
+            if let Err(error) = self.sequence.commit_inbound() {
+                return Err(self.fail_protected_write(error.into()));
+            }
+            self.ext_info = ExtensionState::Complete;
+            self.retained_peer_kexinit = Some(payload);
+            return Ok(OwnedInbound::PeerKexInitRetained);
+        }
+        if matches!(message, 21 | 30..=49) || message == neotales_ssh::ext_info::SSH_MSG_EXT_INFO {
             return Err(self.fail_protected_write(TransportError::UnexpectedMessage));
         }
         let pong = if message == neotales_ssh::keepalive::SSH_MSG_PING {
@@ -1191,7 +1283,7 @@ where
     }
 
     fn write_payload_inner(&mut self, payload: &[u8]) -> Result<(), TransportError> {
-        if self.rekey.is_some() {
+        if self.rekey_active() {
             return Err(TransportError::RekeyInProgress);
         }
         let sequence = match self.write_protected_packet(payload) {
@@ -1235,7 +1327,7 @@ where
         if self.owned_packet.is_some() {
             return Err(TransportError::OwnedPacketState);
         }
-        if self.rekey.is_some() {
+        if self.rekey_active() {
             return Err(TransportError::RekeyInProgress);
         }
         if self.deferred_owned_pong {
@@ -1523,6 +1615,7 @@ where
         self.read_protector = None;
         self.write_protector = None;
         self.rekey = None;
+        self.retained_peer_kexinit = None;
         self.established = false;
         error
     }

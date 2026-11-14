@@ -101,6 +101,8 @@ enum PeerStep {
     ExpectTruncatedPacket,
     ExpectOpened(ChannelId),
     ExpectClose(ChannelId),
+    BeginRekeyOnly(mpsc::Sender<()>),
+    Rekey(mpsc::Sender<()>),
     Wait(mpsc::Receiver<()>),
     Finish,
 }
@@ -244,6 +246,8 @@ fn run_step(
                 other => return Err(format!("expected client close, got {other:?}")),
             }
         }
+        PeerStep::BeginRekeyOnly(signal) => begin_peer_rekey(channels, &signal, false)?,
+        PeerStep::Rekey(signal) => begin_peer_rekey(channels, &signal, true)?,
         PeerStep::Wait(release) => {
             release
                 .recv_timeout(Duration::from_secs(5))
@@ -252,6 +256,34 @@ fn run_step(
         PeerStep::Finish => return Ok(false),
     }
     Ok(true)
+}
+
+/// Starts a server-initiated rekey and optionally drives it to completion.
+///
+/// The signal is sent after the peer KEXINIT is written, so a test can arrange
+/// for the client to receive it at a specific boundary.
+fn begin_peer_rekey(
+    channels: &mut ChannelConnection<ServerTransport<TcpStream>>,
+    signal: &mpsc::Sender<()>,
+    complete: bool,
+) -> Result<(), String> {
+    channels
+        .transport_mut()
+        .begin_rekey()
+        .map_err(|e| e.to_string())?;
+    signal.send(()).map_err(|e| e.to_string())?;
+    if complete {
+        loop {
+            if !channels.transport_mut().rekey_active() {
+                break;
+            }
+            channels
+                .transport_mut()
+                .advance_rekey()
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn expect_truncated(transport: &mut ServerTransport<TcpStream>) -> Result<(), String> {
@@ -3455,6 +3487,78 @@ fn idle_peer_rekey_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         .expect_err("terminal driver released");
     drop(driver);
     release.send(())?;
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn peer_kexinit_behind_active_packet_is_retained_once() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut driver, write, _read, sequence, steps, peer) = setup()?;
+    let (signalled, signal) = mpsc::channel();
+    steps.send(PeerStep::BeginRekeyOnly(signalled))?;
+    let id = driver.admit_data(0, b"abc")?;
+    write.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        driver.drive(&id),
+        Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    let inbound_before = driver.inbound_sequence();
+    signal.recv_timeout(Duration::from_secs(5))?;
+    assert!(matches!(
+        driver.read_inbound(&id)?,
+        OwnedChannelInbound::PeerRekey
+    ));
+    assert!(driver.rekey_active());
+    assert_eq!(driver.inbound_sequence(), inbound_before + 1);
+    assert_eq!(driver.outbound_sequence(), sequence);
+    write.store(usize::MAX, Ordering::SeqCst);
+    driver.drive(&id)?;
+    assert_eq!(driver.outbound_sequence(), sequence + 1);
+    assert!(matches!(
+        driver.admit_data(0, b"x"),
+        Err(OwnedChannelError::Busy)
+    ));
+    let driver = driver
+        .try_into_connection()
+        .expect_err("released with a retained peer KEXINIT");
+    drop(driver);
+    steps.send(PeerStep::Finish)?;
+    peer.join().map_err(|_| "peer panic")??;
+    Ok(())
+}
+
+#[test]
+fn peer_initiated_rekey_at_idle_completes_and_preserves_data()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut driver, _write, _read, _sequence, steps, peer) = setup()?;
+    let (signalled, signal) = mpsc::channel();
+    steps.send(PeerStep::Rekey(signalled))?;
+    signal.recv_timeout(Duration::from_secs(5))?;
+    let mut saw_rekey = false;
+    for _ in 0..16 {
+        match driver.read_idle()? {
+            OwnedChannelInbound::PeerRekey => saw_rekey = true,
+            other => return Err(format!("unexpected inbound during rekey: {other:?}").into()),
+        }
+        if !driver.rekey_active() {
+            break;
+        }
+    }
+    assert!(saw_rekey);
+    assert!(!driver.rekey_active());
+    steps.send(PeerStep::Data(b"after-rekey".to_vec()))?;
+    assert!(matches!(
+        driver.read_idle()?,
+        OwnedChannelInbound::Event(ChannelEvent::Data { channel: 0, data })
+            if data == b"after-rekey"
+    ));
+    drop(
+        driver
+            .try_into_connection()
+            .map_err(|_| "release refused after rekey")?,
+    );
+    steps.send(PeerStep::Finish)?;
     peer.join().map_err(|_| "peer panic")??;
     Ok(())
 }

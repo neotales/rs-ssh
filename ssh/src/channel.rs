@@ -790,6 +790,14 @@ pub enum OwnedChannelInbound {
     /// [`OwnedChannelDriver::drive_deferred_pong`]
     /// writes the pong. The connection cannot be released while the pong is owed.
     PongDeferred,
+    /// A peer-initiated rekey was retained or advanced by this step.
+    ///
+    /// The peer KEXINIT was authenticated with its inbound sequence number
+    /// committed exactly once. No channel event was produced and no application
+    /// payload may be admitted or released until the rekey completes. Finish any
+    /// active outbound packet, then call [`OwnedChannelDriver::read_idle`] to
+    /// advance the exchange. A `WouldBlock` from that call is retryable.
+    PeerRekey,
 }
 
 /// Owns a channel connection while admitting and driving one data packet.
@@ -805,7 +813,8 @@ pub enum OwnedChannelInbound {
 /// packet is active; [`Self::read_idle`] does the same without an admitted
 /// packet. It is deliberately not a full-duplex scheduler: it does
 /// not loop, does not automatically answer requests or peer closes,
-/// and does not handle rekey. The admitted data packet can be driven with
+/// and retains a peer KEXINIT for a later bounded rekey. The admitted data
+/// packet can be driven with
 /// [`Self::drive`] unless the driver fails; a deferred pong can then be written
 /// with [`Self::drive_deferred_pong`]. Release is allowed only when no other
 /// obligation or failure remains. [`Self::drive_global_failure`] answers one
@@ -925,6 +934,22 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         self.connection.transport.outbound_sequence()
     }
 
+    /// Returns the protected transport's committed inbound sequence.
+    #[must_use]
+    pub fn inbound_sequence(&self) -> u32 {
+        self.connection.transport.inbound_sequence()
+    }
+
+    /// Returns whether a peer-initiated rekey is retained or in progress.
+    ///
+    /// While this is true, channel-data admission, window adjustments, EOF,
+    /// replies, further owned reads, and release are refused. Finish the active
+    /// packet and call [`Self::read_idle`] to advance the exchange.
+    #[must_use]
+    pub fn rekey_active(&self) -> bool {
+        self.connection.transport.rekey_active()
+    }
+
     /// Admits one bounded channel-data packet and reserves its remote credit.
     ///
     /// # Errors
@@ -946,6 +971,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             || self.control_owed
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
+            || self.connection.transport.rekey_active()
         {
             return Err(OwnedChannelError::Busy);
         }
@@ -1111,6 +1137,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             || self.control_owed
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
+            || self.connection.transport.rekey_active()
         {
             return Err(OwnedChannelError::Busy);
         }
@@ -1224,8 +1251,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// `WouldBlock` preserves partial input and the outbound packet. Retain the
     /// ID and resume, or drop the driver and all separate socket handles.
-    /// Terminal protocol or I/O errors fail the driver; peer rekey is unsupported
-    /// and fails closed. Use [`Self::read_while_eof`] for an active EOF and
+    /// Terminal protocol or I/O errors fail the driver. A peer KEXINIT is
+    /// retained and advanced with [`Self::read_idle`] after this packet
+    /// completes. Use [`Self::read_while_eof`] for an active EOF and
     /// [`Self::read_while_global_failure`], [`Self::read_while_channel_failure`],
     /// [`Self::read_while_open_rejection`], [`Self::read_while_close_reply`],
     /// or [`Self::read_while_pong`] for those active replies.
@@ -1271,6 +1299,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             || self.control_owed
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
+            || self.connection.transport.rekey_active()
         {
             return Err(OwnedChannelError::Busy);
         }
@@ -1358,8 +1387,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// `WouldBlock` retains partial input and the outbound EOF. Retain the ID
     /// and retry after readiness, or drop the driver and any separately held
-    /// socket handles. Terminal errors fail the driver. Peer rekey fails
-    /// closed. [`Self::read_while_global_failure`] and
+    /// socket handles. Terminal errors fail the driver. A peer KEXINIT is
+    /// retained for [`Self::read_idle`]. [`Self::read_while_global_failure`] and
     /// [`Self::read_while_channel_failure`], [`Self::read_while_open_rejection`]
     /// [`Self::read_while_close_reply`] and [`Self::read_while_pong`] cover
     /// those active replies.
@@ -1403,9 +1432,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// A deferred pong, global failure, channel failure, open rejection and
     /// peer close reply have driver completion paths. This is not a general
-    /// scheduler for control replies or rekey. A data event that exhausts the
-    /// local window is not a reply obligation; admit a window adjustment when
-    /// the writer is available if the peer should continue.
+    /// scheduler for control replies or a client-initiated rekey. A peer
+    /// KEXINIT is retained as [`OwnedChannelInbound::PeerRekey`] and advanced
+    /// by [`Self::read_idle`] after the active packet completes. A data event
+    /// that exhausts the local window is not a reply obligation; admit a window
+    /// adjustment when the writer is available if the peer should continue.
     ///
     /// `WouldBlock` preserves the partial inbound packet, the admitted outbound
     /// packet, and every obligation. A stale or foreign identifier returns
@@ -1437,8 +1468,15 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// Events and reply obligations are handled exactly as in
     /// [`Self::read_inbound`]. While any reply is owed, another read, data
     /// admission and release are refused. A PING retains a pong for
-    /// [`Self::drive_deferred_pong`]. Peer rekey and extension messages fail
-    /// the driver closed; rekey is not supported by this step.
+    /// [`Self::drive_deferred_pong`].
+    ///
+    /// A peer `SSH_MSG_KEXINIT` is authenticated and retained as
+    /// [`OwnedChannelInbound::PeerRekey`]. Its sequence number is committed
+    /// once and application payloads are refused until the rekey completes.
+    /// Finish any active outbound packet, then call this method again: it
+    /// advances the retained exchange and returns `PeerRekey` for each step.
+    /// Extension messages, rekey messages other than KEXINIT, and unsupported
+    /// proposals still fail the driver closed.
     ///
     /// `WouldBlock` retains any partial protected packet. A partial packet
     /// prevents release until another read completes it, or the driver is
@@ -1465,8 +1503,25 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         {
             return Err(OwnedChannelError::Busy);
         }
+        if self.connection.transport.rekey_active() {
+            return self.advance_peer_rekey();
+        }
         let result = self.connection.transport.read_idle_owned();
         self.handle_owned_inbound(result)
+    }
+
+    fn advance_peer_rekey(&mut self) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        match self.connection.transport.advance_retained_peer_rekey() {
+            Ok(true) => Ok(OwnedChannelInbound::PeerRekey),
+            Ok(false) | Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
+            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(OwnedChannelError::Transport(TransportError::Io(error)))
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(OwnedChannelError::Transport(error))
+            }
+        }
     }
 
     fn handle_owned_inbound(
@@ -1541,7 +1596,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                 self.pong_owed = true;
                 Ok(OwnedChannelInbound::PongDeferred)
             }
-            Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
+            Ok(OwnedInbound::PeerKexInitRetained) => Ok(OwnedChannelInbound::PeerRekey),
+            Err(TransportError::OwnedPacketState) => {
+                if self.connection.transport.rekey_active() {
+                    Ok(OwnedChannelInbound::PeerRekey)
+                } else {
+                    Err(OwnedChannelError::Busy)
+                }
+            }
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 Err(OwnedChannelError::Transport(TransportError::Io(error)))
             }
@@ -1564,8 +1626,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// A partial read and the active packet survive `WouldBlock`. On
     /// cancellation retain the driver or drop it and its separate socket
-    /// handles. Terminal I/O or protocol errors fail the driver; peer rekey is
-    /// unsupported and fails closed. [`Self::read_while_channel_failure`] and
+    /// handles. Terminal I/O or protocol errors fail the driver. A peer KEXINIT is
+    /// retained for [`Self::read_idle`]. [`Self::read_while_channel_failure`] and
     /// [`Self::read_while_open_rejection`], [`Self::read_while_close_reply`]
     /// and [`Self::read_while_pong`] cover those active replies.
     ///
@@ -1625,8 +1687,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// `WouldBlock` retains partial input. On cancellation keep the driver or
     /// drop it and separately held socket handles. Fatal I/O or protocol errors
-    /// fail the driver; peer rekey fails closed. Reads during other reply
-    /// ciphertext remain unsupported except for [`Self::read_while_global_failure`]
+    /// fail the driver. A peer KEXINIT is retained for [`Self::read_idle`].
+    /// Reads during other reply ciphertext remain unsupported except for
+    /// [`Self::read_while_global_failure`]
     /// [`Self::read_while_open_rejection`], [`Self::read_while_close_reply`],
     /// and [`Self::read_while_pong`].
     ///
@@ -1695,9 +1758,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// A partial read and active packet survive `WouldBlock`. On cancellation,
     /// retain the driver or drop it and separately held socket handles. Fatal
-    /// I/O or protocol errors fail the driver; peer rekey fails closed. Reads
-    /// during global, channel, close and PONG replies have their own bounded
-    /// read steps.
+    /// I/O or protocol errors fail the driver. A peer KEXINIT is retained for
+    /// [`Self::read_idle`]. Reads during global, channel, close and PONG
+    /// replies have their own bounded read steps.
     ///
     /// # Errors
     ///
@@ -1763,8 +1826,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// `WouldBlock` retains partial input and the active packet. On
     /// cancellation retain the driver or drop it and separately held socket
-    /// handles. Fatal I/O or protocol errors fail the driver, and peer rekey
-    /// fails closed. [`Self::read_while_pong`] covers active PONG ciphertext.
+    /// handles. Fatal I/O or protocol errors fail the driver. A peer KEXINIT is
+    /// retained for [`Self::read_idle`]. [`Self::read_while_pong`] covers
+    /// active PONG ciphertext.
     ///
     /// # Errors
     ///
@@ -1829,8 +1893,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// `WouldBlock` retains partial input and the active packet. On
     /// cancellation retain the driver or drop it and separately held socket
-    /// handles. Fatal I/O or protocol errors fail the driver; peer rekey fails
-    /// closed.
+    /// handles. Fatal I/O or protocol errors fail the driver. A peer KEXINIT is
+    /// retained for [`Self::read_idle`].
     ///
     /// # Errors
     ///
@@ -1917,7 +1981,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                 self.next_reply_obligation = Some(NextReplyObligation::Pong);
                 Ok(OwnedChannelInbound::PongDeferred)
             }
-            Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
+            Ok(OwnedInbound::PeerKexInitRetained) => Ok(OwnedChannelInbound::PeerRekey),
+            Err(TransportError::OwnedPacketState) => {
+                if self.connection.transport.rekey_active() {
+                    Ok(OwnedChannelInbound::PeerRekey)
+                } else {
+                    Err(OwnedChannelError::Busy)
+                }
+            }
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 Err(OwnedChannelError::Transport(TransportError::Io(error)))
             }
@@ -2380,6 +2451,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             || transport.owned_packet.is_some()
             || transport.write_buffer.is_pending()
             || transport.has_partial_protected_read()
+            || transport.rekey_active()
         {
             return Err(self);
         }

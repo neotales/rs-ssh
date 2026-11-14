@@ -167,7 +167,7 @@ fn owned_packet_defers_pong_without_losing_inbound_or_sequence()
 }
 
 #[test]
-fn peer_rekey_while_owned_terminally_disables_protected_io()
+fn malformed_peer_kexinit_while_owned_terminally_disables_protected_io()
 -> Result<(), Box<dyn std::error::Error>> {
     use neotales_ssh::transport::TransportError;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;

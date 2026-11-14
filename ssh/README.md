@@ -29,7 +29,10 @@ tests. The engine's SSH runtime gate is unchanged.
 `TransportError::OwnedPacketState` is a new variant of the public exhaustive
 `transport::TransportError` enum. Existing exhaustive matches must add an arm
 for it (or a suitable fallback), so this is a source-breaking API change even
-for callers that do not use owned packets. When an owned packet is active,
+for callers that do not use owned packets. `OwnedInbound` likewise gains
+`PeerKexInitRetained`, and `channel::OwnedChannelInbound` gains `PeerRekey`;
+exhaustive matches over either enum must add an arm. When an owned packet is
+active,
 `read_payload`, `write_payload`, `begin_rekey`, and `advance_rekey` refuse to
 proceed. Retain the packet ID and drive it to completion, or discard the
 transport. The owned-packet example in `ClientTransport::start_owned_packet`
@@ -38,9 +41,13 @@ shows nonblocking retry and error handling.
 For an authenticated connection, `read_while_owned` permits one inbound packet
 per call. It defers at most one transport PONG behind the owned packet and
 refuses further inbound reads until that PONG is sent. Finish the owner, then
-call `drive_deferred_pong` before a new write or local rekey. A peer rekey or
-extension message received through this limited path terminally disables
-protected I/O; this is not yet a full-duplex rekey scheduler.
+call `drive_deferred_pong` before a new write or local rekey. A peer
+`SSH_MSG_KEXINIT` received through this limited path is authenticated and
+retained: its sequence number is committed once, the owned packet can still be
+completed, and the owned channel driver advances the rekey from its idle read
+step. Extension messages, malformed KEXINIT, and rekey messages other than
+KEXINIT still terminally disable protected I/O; this is not yet a full-duplex
+rekey scheduler.
 
 The crate manifest currently says `0.0.0-alpha.2`. This notice does not assign
 a release version: the repository material inspected does not establish a

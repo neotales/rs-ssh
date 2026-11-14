@@ -1005,6 +1005,33 @@ where
     }
 
     fn accept_peer_kexinit(&mut self, payload: &[u8], sequence: u32) -> Result<(), HandshakeError> {
+        self.accept_peer_kexinit_inner(payload, Some(sequence))
+    }
+
+    /// Accepts a peer KEXINIT whose inbound sequence number was already
+    /// committed by the owned-packet read path.
+    ///
+    /// The proposal is observed exactly once and the deferred rekey continues
+    /// from the same NEWKEYS epoch. A failure aborts the rekey and disables
+    /// protected I/O.
+    pub(crate) fn accept_retained_peer_kexinit(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        match self.accept_peer_kexinit_inner(payload, None) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.abort_rekey();
+                Err(error.into())
+            }
+        }
+    }
+
+    fn accept_peer_kexinit_inner(
+        &mut self,
+        payload: &[u8],
+        sequence: Option<u32>,
+    ) -> Result<(), HandshakeError> {
         let local_kexinit = self
             .rekey
             .as_ref()
@@ -1295,14 +1322,17 @@ where
         Ok(())
     }
 
-    fn accept_rekey_kexinit(&mut self, sequence: u32) -> Result<(), HandshakeError> {
+    fn accept_rekey_kexinit(&mut self, sequence: Option<u32>) -> Result<(), HandshakeError> {
         let disposition = self
             .sequence
             .observe_rekey_kexinit(Direction::Inbound, false)?;
         if disposition != PacketDisposition::KexInit {
             return Err(TransportError::UnexpectedMessage.into());
         }
-        self.commit_rekey_direction(Direction::Inbound, sequence)
+        match sequence {
+            Some(sequence) => self.commit_rekey_direction(Direction::Inbound, sequence),
+            None => Ok(()),
+        }
     }
 
     fn accept_rekey_kex_method(
