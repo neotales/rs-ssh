@@ -261,7 +261,7 @@ fn constructor_refuses_a_connection_with_an_existing_owner()
 
 #[test]
 #[allow(clippy::too_many_lines)] // One synchronized trace proves the ordering.
-fn partial_window_adjustment_blocks_reading_a_queued_peer_adjustment()
+fn partial_window_adjustment_allows_reading_a_queued_peer_adjustment()
 -> Result<(), Box<dyn std::error::Error>> {
     use neotales_ssh::channel::{INITIAL_CHANNEL_WINDOW, OwnedChannelInbound};
 
@@ -307,7 +307,7 @@ fn partial_window_adjustment_blocks_reading_a_queued_peer_adjustment()
             .map_err(|e| e.to_string())?;
         sent_tx.send(()).map_err(|e| e.to_string())?;
         // Keep the peer from reading the client's partial protected packet
-        // until the test has observed the driver's read refusal.
+        // until the test has observed the driver's read progress.
         release_rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
@@ -345,35 +345,44 @@ fn partial_window_adjustment_blocks_reading_a_queued_peer_adjustment()
     let sequence = driver.outbound_sequence();
     let id = driver.admit_window_adjustment(0, 1)?;
     allowance.store(1, Ordering::SeqCst);
+    assert_eq!(
+        allowance.load(Ordering::SeqCst),
+        1,
+        "one byte must be allowed"
+    );
     assert!(matches!(
         driver.drive_window_adjustment(&id),
         Err(OwnedChannelError::Transport(TransportError::Io(error)))
             if error.kind() == io::ErrorKind::WouldBlock
     ));
+    assert_eq!(
+        allowance.load(Ordering::SeqCst),
+        0,
+        "one-byte allowance must be consumed"
+    );
     send_tx.send(())?;
     sent_rx.recv_timeout(Duration::from_secs(5))?;
-    assert!(matches!(driver.read_idle(), Err(OwnedChannelError::Busy)));
-    assert_eq!(driver.outbound_sequence(), sequence);
-    assert_eq!(driver.channel(0).unwrap().remote_window(), 17);
-    assert_eq!(
-        driver.channel(0).unwrap().local_window(),
-        INITIAL_CHANNEL_WINDOW
-    );
-
-    // This release is artificial. The observation above is a read-blocking
-    // limitation, not proof that a real TCP connection deadlocks.
-    allowance.store(usize::MAX, Ordering::SeqCst);
-    assert_eq!(
-        driver.drive_window_adjustment(&id)?,
-        INITIAL_CHANNEL_WINDOW + 1
-    );
     assert!(matches!(
-        driver.read_idle()?,
+        driver.read_while_window_adjustment(&id)?,
         OwnedChannelInbound::Event(ChannelEvent::WindowAdjusted {
             channel: 0,
             available: 18
         })
     ));
+    assert_eq!(driver.outbound_sequence(), sequence);
+    assert_eq!(driver.channel(0).unwrap().remote_window(), 18);
+    assert_eq!(
+        driver.channel(0).unwrap().local_window(),
+        INITIAL_CHANNEL_WINDOW
+    );
+
+    // The peer was deliberately held back; this proves read progress during
+    // a partial packet, not that a real TCP connection would deadlock.
+    allowance.store(usize::MAX, Ordering::SeqCst);
+    assert_eq!(
+        driver.drive_window_adjustment(&id)?,
+        INITIAL_CHANNEL_WINDOW + 1
+    );
     assert_eq!(driver.outbound_sequence(), sequence + 1);
     release_tx.send(())?;
     peer.join().map_err(|_| "peer panic")??;
