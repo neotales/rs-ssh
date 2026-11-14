@@ -711,14 +711,14 @@ pub enum OwnedChannelInbound {
 /// [`Self::read_inbound`] adds one opt-in inbound step while the admitted
 /// packet is active. It is deliberately not a full-duplex scheduler: it does
 /// not loop, does not answer control requests, does not reply to a peer close,
-/// and does not handle rekey. An inbound open, an unanswered peer close, or a
-/// request that wants a reply block further reads and release, and the driver
-/// has no reply path, so the caller drops it. A deferred pong is different:
-/// complete the data packet, call [`Self::drive_deferred_pong`], then the
-/// connection can be released. [`Self::try_new`] refuses a connection that
-/// already has a pending open or an unanswered peer close, so those
-/// pre-existing obligations stay answerable through the legacy API. A global
-/// or channel request that was already delivered to the caller is that
+/// and does not handle rekey. The admitted data packet is always completable
+/// with [`Self::drive`]; a deferred pong is completable with
+/// [`Self::drive_deferred_pong`] once that packet is complete. An inbound open,
+/// an unanswered peer close, or a request that wants a reply has no driver
+/// completion path, so the caller drops the driver. [`Self::try_new`] refuses a
+/// connection that already has a pending open or an unanswered peer close, so
+/// those pre-existing obligations stay answerable through the legacy API. A
+/// global or channel request that was already delivered to the caller is that
 /// caller's to answer and is not visible to the constructor.
 ///
 /// The wrapped connection's mutable transport cannot be reached through the
@@ -1076,20 +1076,22 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
-    /// Releases the connection only when no packet, obligation, or failure is
-    /// outstanding. On refusal, returns the still-owning driver.
+    /// Releases the connection only when no admitted packet, obligation, or
+    /// failure is outstanding. On refusal, returns the still-owning driver.
     ///
-    /// The connection is retained while a deferred pong is owed, an inbound
-    /// open awaits an answer, a peer close awaits this side's close, a request
-    /// surfaced by [`Self::read_inbound`] asked for a reply, or the transport
-    /// still holds a partial outbound packet. A deferred pong is the only one
-    /// with a completion path: complete the data packet, call
-    /// [`Self::drive_deferred_pong`], then release. The others have no driver
-    /// reply path; drop the driver and its transport instead. Pre-existing
-    /// opens and unanswered closes are refused by [`Self::try_new`] before the
-    /// driver takes ownership. A global or channel request that was already
-    /// delivered to the caller is that caller's to answer and is not tracked by
-    /// either method.
+    /// An admitted data packet is not a reason to drop the driver: complete it
+    /// with [`Self::drive`], then release. A deferred pong is also
+    /// dischargeable: once the data packet is complete, call
+    /// [`Self::drive_deferred_pong`], then release.
+    ///
+    /// The driver has no reply path for an inbound open, a peer close this side
+    /// has not answered, or a request surfaced by [`Self::read_inbound`] that
+    /// asked for a reply. Those keep the connection retained and require
+    /// dropping the driver and its transport, as does a failed driver.
+    /// Pre-existing opens and unanswered closes are refused by
+    /// [`Self::try_new`] before the driver takes ownership; a global or channel
+    /// request already delivered to the caller is that caller's to answer and is
+    /// not tracked by either method.
     pub fn try_into_connection(self) -> Result<ChannelConnection<ClientTransport<S>>, Self> {
         let transport = &self.connection.transport;
         let close_owed = self
