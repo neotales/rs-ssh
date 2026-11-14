@@ -1333,9 +1333,22 @@ where
     /// Opens and returns one protected payload.
     ///
     /// Authentication and padding validation complete before a sequence number
-    /// is committed or plaintext is returned. A peer-originated KEXINIT is
-    /// consumed transparently: the transport performs the bounded hybrid
-    /// rekey before reading the next application payload.
+    /// is committed or plaintext is returned.
+    ///
+    /// A peer KEXINIT has two distinct nonblocking paths:
+    ///
+    /// * When this call consumes the KEXINIT itself, it starts the peer rekey
+    ///   immediately. If the stream returns `WouldBlock` while sending the
+    ///   local KEXINIT or KEX method, this call returns that I/O error with the
+    ///   rekey active. A retry of `read_payload` returns
+    ///   [`TransportError::RekeyInProgress`]; finish with
+    ///   [`ClientTransport::advance_rekey`] one bounded step at a time, then
+    ///   retry `read_payload` for the next application payload.
+    /// * When an owned read retained the KEXINIT, this call did not consume
+    ///   it. It returns `RekeyInProgress` immediately; finish with
+    ///   [`ClientTransport::advance_retained_peer_rekey`]. Do not call
+    ///   [`ClientTransport::advance_rekey`], which refuses a retained
+    ///   proposal.
     ///
     /// # Errors
     ///

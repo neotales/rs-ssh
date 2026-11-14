@@ -1100,6 +1100,10 @@ fn client_peer_initiated_rekey_resumes_split_local_kexinit()
         Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
     ));
     assert!(transport.rekey_active());
+    assert!(matches!(
+        transport.read_payload(),
+        Err(TransportError::RekeyInProgress)
+    ));
     gate.borrow_mut().open();
     for _ in 0..8 {
         if !transport.rekey_active() {
