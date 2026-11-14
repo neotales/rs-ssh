@@ -1820,6 +1820,50 @@ where
         self.write_payload(payload)
     }
 
+    /// Test-only: writes a protocol-valid `SSH_MSG_IGNORE` while a non-strict
+    /// rekey is active.
+    ///
+    /// This is compiled only with the `test-support` feature. It exists so a
+    /// controlled peer can make the client's rekey read a real protected
+    /// ignored packet without exposing packet protection or sequence state.
+    /// On `WouldBlock`, retry with the same `data`; the pending packet is
+    /// retained. Do not call it while another protected write is pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport or sequence error. A non-`WouldBlock` failure fails
+    /// the rekey closed.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn write_rekey_ignorable(&mut self, data: &[u8]) -> Result<(), ServerTransportError> {
+        const SSH_MSG_IGNORE: u8 = 2;
+        if self.rekey.is_none() {
+            return Err(ServerTransportError::RekeyInProgress);
+        }
+        let mut writer = neotales_ssh::Writer::new();
+        writer.write_byte(SSH_MSG_IGNORE);
+        writer
+            .write_string(data)
+            .map_err(|error| ServerTransportError::Transport(TransportError::Wire(error)))?;
+        let payload = writer.into_bytes();
+        self.sequence.classify_rekey_outbound(SSH_MSG_IGNORE)?;
+        let sequence = self.write_protected_rekey_packet(&payload, SSH_MSG_IGNORE)?;
+        let disposition = self.sequence.observe_rekey_outbound(SSH_MSG_IGNORE)?;
+        if disposition != PacketDisposition::Ignorable {
+            return Err(ServerTransportError::Transport(
+                TransportError::UnexpectedMessage,
+            ));
+        }
+        let committed = self.sequence.commit_outbound()?;
+        if committed != sequence {
+            return Err(ServerTransportError::Transport(
+                TransportError::InvalidMessage,
+            ));
+        }
+        self.write_buffer.acknowledge(sequence)?;
+        Ok(())
+    }
+
     fn begin_rekey_internal(&mut self) -> Result<(), ServerTransportError> {
         if !self.established {
             return Err(ServerTransportError::NotEstablished);

@@ -11,8 +11,9 @@ keywords = ["ssh", "sftp", "scp", "cryptography", "network-programming"]
 categories = ["cryptography", "network-programming"]
 
 [features]
-# Public opt-in diagnostics for test fixtures; see the README for Cargo
-# feature unification and the diagnostic's overflow semantics.
+# Public opt-in diagnostics and controlled peer hooks for test fixtures. This
+# feature is selectable and Cargo feature unification can enable it indirectly;
+# see the README for the security and diagnostic contracts.
 test-support = []
 
 [dependencies]
