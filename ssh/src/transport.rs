@@ -899,6 +899,10 @@ where
             && !self.rekey_active()
     }
 
+    pub(crate) fn has_partial_protected_read(&self) -> bool {
+        self.read_buffer.filled != 0
+    }
+
     /// Seals one ordinary payload and gives its owner an opaque identifier.
     ///
     /// No bytes are written until [`Self::drive_owned_packet`]. While this
@@ -1038,6 +1042,19 @@ where
         {
             return Err(TransportError::OwnedPacketState);
         }
+        self.read_owned_step()
+    }
+
+    /// Reads one authenticated packet for the channel driver without an
+    /// outbound owner. The channel driver retains any resulting obligation.
+    pub(crate) fn read_idle_owned(&mut self) -> Result<OwnedInbound, TransportError> {
+        if !self.can_start_owned_channel_driver() {
+            return Err(TransportError::OwnedPacketState);
+        }
+        self.read_owned_step()
+    }
+
+    fn read_owned_step(&mut self) -> Result<OwnedInbound, TransportError> {
         if !self.authenticated {
             return Err(TransportError::InvalidMessage);
         }

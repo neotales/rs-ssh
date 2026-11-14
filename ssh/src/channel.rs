@@ -697,19 +697,19 @@ struct CloseReply {
     packet: Option<OwnedPacketId>,
 }
 
-/// One bounded result from [`OwnedChannelDriver::read_inbound`].
+/// One bounded result from [`OwnedChannelDriver::read_inbound`] or
+/// [`OwnedChannelDriver::read_idle`].
 #[derive(Debug)]
 pub enum OwnedChannelInbound {
     /// One complete channel event was decoded and delivered unchanged.
     ///
     /// The driver never automatically answers a request, sends a close, or
     /// adjusts a window. When
-    /// [`OwnedChannelDriver::read_inbound`] surfaces a `Request` or
-    /// `GlobalRequest` that asked for a reply, a channel `OpenRequest`, or a
-    /// `Close` this side has not already sent, the obligation blocks further
-    /// reads and release. Global and channel requests have explicit failure
-    /// reply paths; open requests can be rejected and a peer close can be
-    /// answered explicitly.
+    /// either read step surfaces a `Request` or `GlobalRequest` that asked for
+    /// a reply, a channel `OpenRequest`, or a `Close` this side has not already
+    /// sent, the obligation blocks further reads and release. Global and
+    /// channel requests have explicit failure reply paths; open requests can be
+    /// rejected and a peer close can be answered explicitly.
     Event(ChannelEvent),
     /// One authenticated payload was consumed and carried no channel event.
     ///
@@ -719,7 +719,7 @@ pub enum OwnedChannelInbound {
     Consumed,
     /// An inbound transport ping was consumed and its pong is owed.
     ///
-    /// No further inbound read is permitted until the admitted data packet
+    /// No further inbound read is permitted until any admitted data packet
     /// completes and [`OwnedChannelDriver::drive_deferred_pong`] writes the
     /// pong. The connection cannot be released while the pong is owed.
     PongDeferred,
@@ -735,7 +735,8 @@ pub enum OwnedChannelInbound {
 /// although other independently held stream handles may remain open.
 ///
 /// [`Self::read_inbound`] adds one opt-in inbound step while the admitted
-/// packet is active. It is deliberately not a full-duplex scheduler: it does
+/// packet is active; [`Self::read_idle`] does the same without an admitted
+/// packet. It is deliberately not a full-duplex scheduler: it does
 /// not loop, does not automatically answer requests or peer closes,
 /// and does not handle rekey. The admitted data packet can be driven with
 /// [`Self::drive`] unless the driver fails; a deferred pong can then be written
@@ -1048,7 +1049,47 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if !self.pending || self.pong_owed || self.control_owed {
             return Err(OwnedChannelError::Busy);
         }
-        match self.connection.transport.read_while_owned(&id.0) {
+        let result = self.connection.transport.read_while_owned(&id.0);
+        self.handle_owned_inbound(result)
+    }
+
+    /// Reads at most one authenticated packet without an active data write.
+    ///
+    /// Events and reply obligations are handled exactly as in
+    /// [`Self::read_inbound`]. While any reply is owed, another read, data
+    /// admission and release are refused. A PING retains a pong for
+    /// [`Self::drive_deferred_pong`]. Peer rekey and extension messages fail
+    /// the driver closed; rekey is not supported by this step.
+    ///
+    /// `WouldBlock` retains any partial protected packet. A partial packet
+    /// prevents release until another read completes it, or the driver is
+    /// dropped. A subsequent data admission may be read through
+    /// [`Self::read_inbound`], which resumes that same partial packet. Waiting
+    /// for socket readiness after `WouldBlock` is the caller's responsibility.
+    /// Dropping the driver drops its stream; separately held handles may keep
+    /// the underlying socket open.
+    ///
+    /// # Errors
+    ///
+    /// Returns busy for an active data write or an obligation, failed after
+    /// a terminal error, a channel error for a consumed invalid packet, or a
+    /// transport error. `WouldBlock` is retryable.
+    pub fn read_idle(&mut self) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        if self.failed {
+            return Err(OwnedChannelError::Failed);
+        }
+        if self.pending || self.pong_owed || self.control_owed {
+            return Err(OwnedChannelError::Busy);
+        }
+        let result = self.connection.transport.read_idle_owned();
+        self.handle_owned_inbound(result)
+    }
+
+    fn handle_owned_inbound(
+        &mut self,
+        result: Result<OwnedInbound, TransportError>,
+    ) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        match result {
             Ok(OwnedInbound::Payload(payload)) => {
                 match self.connection.dispatch_decoded_payload(&payload) {
                     Ok(Some(event)) => {
@@ -1408,9 +1449,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
-    /// Writes a pong that [`Self::read_inbound`] deferred.
+    /// Writes a pong that [`Self::read_inbound`] or [`Self::read_idle`] deferred.
     ///
-    /// The admitted data packet must complete first. `WouldBlock` preserves the
+    /// Any admitted data packet must complete first. `WouldBlock` preserves the
     /// pong and is retryable; any other write failure makes the driver
     /// terminal. A pong is owed only after
     /// [`OwnedChannelInbound::PongDeferred`], and the connection cannot be
@@ -1459,8 +1500,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         }
     }
 
-    /// Releases the connection only when no admitted packet, obligation, or
-    /// failure is outstanding. On refusal, returns the still-owning driver.
+    /// Releases the connection only when no admitted packet, partial inbound
+    /// packet, obligation, or failure is outstanding. On refusal, returns the
+    /// still-owning driver.
     ///
     /// An admitted data packet can be driven with [`Self::drive`] unless the
     /// driver fails. Once it completes, write any deferred pong with
@@ -1493,6 +1535,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             || transport.deferred_owned_pong
             || transport.owned_packet.is_some()
             || transport.write_buffer.is_pending()
+            || transport.has_partial_protected_read()
         {
             return Err(self);
         }
