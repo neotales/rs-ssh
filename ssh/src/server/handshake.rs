@@ -1497,7 +1497,7 @@ where
     /// Returns the next inbound packet sequence number without consuming it.
     ///
     /// This resets at a strict-rekey NEWKEYS, so it is not a monotonic packet
-    /// count. Use [`Self::protected_packets_read`] for that.
+    /// count. The optional `test-support` diagnostic provides such a count.
     #[must_use]
     pub const fn inbound_sequence(&self) -> u32 {
         self.sequence.inbound_sequence()
@@ -1509,10 +1509,9 @@ where
     /// The count is monotonic across strict-rekey sequence resets, unlike
     /// [`Self::inbound_sequence`]. `Some(count)` is accurate; `None` means the
     /// counter overflowed and must be treated as ambiguous. This is a
-    /// read-only diagnostic available only with the `test-support` feature; it
-    /// does not affect packet handling or security decisions.
+    /// public, read-only diagnostic available only with the `test-support`
+    /// feature; it does not affect packet handling or security decisions.
     #[cfg(feature = "test-support")]
-    #[doc(hidden)]
     #[must_use]
     pub const fn protected_packets_read(&self) -> Option<u64> {
         self.protected_packets_read

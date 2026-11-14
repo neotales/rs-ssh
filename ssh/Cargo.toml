@@ -11,9 +11,8 @@ keywords = ["ssh", "sftp", "scp", "cryptography", "network-programming"]
 categories = ["cryptography", "network-programming"]
 
 [features]
-# Exposes read-only diagnostics used only by this repository's tests. It does
-# not change protocol behavior or security decisions and is not enabled by
-# default. Normal builds, including the published crate, do not enable it.
+# Public opt-in diagnostics for test fixtures; see the README for Cargo
+# feature unification and the diagnostic's overflow semantics.
 test-support = []
 
 [dependencies]

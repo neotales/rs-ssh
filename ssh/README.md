@@ -8,6 +8,22 @@ local commands or accept a host key by default.
 user, no port means 22, authentication tries the default `ssh-agent`, and an
 unknown host key is rejected.
 
+## Test support
+
+The public, opt-in `test-support` feature exposes
+`ServerTransport::protected_packets_read`, a read-only diagnostic for test
+fixtures. It counts protected packets read after NEWKEYS, including internal
+and rekey traffic, and does not reset on strict rekey. `Some(count)` is
+accurate; after `u64` overflow it permanently returns `None`, which callers
+must treat as ambiguous. It does not change protocol or security decisions.
+
+The feature is off by default, but is selectable by any consumer and included
+in `--all-features`. Cargo feature unification can also enable it in mixed
+build graphs, including builds that combine the Docker engine's dev-dependency
+with its normal dependency. Do not assume that a published crate or a
+production artifact excludes it merely because this repository uses it for
+tests. The engine's SSH runtime gate is unchanged.
+
 ## Owned-packet compatibility change
 
 `TransportError::OwnedPacketState` is a new variant of the public exhaustive
