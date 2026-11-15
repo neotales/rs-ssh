@@ -54,36 +54,45 @@ impl Write for GatedSocket {
     }
 }
 
+/// Peer for `owned_packet_defers_pong_without_losing_inbound_or_sequence`.
+///
+/// Waits until the client is parked in an owned packet before sending the
+/// deferred ping, so the ping and the payload after it queue behind the
+/// client's blocked outbound write.
+fn serve_deferred_ping(
+    listener: &TcpListener,
+    proceed: &mpsc::Receiver<()>,
+    ping_queued: &mpsc::Sender<()>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (stream, _) = listener.accept()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut server = ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32])).accept(stream)?;
+    let policy = neotales_ssh::ServerAuthPolicy::new(4)?
+        .with_authorized_key(&Ed25519Signer::from_seed(&mut [49; 32]).public_key_blob()?)?;
+    neotales_ssh::authenticate_server(&mut server, &policy)?;
+    proceed.recv_timeout(Duration::from_secs(5))?;
+    server.write_payload(b"\x5ebefore-ping")?;
+    server.send_ping(b"deferred")?;
+    server.write_payload(b"\x5einbound")?;
+    ping_queued.send(())?;
+    assert_eq!(server.read_payload()?, b"\x5eoutbound");
+    assert_eq!(
+        TransportPing::decode(&server.read_payload()?)?,
+        TransportPing::Pong(b"deferred".to_vec())
+    );
+    Ok(())
+}
+
 #[test]
 fn owned_packet_defers_pong_without_losing_inbound_or_sequence()
 -> Result<(), Box<dyn std::error::Error>> {
     use neotales_ssh::transport::{OwnedInbound, TransportError};
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let address = listener.local_addr()?;
-    let (send, recv) = mpsc::channel();
-    let (ready, sent) = mpsc::channel();
-    let server = std::thread::spawn(
-        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let (stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-            let mut server =
-                ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32])).accept(stream)?;
-            let policy = neotales_ssh::ServerAuthPolicy::new(4)?
-                .with_authorized_key(&Ed25519Signer::from_seed(&mut [49; 32]).public_key_blob()?)?;
-            neotales_ssh::authenticate_server(&mut server, &policy)?;
-            recv.recv_timeout(Duration::from_secs(5))?;
-            server.write_payload(b"\x5ebefore-ping")?;
-            server.send_ping(b"deferred")?;
-            server.write_payload(b"\x5einbound")?;
-            ready.send(())?;
-            assert_eq!(server.read_payload()?, b"\x5eoutbound");
-            assert_eq!(
-                TransportPing::decode(&server.read_payload()?)?,
-                TransportPing::Pong(b"deferred".to_vec())
-            );
-            Ok(())
-        },
-    );
+    let (proceed_tx, proceed_rx) = mpsc::channel();
+    let (ping_queued_tx, ping_queued_rx) = mpsc::channel();
+    let server =
+        std::thread::spawn(move || serve_deferred_ping(&listener, &proceed_rx, &ping_queued_tx));
     let stream = TcpStream::connect(address)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let allowance = Arc::new(AtomicUsize::new(usize::MAX));
@@ -111,8 +120,8 @@ fn owned_packet_defers_pong_without_losing_inbound_or_sequence()
     assert!(
         matches!(client.drive_owned_packet(&id), Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock)
     );
-    send.send(())?;
-    sent.recv_timeout(Duration::from_secs(5))?;
+    proceed_tx.send(())?;
+    ping_queued_rx.recv_timeout(Duration::from_secs(5))?;
     assert!(matches!(
         client.read_while_owned(&id)?,
         OwnedInbound::Payload(bytes) if bytes == b"\x5ebefore-ping"
@@ -172,8 +181,8 @@ fn malformed_peer_kexinit_while_owned_terminally_disables_protected_io()
     use neotales_ssh::transport::TransportError;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let address = listener.local_addr()?;
-    let (send, recv) = mpsc::channel();
-    let (sent, ready) = mpsc::channel();
+    let (proceed_tx, proceed_rx) = mpsc::channel();
+    let (malformed_kex_tx, malformed_kex_rx) = mpsc::channel();
     let server = std::thread::spawn(
         move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let (stream, _) = listener.accept()?;
@@ -183,9 +192,9 @@ fn malformed_peer_kexinit_while_owned_terminally_disables_protected_io()
             let policy = neotales_ssh::ServerAuthPolicy::new(4)?
                 .with_authorized_key(&Ed25519Signer::from_seed(&mut [49; 32]).public_key_blob()?)?;
             neotales_ssh::authenticate_server(&mut server, &policy)?;
-            recv.recv_timeout(Duration::from_secs(5))?;
+            proceed_rx.recv_timeout(Duration::from_secs(5))?;
             server.write_payload(&[20])?;
-            sent.send(())?;
+            malformed_kex_tx.send(())?;
             Ok(())
         },
     );
@@ -214,8 +223,8 @@ fn malformed_peer_kexinit_while_owned_terminally_disables_protected_io()
     assert!(
         matches!(client.drive_owned_packet(&id), Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock)
     );
-    send.send(())?;
-    ready.recv_timeout(Duration::from_secs(5))?;
+    proceed_tx.send(())?;
+    malformed_kex_rx.recv_timeout(Duration::from_secs(5))?;
     assert!(matches!(
         client.read_while_owned(&id),
         Err(TransportError::UnexpectedMessage)
