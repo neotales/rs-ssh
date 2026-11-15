@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use neotales_ssh::{Error as WireError, build_packet};
 
-use crate::cipher::{PacketKeyMaterial, PacketProtectionError, PacketProtector, PacketSuite};
+use crate::cipher::{
+    PacketKeyMaterial, PacketProtectionError, PacketProtector, PacketSuite, PlaintextBytes,
+    PlaintextSlot,
+};
 use crate::hostkey::{Ed25519PublicKey, Ed25519Signer, HostKeyError, HostSigner};
 use crate::kex::dh_group16::{Group16KexCompletion, Group16KexContext, Group16ServerKex};
 use crate::kex::mlkem768_x25519::ServerKex as MlKemServerKex;
@@ -1354,11 +1357,13 @@ pub struct ServerTransport<S> {
     rekey: Option<ServerRekeyState>,
     /// At most one inbound application packet found by [`Self::advance_rekey`]
     /// after this server's rekey `KEXINIT` and before the peer's own `KEXINIT`
-    /// is recorded. The packet's sequence number is not committed until
-    /// [`Self::read_payload`] or [`Self::read_auth_packet`] returns it, and no
-    /// further packet is read while it is held, so arrival order is preserved
-    /// and the hold is bounded to one packet.
-    pending_in_flight_application: Option<Vec<u8>>,
+    /// is recorded. It is a [`PlaintextBytes`] because it can hold an
+    /// authentication request: the retained copy is wiped on every drop, and a
+    /// read method that returns it hands the caller a separate copy. The
+    /// packet's sequence number is not committed until that read method returns
+    /// it, and no further packet is read while it is held, so arrival order is
+    /// preserved and the hold is bounded to one packet.
+    pending_in_flight_application: Option<PlaintextBytes>,
     /// Every protected packet read after NEWKEYS, including `PING`,
     /// `EXT_INFO`, and rekey traffic. Monotonic across rekey sequence resets,
     /// so a caller can count packets without relying on the wire sequence
@@ -1646,6 +1651,16 @@ where
     /// memory without limit. That result is recoverable: the rekey stays active
     /// and the retained packet stays readable.
     ///
+    /// The staged progress pattern for a retained packet is: read it with
+    /// [`Self::read_payload`] or [`Self::read_auth_packet`]; keep in caller
+    /// state whatever answer it needs; continue this method until the exchange
+    /// completes; then write the answer with [`Self::write_payload`]. Answering
+    /// earlier is not available, because RFC 4253 §7.1 forbids sending a non-KEX
+    /// message while this server's `KEXINIT` is outstanding, and the transport
+    /// retains nothing outbound. `RekeyInProgress` in the meantime is not a
+    /// retry signal: the exchange is active, so call this method only after the
+    /// read that drains the retained packet.
+    ///
     /// # Errors
     ///
     /// Returns a typed transport, KEX, host-key, or sequence error. Malformed
@@ -1688,8 +1703,10 @@ where
             .is_some_and(|message_type| self.in_flight_application_allowed(message_type))
         {
             // Read, but not committed and not reordered: the next read method
-            // applies the authentication boundary and commits it once.
-            self.pending_in_flight_application = Some(payload);
+            // applies the authentication boundary and commits it once. The
+            // retained buffer wipes itself if it is dropped unread.
+            self.pending_in_flight_application =
+                Some(PlaintextBytes::new(PlaintextSlot::InFlightPayload, payload));
             return Ok(true);
         }
         self.process_rekey_payload(&payload)?;
@@ -1709,6 +1726,10 @@ where
     /// [`Self::read_auth_packet`] and finish with [`Self::advance_rekey`]. A
     /// blocking stream whose peer sends application data across a rekey must
     /// use the staged API.
+    ///
+    /// Do not retry this method after that error: the exchange is still active,
+    /// and [`Self::begin_rekey`] fails closed on an active exchange. There is no
+    /// way to resume the convenience form, which is why the staged API exists.
     ///
     /// # Errors
     ///
@@ -1770,6 +1791,15 @@ where
     /// that, an application packet is a protocol violation and fails the
     /// rekey. The outbound rule is unchanged, so [`Self::write_payload`] still
     /// refuses application data until the exchange completes.
+    ///
+    /// Transport-level traffic is consumed rather than returned while a rekey is
+    /// active. `SSH_MSG_IGNORE`, `SSH_MSG_DEBUG` and `SSH_MSG_UNIMPLEMENTED`
+    /// are discarded at any point in the exchange (RFC 4253 §7.1 permits them
+    /// from the sender, and the strict-KEX rule is initial-exchange only), and
+    /// a keepalive ping is accepted without a reply because a PONG would be a
+    /// non-KEX message while this server's own `KEXINIT` is outstanding
+    /// (OpenSSH PROTOCOL §1.8). A PONG owed for an earlier ping is queued until
+    /// the exchange completes, then flushed with the new keys by the next read.
     ///
     /// # Errors
     ///
@@ -2080,7 +2110,14 @@ where
             if let Some(result) = self.take_retained_in_flight_application(allow_application) {
                 return result;
             }
-            if let Some(reply) = self.pending_transport_reply.take()
+            // A queued transport PONG is written only when no rekey is active:
+            // RFC 4253 §7.1 forbids sending a non-KEX message after this
+            // server's KEXINIT, and OpenSSH queues rather than sends one
+            // ("During rekeying we can only send key exchange messages. Queue
+            // everything else." — packet.c, `ssh_packet_send2`). The first read
+            // after the exchange flushes it with the new keys.
+            if self.rekey.is_none()
+                && let Some(reply) = self.pending_transport_reply.take()
                 && let Err(error) = self.write_payload(&reply)
             {
                 if self.established {
@@ -2175,14 +2212,16 @@ where
     ///
     /// The packet was read but not committed, so this is the single place that
     /// commits it. Returning it before any other read keeps the peer's arrival
-    /// order, and `None` means nothing is retained.
+    /// order, and `None` means nothing is retained. Every path here drops the
+    /// retained [`PlaintextBytes`], which wipes it; the caller gets a copy so
+    /// the transport never hands its own buffer on.
     fn take_retained_in_flight_application(
         &mut self,
         allow_application: bool,
     ) -> Option<Result<Vec<u8>, ServerTransportError>> {
         let payload = self.pending_in_flight_application.take()?;
         if !allow_application
-            && !is_authentication_message(payload.first().copied().unwrap_or_default())
+            && !is_authentication_message(payload.as_slice().first().copied().unwrap_or_default())
         {
             self.established = false;
             let _ = self.sequence.fail_rekey();
@@ -2191,7 +2230,7 @@ where
         if let Err(error) = self.sequence.commit_inbound() {
             return Some(Err(error.into()));
         }
-        Some(Ok(payload))
+        Some(Ok(payload.as_slice().to_vec()))
     }
 
     /// Reports whether an inbound packet may be delivered as application data
@@ -2208,12 +2247,18 @@ where
     ///
     /// The rekey state machine keeps ownership of the transport messages
     /// (`SSH_MSG_DISCONNECT`, `SSH_MSG_IGNORE`, `SSH_MSG_DEBUG`,
-    /// `SSH_MSG_UNIMPLEMENTED`, `SSH_MSG_KEXINIT`, `SSH_MSG_NEWKEYS`, and the
-    /// 30-49 method range), and the keepalive extension messages 192/193 are
-    /// not application data, so all of those keep their existing handling.
-    /// Everything else is an application packet: it is returned to the caller
-    /// through the ordinary dispatch tail, which still applies the
-    /// authentication boundary and commits its sequence number exactly once.
+    /// `SSH_MSG_UNIMPLEMENTED`, `SSH_MSG_KEXINIT`, `SSH_MSG_NEWKEYS`, the
+    /// 30-49 method range, and the OpenSSH 192/193 keepalive messages), so all
+    /// of those keep their existing dispatch and none is returned as
+    /// application data. Everything else is an application packet: it is
+    /// returned to the caller through the ordinary dispatch tail, which still
+    /// applies the authentication boundary and commits its sequence number
+    /// exactly once.
+    ///
+    /// This predicate governs delivery only. Whether a transport-level message
+    /// is accepted is decided by [`Self::process_rekey_payload`], which accepts
+    /// the generic messages at any point in the exchange (RFC 4253 §7.1) and
+    /// the keepalive messages without a reply (OpenSSH PROTOCOL §1.8).
     fn in_flight_application_allowed(&self, message_type: u8) -> bool {
         let Some(state) = self.rekey.as_ref() else {
             return false;
@@ -2245,11 +2290,27 @@ where
             30..=49 => self.accept_rekey_method(payload),
             SSH_MSG_NEWKEYS => self.accept_rekey_newkeys(payload),
             2..=4 => {
-                let disposition = self.sequence.observe_rekey(message_type)?;
-                if disposition != PacketDisposition::Ignorable {
-                    return Err(ServerTransportError::Transport(
-                        TransportError::UnexpectedMessage,
-                    ));
+                // RFC 4253 §7.1 allows transport-generic messages (1-19) from a
+                // party that has sent a KEXINIT, and the strict-KEX draft only
+                // requires non-KEX rejection during the *initial* exchange
+                // (draft-miller-sshm-strict-kex-01 §3.2), so these are accepted
+                // in a strict rekey too. OpenSSH draws the same line: its
+                // implicit transport handler is skipped only while the exchange
+                // is `KEX_INITIAL` (packet.c, `ssh_packet_read_poll_seqnr`).
+                // They carry nothing this transport acts on, so they are
+                // discarded after the sequence commit, as OpenSSH discards them.
+                self.sequence.commit_inbound()?;
+                Ok(())
+            }
+            neotales_ssh::keepalive::SSH_MSG_PING | neotales_ssh::keepalive::SSH_MSG_PONG => {
+                // OpenSSH PROTOCOL §1.8 sends replies "in order" but states
+                // "No reply is sent to a ping that is received ... while
+                // rekeying is in progress". Replying here would send a non-KEX
+                // message while RFC 4253 §7.1 forbids it, so the ping is
+                // accepted and dropped with no reply. The framing is validated
+                // exactly as the non-rekey path validates it.
+                if let Err(error) = neotales_ssh::keepalive::TransportPing::decode(payload) {
+                    return Err(ServerTransportError::Transport(TransportError::Wire(error)));
                 }
                 self.sequence.commit_inbound()?;
                 Ok(())

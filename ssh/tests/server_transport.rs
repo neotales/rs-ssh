@@ -51,7 +51,10 @@ use std::io::{self, Cursor, Read, Write};
 use std::rc::Rc;
 
 use crate::client::{ClientConfig, HandshakeError as ClientHandshakeError};
-use cipher::{PacketKeyMaterial, PacketProtector, PacketSuite};
+use cipher::{
+    PacketKeyMaterial, PacketProtector, PacketSuite, PlaintextDrop, PlaintextSlot,
+    take_plaintext_drop,
+};
 use hostkey::{Ed25519PublicKey, Ed25519Signer, verify_host_key_signature};
 use kex::mlkem768_x25519::ClientKex as MlKemClientKex;
 use kex::{Curve25519, DerivationLengths, DerivedKeys, KexContext, KeyExchange, derive_keys};
@@ -64,6 +67,7 @@ use msg::kexinit::{
 };
 use neotales_ssh::build_packet_default;
 use neotales_ssh::compression::CompressionAlgorithm;
+use neotales_ssh::keepalive::TransportPing;
 use sequence::SequenceState;
 use server::{
     HandshakeError, IdentificationError, ServerConfig, ServerHandshake, ServerTransport,
@@ -468,12 +472,18 @@ fn server_advance_rekey_retains_one_in_flight_packet_and_refuses_a_second()
     peer.send_application(&[50, 2])?;
 
     let inbound_before = server.inbound_sequence();
+    let _ = take_plaintext_drop(PlaintextSlot::InFlightPayload);
     assert!(server.advance_rekey()?);
     assert!(server.rekey_active());
     assert_eq!(
         server.inbound_sequence(),
         inbound_before,
         "a retained packet is committed only when a read method returns it"
+    );
+    assert_eq!(
+        take_plaintext_drop(PlaintextSlot::InFlightPayload),
+        None,
+        "a retained packet is still owned by the transport, not dropped"
     );
 
     // The slot holds one packet, so a second step refuses without reading,
@@ -485,11 +495,26 @@ fn server_advance_rekey_retains_one_in_flight_packet_and_refuses_a_second()
     assert!(server.is_established());
     assert!(server.rekey_active());
     assert_eq!(server.inbound_sequence(), inbound_before);
+    assert_eq!(
+        take_plaintext_drop(PlaintextSlot::InFlightPayload),
+        None,
+        "a refused step neither reads nor drops the retained packet"
+    );
 
     assert_eq!(server.read_auth_packet()?, [50, 1]);
+    assert_eq!(
+        take_plaintext_drop(PlaintextSlot::InFlightPayload),
+        Some(PlaintextDrop::Wiped),
+        "the retained plaintext must be wiped once a read has returned a copy"
+    );
     assert_eq!(server.inbound_sequence(), inbound_before + 1);
     assert!(server.advance_rekey()?);
     assert_eq!(server.read_auth_packet()?, [50, 2]);
+    assert_eq!(
+        take_plaintext_drop(PlaintextSlot::InFlightPayload),
+        Some(PlaintextDrop::Wiped),
+        "the second retained plaintext must be wiped too"
+    );
     assert_eq!(server.inbound_sequence(), inbound_before + 2);
 
     peer.begin_rekey()?;
@@ -512,6 +537,10 @@ fn server_advance_rekey_retains_one_in_flight_packet_and_refuses_a_second()
     server.advance_rekey()?;
     assert!(!server.rekey_active());
     peer.install_rekey_protectors(&derived)?;
+    // The caller kept the answer to the retained request and sends it only
+    // after the exchange, which is the documented pattern for this API.
+    server.write_payload(&[52, 1])?;
+    assert_eq!(peer.receive_protected()?, [52, 1]);
     peer.send_application(&[50, 3])?;
     assert_eq!(server.read_auth_packet()?, [50, 3]);
     Ok(())
@@ -529,13 +558,158 @@ fn server_advance_rekey_checks_the_auth_boundary_when_it_returns_in_flight_data(
     // Channel data before authentication. Receiving it during the RFC 4253
     // §7.1 window is legal; handing it to an authentication read is not.
     peer.send_application(&[94, 1])?;
+    let _ = take_plaintext_drop(PlaintextSlot::InFlightPayload);
     assert!(server.advance_rekey()?);
     assert!(matches!(
         server.read_auth_packet(),
         Err(ServerTransportError::UnauthenticatedMessage)
     ));
+    assert_eq!(
+        take_plaintext_drop(PlaintextSlot::InFlightPayload),
+        Some(PlaintextDrop::Wiped),
+        "a retained packet refused by the authentication boundary must be wiped"
+    );
     assert!(!server.is_established());
     assert!(server.rekey_is_terminal());
+    Ok(())
+}
+
+/// Valid wire encodings for the three RFC 4253 §11 transport messages.
+fn transport_generic_payloads() -> [Vec<u8>; 3] {
+    [
+        // SSH_MSG_IGNORE (2) with an empty string.
+        vec![2, 0, 0, 0, 0],
+        // SSH_MSG_UNIMPLEMENTED (3) for sequence number 1.
+        vec![3, 0, 0, 0, 1],
+        // SSH_MSG_DEBUG (4): always_display set, empty message and language.
+        vec![4, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+    ]
+}
+
+#[test]
+fn server_rekey_accepts_transport_messages_before_the_peer_kexinit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(61);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, true)?;
+    let original_session_id = server.session_id().to_vec();
+    server.mark_authenticated();
+
+    server.begin_rekey()?;
+    // RFC 4253 §7.1 permits transport-generic messages from a party that has
+    // sent a KEXINIT, and the strict-KEX rule is initial-exchange only, so a
+    // strict rekey accepts them. A ping gets no reply: OpenSSH PROTOCOL §1.8
+    // sends none while rekeying.
+    let mut payloads = transport_generic_payloads().to_vec();
+    payloads.push(TransportPing::Ping(b"q".to_vec()).encode()?);
+    payloads.push(TransportPing::Pong(b"q".to_vec()).encode()?);
+    let inbound_before = server.inbound_sequence();
+    for payload in &payloads {
+        peer.send_application(payload)?;
+        assert!(server.advance_rekey()?);
+        assert!(server.is_established());
+        assert!(server.rekey_active());
+    }
+    assert_eq!(
+        server.inbound_sequence(),
+        inbound_before + u32::try_from(payloads.len())?,
+        "accepted transport messages are committed once each"
+    );
+
+    peer.begin_rekey()?;
+    let server_kexinit = peer.receive_protected()?;
+    assert_eq!(server_kexinit.first(), Some(&20));
+    let mut client_kexinit = proposal(KEX_MLKEM768X25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    client_kexinit.cookie = [0x77; 16];
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_rekey(&client_kexinit_payload, 20)?;
+    server.advance_rekey()?;
+    // The exchange's own packets arrive in order: a PONG written while the
+    // server's KEXINIT was outstanding would appear here or fail the peer's
+    // rekey classification instead of being read as the reply.
+    let derived = peer_finishes_raw_mlkem_rekey(
+        &mut server,
+        &mut peer,
+        &server_kexinit,
+        &client_kexinit_payload,
+        &original_session_id,
+        &expected_key,
+        0x85,
+    )?;
+    server.advance_rekey()?;
+    assert!(!server.rekey_active());
+
+    // After the exchange a ping is answered again, so the silent window is the
+    // rekey and not a lost reply path.
+    peer.install_rekey_protectors(&derived)?;
+    peer.send_application(&TransportPing::Ping(b"r".to_vec()).encode()?)?;
+    // The ping is consumed and the pong written before the read runs out of
+    // bytes, so the reply is on the wire and the error is only the fixture's
+    // would-block.
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert_eq!(
+        peer.receive_protected()?,
+        TransportPing::Pong(b"r".to_vec()).encode()?
+    );
+    Ok(())
+}
+
+#[test]
+fn server_rekey_accepts_transport_messages_after_the_peer_kexinit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(62);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, true)?;
+    let original_session_id = server.session_id().to_vec();
+
+    server.begin_rekey()?;
+    peer.begin_rekey()?;
+    let server_kexinit = peer.receive_protected()?;
+    assert_eq!(server_kexinit.first(), Some(&20));
+    let mut client_kexinit = proposal(KEX_MLKEM768X25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    client_kexinit.cookie = [0x78; 16];
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_rekey(&client_kexinit_payload, 20)?;
+    server.advance_rekey()?;
+    assert!(server.rekey_active());
+
+    // Between the peer's KEXINIT and its method message, RFC 4253 §7.1 still
+    // allows transport-generic messages from it, and the keepalive extension
+    // stays tolerable without a reply.
+    let mut payloads = transport_generic_payloads().to_vec();
+    payloads.push(TransportPing::Ping(b"s".to_vec()).encode()?);
+    payloads.push(TransportPing::Pong(b"s".to_vec()).encode()?);
+    let inbound_before = server.inbound_sequence();
+    for payload in &payloads {
+        peer.send_application(payload)?;
+        assert!(server.advance_rekey()?);
+        assert!(server.is_established());
+    }
+    assert_eq!(
+        server.inbound_sequence(),
+        inbound_before + u32::try_from(payloads.len())?
+    );
+
+    let derived = peer_finishes_raw_mlkem_rekey(
+        &mut server,
+        &mut peer,
+        &server_kexinit,
+        &client_kexinit_payload,
+        &original_session_id,
+        &expected_key,
+        0x86,
+    )?;
+    server.advance_rekey()?;
+    assert!(!server.rekey_active());
+    peer.install_rekey_protectors(&derived)?;
+    peer.send_application(&[50, 4])?;
+    assert_eq!(server.read_auth_packet()?, [50, 4]);
     Ok(())
 }
 

@@ -1292,15 +1292,16 @@ const _: () = {
 
 /// Which plaintext buffer a [`PlaintextBytes`] is.
 ///
-/// One variant per site on the outbound path. The wipe witness is recorded per
-/// slot rather than in one channel, because the test scheduler reuses threads
-/// and because a single password request passes through three of these buffers
-/// in one call: without the slots a test could not attribute a record to the
-/// site it meant, or could read another test's record on the same thread.
+/// One variant per site on the protected-payload path. The wipe witness is
+/// recorded per slot rather than in one channel, because the test scheduler
+/// reuses threads and because a single password request passes through three of
+/// these buffers in one call: without the slots a test could not attribute a
+/// record to the site it meant, or could read another test's record on the same
+/// thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 // A test binary that includes this module without `auth.rs` has no
-// `AuthRequest` to construct, and the other three are unused there the other way
+// `AuthRequest` to construct, and the others are unused there the other way
 // round. The slots are the witness table's shape, not any one binary's traffic.
 #[allow(dead_code)]
 pub(crate) enum PlaintextSlot {
@@ -1312,6 +1313,9 @@ pub(crate) enum PlaintextSlot {
     ClearPacket,
     /// The payload a transport keeps to recognise a retried write.
     PendingPayload,
+    /// An application payload a server transport retains across a rekey
+    /// (RFC 4253 §7.1) until a read method returns it.
+    InFlightPayload,
 }
 
 /// The size of the wipe-witness table, taken from the last slot.
@@ -1320,7 +1324,7 @@ pub(crate) enum PlaintextSlot {
 /// range is a test that panics rather than a record that overwrites another
 /// site's.
 #[cfg(test)]
-const PLAINTEXT_SLOT_COUNT: usize = PlaintextSlot::PendingPayload as usize + 1;
+const PLAINTEXT_SLOT_COUNT: usize = PlaintextSlot::InFlightPayload as usize + 1;
 
 /// What one [`PlaintextBytes`] destructor found.
 ///
