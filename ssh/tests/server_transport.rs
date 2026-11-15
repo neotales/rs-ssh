@@ -345,6 +345,375 @@ fn server_rekeys_hybrid_with_old_keys_until_newkeys_and_keeps_session_identity()
     Ok(())
 }
 
+/// Drives the peer side of an already-open ML-KEM rekey whose server `KEXINIT`
+/// and peer `KEXINIT` have been exchanged, up to and including the peer
+/// `NEWKEYS`. The caller still advances the server past that `NEWKEYS`.
+fn peer_finishes_raw_mlkem_rekey(
+    server: &mut ServerTransport<Stream<'_>>,
+    peer: &mut RawPeer<Stream<'_>>,
+    server_kexinit: &[u8],
+    client_kexinit_payload: &[u8],
+    session_id: &[u8],
+    expected_key: &Ed25519PublicKey,
+    seed: u8,
+) -> Result<DerivedKeys, Box<dyn std::error::Error>> {
+    let context = KexContext::new(
+        &peer.client_version,
+        &peer.server_version,
+        client_kexinit_payload,
+        server_kexinit,
+        KEX_MLKEM768X25519_SHA256,
+    )?;
+    let client_kex = MlKemClientKex::from_seeds(&[seed; 64], &[seed.wrapping_add(1); 32]);
+    peer.send_rekey(&client_kex.init_message()?, 30)?;
+    server.advance_rekey()?;
+    let reply = peer.receive_protected()?;
+    assert_eq!(reply.first(), Some(&31));
+    let completion = client_kex.complete(&context, &reply)?;
+    verify_host_key_signature(
+        expected_key,
+        &completion.signature_blob,
+        &completion.exchange_hash,
+    )?;
+    let derived = derive_keys(
+        &completion.shared_secret,
+        &completion.exchange_hash,
+        session_id,
+        raw_derivation_lengths(),
+    )?;
+    assert_eq!(peer.receive_protected()?, [21]);
+    peer.send_rekey(&[21], 21)?;
+    peer.complete_rekey()?;
+    Ok(derived)
+}
+
+#[test]
+fn server_rekey_reads_in_flight_application_data_before_the_peer_kexinit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(52);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, true)?;
+    let original_session_id = server.session_id().to_vec();
+    server.mark_authenticated();
+
+    server.begin_rekey()?;
+
+    // Both packets were sent before the peer read (let alone sent) a KEXINIT,
+    // which is exactly the window RFC 4253 §7.1 says must be processed.
+    peer.send_application(&[94, 1, 1])?;
+    peer.send_application(&[94, 2, 2])?;
+
+    // The outbound half of §7.1 is unchanged: no application data may be sent
+    // after this server's KEXINIT, and reading the peer's data does not lift it.
+    assert!(matches!(
+        server.write_payload(&[94, 3, 3]),
+        Err(ServerTransportError::RekeyInProgress)
+    ));
+    assert!(server.is_established());
+
+    // Arrival order, one commit per packet, and the rekey is still open.
+    let inbound_before = server.inbound_sequence();
+    assert_eq!(server.read_payload()?, [94, 1, 1]);
+    assert_eq!(server.inbound_sequence(), inbound_before + 1);
+    assert_eq!(server.read_payload()?, [94, 2, 2]);
+    assert_eq!(server.inbound_sequence(), inbound_before + 2);
+    assert!(server.rekey_active());
+
+    peer.begin_rekey()?;
+    let server_kexinit = peer.receive_protected()?;
+    assert_eq!(server_kexinit.first(), Some(&20));
+    let mut client_kexinit = proposal(KEX_MLKEM768X25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    client_kexinit.cookie = [0x74; 16];
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_rekey(&client_kexinit_payload, 20)?;
+    server.advance_rekey()?;
+    let derived = peer_finishes_raw_mlkem_rekey(
+        &mut server,
+        &mut peer,
+        &server_kexinit,
+        &client_kexinit_payload,
+        &original_session_id,
+        &expected_key,
+        0x83,
+    )?;
+    server.advance_rekey()?;
+    assert!(!server.rekey_active());
+    assert_eq!(server.inbound_sequence(), 0);
+    assert_eq!(server.outbound_sequence(), 0);
+    assert_eq!(server.session_id(), original_session_id.as_slice());
+
+    // Post-rekey traffic uses the reset sequence numbers on both sides.
+    peer.install_rekey_protectors(&derived)?;
+    peer.send_application(&[94, 4, 4])?;
+    assert_eq!(server.read_payload()?, [94, 4, 4]);
+    server.write_payload(&[94, 5, 5])?;
+    assert_eq!(peer.receive_protected()?, [94, 5, 5]);
+    Ok(())
+}
+
+#[test]
+fn server_advance_rekey_retains_one_in_flight_packet_and_refuses_a_second()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(53);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    // Unauthenticated on purpose: the retained packets must still be delivered
+    // by `read_auth_packet`, which applies the boundary at delivery time.
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, true)?;
+    let original_session_id = server.session_id().to_vec();
+
+    server.begin_rekey()?;
+    peer.send_application(&[50, 1])?;
+    peer.send_application(&[50, 2])?;
+
+    let inbound_before = server.inbound_sequence();
+    assert!(server.advance_rekey()?);
+    assert!(server.rekey_active());
+    assert_eq!(
+        server.inbound_sequence(),
+        inbound_before,
+        "a retained packet is committed only when a read method returns it"
+    );
+
+    // The slot holds one packet, so a second step refuses without reading,
+    // committing, or failing the exchange.
+    assert!(matches!(
+        server.advance_rekey(),
+        Err(ServerTransportError::RekeyInProgress)
+    ));
+    assert!(server.is_established());
+    assert!(server.rekey_active());
+    assert_eq!(server.inbound_sequence(), inbound_before);
+
+    assert_eq!(server.read_auth_packet()?, [50, 1]);
+    assert_eq!(server.inbound_sequence(), inbound_before + 1);
+    assert!(server.advance_rekey()?);
+    assert_eq!(server.read_auth_packet()?, [50, 2]);
+    assert_eq!(server.inbound_sequence(), inbound_before + 2);
+
+    peer.begin_rekey()?;
+    let server_kexinit = peer.receive_protected()?;
+    assert_eq!(server_kexinit.first(), Some(&20));
+    let mut client_kexinit = proposal(KEX_MLKEM768X25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    client_kexinit.cookie = [0x75; 16];
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_rekey(&client_kexinit_payload, 20)?;
+    server.advance_rekey()?;
+    let derived = peer_finishes_raw_mlkem_rekey(
+        &mut server,
+        &mut peer,
+        &server_kexinit,
+        &client_kexinit_payload,
+        &original_session_id,
+        &expected_key,
+        0x84,
+    )?;
+    server.advance_rekey()?;
+    assert!(!server.rekey_active());
+    peer.install_rekey_protectors(&derived)?;
+    peer.send_application(&[50, 3])?;
+    assert_eq!(server.read_auth_packet()?, [50, 3]);
+    Ok(())
+}
+
+#[test]
+fn server_advance_rekey_checks_the_auth_boundary_when_it_returns_in_flight_data()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(60);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, true)?;
+
+    server.begin_rekey()?;
+    // Channel data before authentication. Receiving it during the RFC 4253
+    // §7.1 window is legal; handing it to an authentication read is not.
+    peer.send_application(&[94, 1])?;
+    assert!(server.advance_rekey()?);
+    assert!(matches!(
+        server.read_auth_packet(),
+        Err(ServerTransportError::UnauthenticatedMessage)
+    ));
+    assert!(!server.is_established());
+    assert!(server.rekey_is_terminal());
+    Ok(())
+}
+
+#[test]
+fn server_rekey_rejects_application_data_after_the_peer_kexinit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(55);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    // Non-strict, so the rejection is the §7.1 ordering rule and not the
+    // strict-KEX policy.
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, false)?;
+    server.mark_authenticated();
+
+    server.begin_rekey()?;
+    assert_eq!(peer.receive_protected()?.first(), Some(&20));
+    peer.begin_rekey()?;
+    let mut client_kexinit = proposal(KEX_MLKEM768X25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    client_kexinit.cookie = [0x76; 16];
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_rekey(&client_kexinit_payload, 20)?;
+    server.advance_rekey()?;
+    assert!(server.rekey_active());
+
+    // The peer KEXINIT closed the in-flight window: application data now
+    // violates RFC 4253 §7.1 and must fail the exchange closed.
+    peer.send_application(&[94, 9])?;
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::Transport(
+            TransportError::UnexpectedMessage
+        ))
+    ));
+    assert!(!server.is_established());
+    assert!(server.rekey_is_terminal());
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::NotEstablished)
+    ));
+    Ok(())
+}
+
+#[test]
+fn server_initial_kex_rejects_application_data_and_strict_ignores()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Initial-KEX policy is not the rekey window: before NEWKEYS there is no
+    // established application traffic, so an application packet is refused in
+    // both modes, and an ignorable transport message is refused only when
+    // strict-KEX was negotiated.
+    let initial_input =
+        |strict: bool, injected: Vec<u8>| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let mut client_kexinit = ClientConfig::new().kexinit().clone();
+            client_kexinit.kex_algorithms = vec![CURVE25519_SHA256.to_owned()];
+            if strict {
+                client_kexinit
+                    .kex_algorithms
+                    .push(KEX_STRICT_C_V00_OPENSSH.to_owned());
+            }
+            client_kexinit.cookie = [21; 16];
+            let mechanism = Curve25519::standard();
+            let ephemeral = mechanism.generate_ephemeral()?;
+            let init = mechanism.encode_init_message(&ephemeral)?;
+            let mut input = b"SSH-2.0-neotales-ssh_0.1\r\n".to_vec();
+            for payload in [client_kexinit.encode()?, injected, init, vec![21]] {
+                input.extend_from_slice(&build_packet_default(&payload, |padding| {
+                    padding.fill(0xa5);
+                })?);
+            }
+            Ok(input)
+        };
+
+    for strict in [false, true] {
+        let mut stream = BlockingStream {
+            input: Cursor::new(initial_input(
+                strict,
+                vec![50, 0, 0, 0, 4, b'a', b'u', b't', b'h'],
+            )?),
+            output: Vec::new(),
+        };
+        assert!(matches!(
+            ServerConfig::new(signer(56)).connect(&mut stream),
+            Err(HandshakeError::Transport(TransportError::Sequence(
+                sequence::SequenceError::UnexpectedPacket
+            )))
+        ));
+    }
+
+    let mut strict_ignore = BlockingStream {
+        input: Cursor::new(initial_input(true, vec![2, 0, 0, 0, 0])?),
+        output: Vec::new(),
+    };
+    assert!(matches!(
+        ServerConfig::new(signer(57)).connect(&mut strict_ignore),
+        Err(HandshakeError::Transport(TransportError::Sequence(
+            sequence::SequenceError::StrictViolation
+        )))
+    ));
+
+    let mut lenient_ignore = BlockingStream {
+        input: Cursor::new(initial_input(false, vec![2, 0, 0, 0, 0])?),
+        output: Vec::new(),
+    };
+    let transport = ServerConfig::new(signer(58)).connect(&mut lenient_ignore)?;
+    assert!(transport.is_established());
+    assert!(!transport.strict_kex());
+    Ok(())
+}
+
+#[test]
+fn server_initiated_rekey_survives_in_flight_client_data_end_to_end()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let config = ServerConfig::new(signer(59));
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<Vec<u8>, String> {
+        let (stream, _) = listener.accept().map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| error.to_string())?;
+        let mut transport = config.accept(stream).map_err(|error| error.to_string())?;
+        let session_id = transport.session_id().to_vec();
+        transport
+            .write_payload(&[52])
+            .map_err(|error| error.to_string())?;
+        transport.mark_authenticated();
+        transport.begin_rekey().map_err(|error| error.to_string())?;
+
+        // The client wrote these before it could have read this KEXINIT.
+        for expected in [[94_u8, 1], [94, 2]] {
+            let payload = transport
+                .read_payload()
+                .map_err(|error| error.to_string())?;
+            if payload != expected {
+                return Err(format!("unexpected in-flight payload {payload:?}"));
+            }
+        }
+        while transport.rekey_active() {
+            transport
+                .advance_rekey()
+                .map_err(|error| error.to_string())?;
+        }
+        if transport.session_id() != session_id.as_slice() {
+            return Err("session identity changed".to_owned());
+        }
+        if transport
+            .read_payload()
+            .map_err(|error| error.to_string())?
+            != [94, 3]
+        {
+            return Err("missing post-rekey payload".to_owned());
+        }
+        transport
+            .write_payload(&[94, 4])
+            .map_err(|error| error.to_string())?;
+        Ok(session_id)
+    });
+
+    let stream = TcpStream::connect(address)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut transport = ClientConfig::new().connect(stream, |_| Ok::<(), Infallible>(()))?;
+    let session_id = transport.session_id().to_vec();
+    assert_eq!(transport.read_payload()?, [52]);
+    transport.authenticated = true;
+    // Both writes precede the client's first read, so they are in flight when
+    // the server opens its rekey.
+    transport.write_payload(&[94, 1])?;
+    transport.write_payload(&[94, 2])?;
+    transport.rekey()?;
+    transport.write_payload(&[94, 3])?;
+    assert_eq!(transport.read_payload()?, [94, 4]);
+    let server_session_id = server.join().map_err(|_| "server panicked")?;
+    assert_eq!(server_session_id?, session_id);
+    Ok(())
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn test_support_rekey_ignorable_requires_active_non_strict_rekey()

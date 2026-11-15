@@ -194,7 +194,11 @@ pub enum ServerTransportError {
     UnsupportedAlgorithm,
     /// A host-key operation failed during rekeying.
     HostKey(HostKeyError),
-    /// An application packet was attempted while a rekey was active.
+    /// An application write, or another `advance_rekey` step, was refused
+    /// while a rekey was active. `advance_rekey` also returns this while it
+    /// holds an in-flight application packet: read it with
+    /// [`ServerTransport::read_payload`] or
+    /// [`ServerTransport::read_auth_packet`], then continue the exchange.
     RekeyInProgress,
 }
 
@@ -217,7 +221,7 @@ impl fmt::Display for ServerTransportError {
                 write!(formatter, "SSH server rekey host-key error: {error}")
             }
             Self::RekeyInProgress => {
-                formatter.write_str("SSH server cannot send application data during rekey")
+                formatter.write_str("SSH server cannot proceed while a rekey is active")
             }
         }
     }
@@ -880,6 +884,7 @@ where
                 immediate: self.config.immediate_compression,
             },
             rekey: None,
+            pending_in_flight_application: None,
             #[cfg(feature = "test-support")]
             protected_packets_read: Some(0),
         })
@@ -1347,6 +1352,13 @@ pub struct ServerTransport<S> {
     established: bool,
     authenticated: bool,
     rekey: Option<ServerRekeyState>,
+    /// At most one inbound application packet found by [`Self::advance_rekey`]
+    /// after this server's rekey `KEXINIT` and before the peer's own `KEXINIT`
+    /// is recorded. The packet's sequence number is not committed until
+    /// [`Self::read_payload`] or [`Self::read_auth_packet`] returns it, and no
+    /// further packet is read while it is held, so arrival order is preserved
+    /// and the hold is bounded to one packet.
+    pending_in_flight_application: Option<Vec<u8>>,
     /// Every protected packet read after NEWKEYS, including `PING`,
     /// `EXT_INFO`, and rekey traffic. Monotonic across rekey sequence resets,
     /// so a caller can count packets without relying on the wire sequence
@@ -1617,22 +1629,37 @@ where
     /// Advances an active rekey by one protected inbound packet.
     ///
     /// `Ok(true)` means that a KEXINIT, method message, or NEWKEYS packet was
-    /// consumed. `Ok(false)` means that no rekey is active. A peer-initiated
+    /// consumed, or that one in-flight application packet was retained for the
+    /// next [`Self::read_payload`] or [`Self::read_auth_packet`] call.
+    /// `Ok(false)` means that no rekey is active. A peer-initiated
     /// rekey is normally consumed by [`Self::read_auth_packet`] or
     /// [`Self::read_payload`] instead. Protected-packet bytes are retained by
     /// the transport, so a staged caller may retry after `WouldBlock` at any
     /// packet boundary or in the middle of a packet.
     ///
+    /// RFC 4253 §7.1 lets application data that the peer sent before its own
+    /// rekey `KEXINIT` arrive while the exchange is open. At most one such
+    /// packet is retained; while it is held, this method returns
+    /// [`ServerTransportError::RekeyInProgress`] without reading or changing
+    /// anything, and the caller must return it with a read method first. The
+    /// bound stops a peer that withholds its `KEXINIT` from growing transport
+    /// memory without limit. That result is recoverable: the rekey stays active
+    /// and the retained packet stays readable.
+    ///
     /// # Errors
     ///
     /// Returns a typed transport, KEX, host-key, or sequence error. Malformed
-    /// packets and invalid transitions terminally fail closed.
+    /// packets and invalid transitions terminally fail closed, apart from the
+    /// recoverable `RekeyInProgress` case above.
     pub fn advance_rekey(&mut self) -> Result<bool, ServerTransportError> {
         if !self.established {
             return Err(ServerTransportError::NotEstablished);
         }
         if self.rekey.is_none() {
             return Ok(false);
+        }
+        if self.pending_in_flight_application.is_some() {
+            return Err(ServerTransportError::RekeyInProgress);
         }
         let result = self.advance_rekey_inner();
         match result {
@@ -1655,6 +1682,16 @@ where
             return Ok(true);
         }
         let payload = self.read_protected_packet_uncommitted()?;
+        if payload
+            .first()
+            .copied()
+            .is_some_and(|message_type| self.in_flight_application_allowed(message_type))
+        {
+            // Read, but not committed and not reordered: the next read method
+            // applies the authentication boundary and commits it once.
+            self.pending_in_flight_application = Some(payload);
+            return Ok(true);
+        }
         self.process_rekey_payload(&payload)?;
         Ok(true)
     }
@@ -1665,10 +1702,20 @@ where
     /// caller should use [`Self::begin_rekey`] and [`Self::advance_rekey`];
     /// partial protected packets are retained across `WouldBlock`.
     ///
+    /// It cannot deliver application data to a caller, so it retains at most one
+    /// in-flight application packet (RFC 4253 §7.1) and then stops with
+    /// [`ServerTransportError::RekeyInProgress`], leaving the rekey active and
+    /// that packet readable. Read it with [`Self::read_payload`] or
+    /// [`Self::read_auth_packet`] and finish with [`Self::advance_rekey`]. A
+    /// blocking stream whose peer sends application data across a rekey must
+    /// use the staged API.
+    ///
     /// # Errors
     ///
     /// Returns the first transport, KEX, host-key, or sequence failure. The
-    /// transport is not returned in a partially switched state.
+    /// transport is not returned in a partially switched state. Returns
+    /// [`ServerTransportError::RekeyInProgress`] as described above when
+    /// application data arrived before the peer's `KEXINIT`.
     pub fn rekey(&mut self) -> Result<(), ServerTransportError> {
         self.begin_rekey()?;
         while self.rekey.is_some() {
@@ -1693,6 +1740,11 @@ where
     /// peer KEXINIT and the complete rekey exchange are consumed internally
     /// before either authentication or channel dispatch can observe a packet.
     ///
+    /// Application packets the peer sent before its rekey `KEXINIT` are the
+    /// exception. RFC 4253 §7.1 requires them to be processed, so they are
+    /// returned here in arrival order during a rekey this server started, and
+    /// the same authentication boundary below still applies to them.
+    ///
     /// # Errors
     ///
     /// Returns [`ServerTransportError::NotEstablished`] before NEWKEYS,
@@ -1707,9 +1759,17 @@ where
     /// Reads one packet through the authentication or post-authentication
     /// boundary.
     ///
-    /// Rekey packets always take precedence over application packets. Once a
-    /// peer KEXINIT is accepted, this method consumes the KEX method and both
+    /// Rekey packets take precedence over application packets. Once a peer
+    /// KEXINIT is accepted, this method consumes the KEX method and both
     /// NEWKEYS boundaries before returning an application packet.
+    ///
+    /// The one exception is required by RFC 4253 §7.1: after this server sends
+    /// a rekey `KEXINIT`, application data that the peer sent before its own
+    /// `KEXINIT` is returned here in arrival order, and only then is the peer
+    /// proposal processed. The window is bounded by the peer's `KEXINIT`: after
+    /// that, an application packet is a protocol violation and fails the
+    /// rekey. The outbound rule is unchanged, so [`Self::write_payload`] still
+    /// refuses application data until the exchange completes.
     ///
     /// # Errors
     ///
@@ -1721,9 +1781,11 @@ where
 
     /// Writes one nonempty protected packet for the server-side protocol.
     ///
-    /// Application packets are refused while a rekey is active. KEXINIT, KEX
+    /// Application packets are refused while a rekey is active, as RFC 4253
+    /// §7.1 requires of a party that has sent a rekey `KEXINIT`. KEXINIT, KEX
     /// method, and NEWKEYS packets are written only by the rekey state machine
-    /// while the old keys are still installed.
+    /// while the old keys are still installed. Consuming the peer's in-flight
+    /// application data does not lift this restriction.
     ///
     /// # Errors
     ///
@@ -2015,6 +2077,9 @@ where
             return Err(ServerTransportError::NotEstablished);
         }
         loop {
+            if let Some(result) = self.take_retained_in_flight_application(allow_application) {
+                return result;
+            }
             if let Some(reply) = self.pending_transport_reply.take()
                 && let Err(error) = self.write_payload(&reply)
             {
@@ -2082,7 +2147,7 @@ where
                 }
                 continue;
             }
-            if self.rekey.is_some() {
+            if self.rekey.is_some() && !self.in_flight_application_allowed(message_type) {
                 match self.process_rekey_payload(&payload) {
                     Ok(()) => {}
                     Err(error) if is_would_block_error(&error) => return Err(error),
@@ -2103,6 +2168,69 @@ where
             self.sequence.commit_inbound()?;
             return Ok(payload);
         }
+    }
+
+    /// Takes the application packet that [`Self::advance_rekey`] retained, if
+    /// any, applying the same authentication boundary as the dispatch tail.
+    ///
+    /// The packet was read but not committed, so this is the single place that
+    /// commits it. Returning it before any other read keeps the peer's arrival
+    /// order, and `None` means nothing is retained.
+    fn take_retained_in_flight_application(
+        &mut self,
+        allow_application: bool,
+    ) -> Option<Result<Vec<u8>, ServerTransportError>> {
+        let payload = self.pending_in_flight_application.take()?;
+        if !allow_application
+            && !is_authentication_message(payload.first().copied().unwrap_or_default())
+        {
+            self.established = false;
+            let _ = self.sequence.fail_rekey();
+            return Some(Err(ServerTransportError::UnauthenticatedMessage));
+        }
+        if let Err(error) = self.sequence.commit_inbound() {
+            return Some(Err(error.into()));
+        }
+        Some(Ok(payload))
+    }
+
+    /// Reports whether an inbound packet may be delivered as application data
+    /// while this server's rekey is waiting for the peer's `KEXINIT`.
+    ///
+    /// RFC 4253 §7.1 requires each party, after sending a `KEXINIT` for a key
+    /// re-exchange, to "process an arbitrary number of messages that may be
+    /// in-flight before receiving a `SSH_MSG_KEXINIT` message from the other
+    /// party". The stream is ordered, so every message the peer sent before its
+    /// own `KEXINIT` arrives before that `KEXINIT`, and the window closes the
+    /// moment the peer proposal is recorded. The provision is specific to
+    /// re-exchange: an initial exchange has no established application data,
+    /// and its stricter policy is unchanged.
+    ///
+    /// The rekey state machine keeps ownership of the transport messages
+    /// (`SSH_MSG_DISCONNECT`, `SSH_MSG_IGNORE`, `SSH_MSG_DEBUG`,
+    /// `SSH_MSG_UNIMPLEMENTED`, `SSH_MSG_KEXINIT`, `SSH_MSG_NEWKEYS`, and the
+    /// 30-49 method range), and the keepalive extension messages 192/193 are
+    /// not application data, so all of those keep their existing handling.
+    /// Everything else is an application packet: it is returned to the caller
+    /// through the ordinary dispatch tail, which still applies the
+    /// authentication boundary and commits its sequence number exactly once.
+    fn in_flight_application_allowed(&self, message_type: u8) -> bool {
+        let Some(state) = self.rekey.as_ref() else {
+            return false;
+        };
+        // The peer's proposal closes the window: after it, the sender rule of
+        // RFC 4253 §7.1 applies again and application data is a violation.
+        if state.peer_kexinit.is_some() {
+            return false;
+        }
+        !matches!(
+            message_type,
+            1..=4 | SSH_MSG_KEXINIT
+                | SSH_MSG_NEWKEYS
+                | SSH_MSG_KEX_METHOD_FIRST..=SSH_MSG_KEX_METHOD_LAST
+                | neotales_ssh::keepalive::SSH_MSG_PING
+                | neotales_ssh::keepalive::SSH_MSG_PONG
+        )
     }
 
     fn process_rekey_payload(&mut self, payload: &[u8]) -> Result<(), ServerTransportError> {
@@ -2573,6 +2701,7 @@ where
         self.read_protector = None;
         self.write_protector = None;
         self.rekey = None;
+        self.pending_in_flight_application = None;
         self.established = false;
         error
     }
@@ -2580,6 +2709,7 @@ where
     fn fail_rekey_closed(&mut self, error: ServerTransportError) -> ServerTransportError {
         self.rekey = None;
         self.write_buffer.abort();
+        self.pending_in_flight_application = None;
         self.established = false;
         let _ = self.sequence.fail_rekey();
         error
