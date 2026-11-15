@@ -375,6 +375,27 @@ fn peer_completes_raw_mlkem_rekey(
     expected_key: &Ed25519PublicKey,
     client_kex: MlKemClientKex,
 ) -> Result<DerivedKeys, Box<dyn std::error::Error>> {
+    server.advance_rekey()?;
+    peer_completes_after_server_method(
+        peer,
+        server_kexinit,
+        client_kexinit_payload,
+        session_id,
+        expected_key,
+        client_kex,
+    )
+}
+
+/// Completes the peer side once the server has already processed the init
+/// message, which is what a direct `read_payload` call does internally.
+fn peer_completes_after_server_method(
+    peer: &mut RawPeer<Stream<'_>>,
+    server_kexinit: &[u8],
+    client_kexinit_payload: &[u8],
+    session_id: &[u8],
+    expected_key: &Ed25519PublicKey,
+    client_kex: MlKemClientKex,
+) -> Result<DerivedKeys, Box<dyn std::error::Error>> {
     let context = KexContext::new(
         &peer.client_version,
         &peer.server_version,
@@ -382,7 +403,6 @@ fn peer_completes_raw_mlkem_rekey(
         server_kexinit,
         KEX_MLKEM768X25519_SHA256,
     )?;
-    server.advance_rekey()?;
     let reply = peer.receive_protected()?;
     assert_eq!(reply.first(), Some(&31));
     let completion = client_kex.complete(&context, &reply)?;
@@ -903,6 +923,192 @@ fn server_rekey_discards_the_packet_after_a_wrong_guess() -> Result<(), Box<dyn 
         peer.send_application(&[50, 8])?;
         assert_eq!(server.read_auth_packet()?, [50, 8]);
     }
+    Ok(())
+}
+
+#[test]
+fn server_read_waits_for_the_callers_partial_write_then_answers_a_ping()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(83);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let (mut server, mut peer) =
+        complete_raw_initial_with_write_gate(&config, expected_key, true, Rc::clone(&gate))?;
+    server.mark_authenticated();
+
+    // The caller owns a half-written packet.
+    gate.borrow_mut().arm(3);
+    assert!(matches!(
+        server.write_payload(&[94, 1]),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    let outbound_before = server.outbound_sequence();
+    let inbound_before = server.inbound_sequence();
+
+    // A ping arrives. Reading it would have to queue and write a PONG behind
+    // the caller's packet, and that write cannot be reordered, so nothing is
+    // read at all: no state, no packet, no counter moves.
+    let ping = TransportPing::Ping(b"n".to_vec()).encode()?;
+    peer.send_application(&ping)?;
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::RekeyInProgress)
+    ));
+    assert!(server.is_established());
+    assert_eq!(server.inbound_sequence(), inbound_before);
+    assert_eq!(server.outbound_sequence(), outbound_before);
+
+    // Finishing the caller's packet frees the transport; the ping is then read
+    // and answered behind it, in that order.
+    gate.borrow_mut().open();
+    server.write_payload(&[94, 1])?;
+    assert_eq!(server.outbound_sequence(), outbound_before + 1);
+    assert_eq!(peer.receive_protected()?, [94, 1]);
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert_eq!(server.inbound_sequence(), inbound_before + 1);
+    assert_eq!(
+        peer.receive_protected()?,
+        TransportPing::Pong(b"n".to_vec()).encode()?
+    );
+    Ok(())
+}
+
+#[test]
+fn server_peer_kexinit_waits_for_the_callers_partial_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(84);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let (mut server, mut peer) =
+        complete_raw_initial_with_write_gate(&config, expected_key, true, Rc::clone(&gate))?;
+    let original_session_id = server.session_id().to_vec();
+    server.mark_authenticated();
+
+    gate.borrow_mut().arm(3);
+    assert!(matches!(
+        server.write_payload(&[94, 1]),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    let outbound_before = server.outbound_sequence();
+    let inbound_before = server.inbound_sequence();
+
+    // A peer-initiated rekey arrives while the caller's packet is half sent.
+    // The fixture writes the proposal without advancing its own KEX state,
+    // because the exchange has not started on this side either.
+    let mut client_kexinit = proposal(KEX_MLKEM768X25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    client_kexinit.cookie = [0x8f; 16];
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_application(&client_kexinit_payload)?;
+
+    // The KEXINIT is not read: consuming it would start an exchange whose local
+    // KEXINIT cannot be written behind the caller's packet.
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::RekeyInProgress)
+    ));
+    assert!(!server.rekey_active());
+    assert_eq!(server.inbound_sequence(), inbound_before);
+    assert_eq!(server.outbound_sequence(), outbound_before);
+    assert!(server.is_established());
+
+    // The caller's packet goes first; the server KEXINIT follows it.
+    gate.borrow_mut().open();
+    server.write_payload(&[94, 1])?;
+    assert_eq!(peer.receive_protected()?, [94, 1]);
+    // The peer's proposal is already sent, so its policy enters the cycle at
+    // the method phase and waits for the server proposal.
+    peer.sequence
+        .begin_rekey_direction(sequence::Direction::Outbound)?;
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(server.rekey_active());
+    assert_eq!(server.inbound_sequence(), inbound_before + 1);
+    assert_eq!(
+        server.outbound_sequence(),
+        outbound_before + 2,
+        "the caller's packet and then the server KEXINIT"
+    );
+    let server_kexinit = peer.receive_protected()?;
+    assert_eq!(server_kexinit.first(), Some(&20));
+
+    // The exchange completes normally from there.
+    let client_kex = peer_sends_raw_mlkem_init(&mut peer, 0x91)?;
+    let derived = peer_completes_raw_mlkem_rekey(
+        &mut server,
+        &mut peer,
+        &server_kexinit,
+        &client_kexinit_payload,
+        &original_session_id,
+        &expected_key,
+        client_kex,
+    )?;
+    server.advance_rekey()?;
+    assert!(!server.rekey_active());
+    peer.install_rekey_protectors(&derived)?;
+    peer.send_application(&[50, 2])?;
+    assert_eq!(server.read_auth_packet()?, [50, 2]);
+    Ok(())
+}
+
+#[test]
+fn server_read_payload_discards_the_packet_after_a_wrong_guess()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(85);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, true)?;
+    let original_session_id = server.session_id().to_vec();
+    server.mark_authenticated();
+
+    server.begin_rekey()?;
+    peer.begin_rekey()?;
+    let server_kexinit = peer.receive_protected()?;
+    assert_eq!(server_kexinit.first(), Some(&20));
+    let client_kexinit = wrong_guess_proposal([0x93; 16]);
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_rekey(&client_kexinit_payload, 20)?;
+
+    // One direct read consumes both packets the peer sent: the optimistic
+    // packet is discarded by the guard, the real method is processed, and the
+    // read then blocks with nothing left.
+    let inbound_before = server.inbound_sequence();
+    peer.send_application(&[200, 1, 2, 3])?;
+    let client_kex = peer_sends_raw_mlkem_init(&mut peer, 0x94)?;
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(server.rekey_active());
+    assert_eq!(
+        server.inbound_sequence(),
+        inbound_before + 3,
+        "KEXINIT, the discarded packet and the method, one commit each"
+    );
+    let derived = peer_completes_after_server_method(
+        &mut peer,
+        &server_kexinit,
+        &client_kexinit_payload,
+        &original_session_id,
+        &expected_key,
+        client_kex,
+    )?;
+    server.advance_rekey()?;
+    assert!(!server.rekey_active());
+    peer.install_rekey_protectors(&derived)?;
+    peer.send_application(&[50, 9])?;
+    assert_eq!(server.read_auth_packet()?, [50, 9]);
     Ok(())
 }
 

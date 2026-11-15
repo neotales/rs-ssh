@@ -197,11 +197,22 @@ pub enum ServerTransportError {
     UnsupportedAlgorithm,
     /// A host-key operation failed during rekeying.
     HostKey(HostKeyError),
-    /// The transport cannot proceed with this operation now: an application
-    /// write or another `advance_rekey` step while a rekey is active,
-    /// `begin_rekey` while a protected packet is partly written and waiting for
-    /// the caller's own `write_payload` retry, or `advance_rekey` while it holds
-    /// a retained inbound payload. Read or finish the pending work, then retry.
+    /// The transport cannot proceed with this operation now, and it has not
+    /// changed: an application write or another `advance_rekey` step while a
+    /// rekey is active, `begin_rekey` while a protected write is partly sent,
+    /// `advance_rekey` while it holds a retained inbound payload, or a read
+    /// while the caller's own protected write is partly sent (a read could need
+    /// a write that cannot be reordered behind it).
+    ///
+    /// Whether the transport survives is [`ServerTransport::is_established`],
+    /// and a caller that retries must check it. The four refusals above leave the
+    /// transport usable and untouched, so finishing the pending write, read, or
+    /// exchange and retrying works. A reentrant [`ServerTransport::begin_rekey`],
+    /// a broken KEX-state invariant, and the `test-support`
+    /// `write_rekey_ignorable` refusal after this server's NEWKEYS report this
+    /// variant after failing the transport closed: callers that treat it as
+    /// fatal keep working, and callers that continue must recheck the
+    /// transport.
     RekeyInProgress,
 }
 
@@ -1620,10 +1631,15 @@ where
     /// that a nonblocking stream stopped part-way through cannot be reordered
     /// ahead of one. If the stream cannot take the rest of it yet, this returns
     /// the I/O error with no rekey state touched, and a retry resumes the same
-    /// bytes. A partially written packet that is not the transport's own reply
+    /// bytes. A partly written packet that is not the transport's own reply
     /// (an application write waiting for its retry) makes this return
     /// [`ServerTransportError::RekeyInProgress`] for the same reason, also
     /// without touching rekey state.
+    ///
+    /// A partial write of the KEXINIT itself is not one of those refusals: the
+    /// exchange is already active when that write starts, so this returns the
+    /// I/O error with the KEXINIT pending and the caller finishes it through
+    /// [`Self::advance_rekey`].
     ///
     /// # Errors
     ///
@@ -1764,10 +1780,15 @@ where
     /// way to resume the convenience form, which is why the staged API exists.
     ///
     /// A keepalive PONG owed to an earlier ping is written before the KEXINIT,
-    /// as [`Self::begin_rekey`] documents. On a nonblocking stream that cannot
-    /// take the rest of a partly written packet, this returns that I/O error
-    /// after `begin_rekey` refuses without touching rekey state, so no exchange
-    /// has started; retrying after the stream drains resumes the same bytes.
+    /// and a protected packet the caller left partly written makes the start
+    /// refuse; neither leaves an exchange behind, so a retry after that work
+    /// completes starts from the same place.
+    ///
+    /// A `WouldBlock` from the KEXINIT write itself is different: the exchange
+    /// is already active when that write starts, and the server KEXINIT is
+    /// partly written. This form cannot be retried, because [`Self::begin_rekey`]
+    /// fails closed on an active exchange; finish the KEXINIT with
+    /// [`Self::advance_rekey`] and continue from there.
     ///
     /// # Errors
     ///
@@ -1811,7 +1832,11 @@ where
     ///
     /// Returns [`ServerTransportError::NotEstablished`] before NEWKEYS,
     /// transport/protection errors for invalid input, rekey errors for a
-    /// peer-initiated exchange, and [`ServerTransportError::UnauthenticatedMessage`]
+    /// peer-initiated exchange,
+    /// [`ServerTransportError::RekeyInProgress`] while a protected packet the
+    /// caller started is still partly written (nothing is read until it is
+    /// finished, for the reason [`Self::read_payload`] gives), and
+    /// [`ServerTransportError::UnauthenticatedMessage`]
     /// for a valid protected application packet whose type is not an
     /// authentication request.
     pub fn read_auth_packet(&mut self) -> Result<Vec<u8>, ServerTransportError> {
@@ -1846,6 +1871,13 @@ where
     /// finishes it with the old keys, or returns the I/O error without touching
     /// rekey state so the caller can retry, because RFC 4253 §7.1 forbids sending
     /// it after this server's `KEXINIT`.
+    ///
+    /// While a protected packet the caller started is still partly written,
+    /// nothing is read: an inbound packet can itself need a write (a peer
+    /// `KEXINIT`, a ping reply, a KEX reply), and that write cannot be reordered
+    /// behind the pending one. This returns
+    /// [`ServerTransportError::RekeyInProgress`] with the transport unchanged;
+    /// finish the packet with [`Self::write_payload`] and read again.
     ///
     /// # Errors
     ///
@@ -2217,6 +2249,16 @@ where
                     Err(error) if is_would_block_error(&error) => return Err(error),
                     Err(error) => return Err(self.fail_rekey_closed(error)),
                 }
+            }
+            // A protected packet the caller owns is still partly written. Any
+            // inbound packet can need a write of its own — a peer KEXINIT starts
+            // an exchange with a local KEXINIT, a ping queues a PONG, a KEX
+            // method and NEWKEYS answer themselves — and that write cannot be
+            // reordered behind the pending one, so nothing is read until the
+            // caller finishes its packet. The reply and rekey writes above are
+            // the transport's own and have already been resumed or reported.
+            if self.write_buffer.is_pending() {
+                return Err(ServerTransportError::RekeyInProgress);
             }
             let payload = match self.read_protected_packet_uncommitted() {
                 Ok(payload) => payload,
