@@ -1034,6 +1034,7 @@ mod tests {
 
     #[test]
     fn pinned_builder_authenticates_public_key() -> Result<(), ClientError> {
+        let _serial = crate::test_serial::port_and_spawn();
         let host_signer = crate::hostkey::Ed25519Signer::from_seed(&mut [7; 32]);
         let pin = host_signer.public_key().to_blob()?;
         let user_signer = crate::hostkey::Ed25519Signer::from_seed(&mut [8; 32]);
@@ -1087,6 +1088,7 @@ mod tests {
             }
             return Ok(());
         }
+        let _serial = crate::test_serial::port_and_spawn();
         for (user, logname, expected) in [
             ("first", "second", "first"),
             ("", "second", "second"),
@@ -1114,6 +1116,7 @@ mod tests {
             assert!(error.to_string().contains("agent unavailable"), "{error}");
             return Ok(());
         }
+        let _serial = crate::test_serial::port_and_spawn();
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let status = std::process::Command::new(std::env::current_exe()?)

@@ -653,6 +653,7 @@ mod tests {
     // all listening, accepting, copying and cancellation use real loopback TCP.
     #[test]
     fn local_listener_splices_one_byte_each_way() -> Result<(), Box<dyn std::error::Error>> {
+        let _serial = crate::test_serial::port_and_spawn();
         let (mut client, mut server) = connections();
         assert!(LocalListener::bind("localhost", 0, b"destination", 80).is_err());
         assert!(LocalListener::bind("", 0, b"destination", 80).is_err());
@@ -721,6 +722,7 @@ mod tests {
     #[test]
     fn reverse_two_connections_copy_independently_and_cancel_or_drop_closes_both()
     -> Result<(), Box<dyn std::error::Error>> {
+        let _serial = crate::test_serial::port_and_spawn();
         for cancel in [false, true] {
             let (mut server, mut client) = connections();
             let mut listener = ReverseListener::bind("127.0.0.1", 0)?;
@@ -805,6 +807,7 @@ mod tests {
     #[test]
     fn local_cancel_before_confirmation_closes_late_open() -> Result<(), Box<dyn std::error::Error>>
     {
+        let _serial = crate::test_serial::port_and_spawn();
         let (mut client, mut server) = connections();
         let mut listener = LocalListener::bind("127.0.0.1", 0, b"destination", 80)?;
         let address = listener.local_addr()?;
@@ -836,6 +839,7 @@ mod tests {
 
     #[test]
     fn reverse_listener_accepts_two_connections() -> Result<(), Box<dyn std::error::Error>> {
+        let _serial = crate::test_serial::port_and_spawn();
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let mut connection = ChannelConnection::new(MemoryTransport {
             incoming: queue.clone(),
@@ -857,6 +861,7 @@ mod tests {
 
     #[test]
     fn explicit_bind_cancel_and_drop_release_the_port() -> io::Result<()> {
+        let _serial = crate::test_serial::port_and_spawn();
         assert_eq!(
             ReverseListener::bind("", 0).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
@@ -879,6 +884,7 @@ mod tests {
 
     #[test]
     fn wire_cancel_requires_exact_binding() -> Result<(), Box<dyn std::error::Error>> {
+        let _serial = crate::test_serial::port_and_spawn();
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let mut connection = ChannelConnection::new(MemoryTransport {
             incoming: queue.clone(),
@@ -913,6 +919,7 @@ mod tests {
     // the TCP listener and destination are real loopback sockets, not mocks.
     #[test]
     fn one_byte_each_way() -> Result<(), Box<dyn std::error::Error>> {
+        let _serial = crate::test_serial::port_and_spawn();
         let incoming = Rc::new(RefCell::new(VecDeque::new()));
         let outgoing = Rc::new(RefCell::new(VecDeque::new()));
         let mut server = ChannelConnection::new(MemoryTransport {

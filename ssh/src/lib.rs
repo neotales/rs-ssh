@@ -391,3 +391,32 @@ pub use wire::{
     decode_name_list, decode_string, decode_uint32, decode_uint64, encode_boolean, encode_byte,
     encode_mpint, encode_name_list, encode_string, encode_uint32, encode_uint64,
 };
+
+/// Process-wide serialization for tests that bind loopback TCP ports or
+/// re-exec the test binary.
+///
+/// The kernel may hand a just-released ephemeral port to any other binder in
+/// the network namespace, and a forked child keeps a copy of the parent's
+/// listening sockets until its `exec` closes them. Both windows make a
+/// port-release assertion unreliable when another test runs at the same time,
+/// so those tests hold this lock for their whole body. It is test-only and
+/// changes no production behaviour.
+#[cfg(test)]
+pub(crate) mod test_serial {
+    use std::sync::Mutex;
+    use std::sync::MutexGuard;
+    use std::sync::OnceLock;
+    use std::sync::PoisonError;
+
+    static PORT_AND_SPAWN: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// Serializes loopback-port tests against each other and against tests
+    /// that fork a child process. Poisoning is ignored: a failed test must not
+    /// turn every later test into a second failure.
+    pub(crate) fn port_and_spawn() -> MutexGuard<'static, ()> {
+        PORT_AND_SPAWN
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
