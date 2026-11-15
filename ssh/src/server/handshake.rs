@@ -200,18 +200,21 @@ pub enum ServerTransportError {
     /// The transport refused this operation, and
     /// [`ServerTransport::is_established`] tells the two outcomes apart.
     ///
-    /// Recoverable, with the transport untouched: an application write or
-    /// another `advance_rekey` step while a rekey is active, `begin_rekey` while
-    /// a protected write is partly sent, `advance_rekey` while it holds a
-    /// retained inbound payload, or a read while the caller's own protected
-    /// write is partly sent (a read could need a write that cannot be reordered
-    /// behind it). Finish the pending write, read, or exchange, then retry.
+    /// Recoverable, with the transport untouched: an application write while a
+    /// rekey is active, `begin_rekey` while the caller's own protected write is
+    /// partly sent, `advance_rekey` while a retained inbound payload must be
+    /// read first (an active exchange on its own does not refuse that step), or
+    /// a read while the caller's own protected write is partly sent (a read
+    /// could need a write that cannot be reordered behind it). Finish the
+    /// pending write, read, or exchange, then retry.
     ///
     /// Fail-closed, with the transport dead: a reentrant
-    /// [`ServerTransport::begin_rekey`], a broken KEX-state invariant, and the
-    /// `test-support` `write_rekey_ignorable` refusal after this server's
-    /// NEWKEYS. Callers that treat the variant as fatal keep working; callers
-    /// that continue must recheck the transport.
+    /// [`ServerTransport::begin_rekey`] whose pending packet is not a partly
+    /// written `KEXINIT` (that case resumes the write and reports what the write
+    /// returns), a broken KEX-state invariant, and the `test-support`
+    /// `write_rekey_ignorable` refusal after this server's NEWKEYS. Callers that
+    /// treat the variant as fatal keep working; callers that continue must
+    /// recheck the transport.
     RekeyInProgress,
 }
 
@@ -2023,6 +2026,10 @@ where
     }
 
     /// Writes one protected authentication-boundary packet.
+    ///
+    /// A partial write follows [`Self::write_payload`]'s contract: the retry
+    /// must carry the same payload bytes to finish the packet already on the
+    /// wire, and different bytes fail the transport closed.
     ///
     /// # Errors
     ///
