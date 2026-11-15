@@ -927,6 +927,64 @@ fn server_rekey_discards_the_packet_after_a_wrong_guess() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn server_write_retry_requires_the_same_payload() -> Result<(), Box<dyn std::error::Error>> {
+    // The same bytes resume the packet that is already partly on the wire.
+    {
+        let signer = signer(86);
+        let expected_key = *signer.public_key();
+        let config = ServerConfig::new(signer);
+        let gate = Rc::new(RefCell::new(WriteGate::default()));
+        let (mut server, mut peer) =
+            complete_raw_initial_with_write_gate(&config, expected_key, true, Rc::clone(&gate))?;
+        gate.borrow_mut().arm(3);
+        assert!(matches!(
+            server.write_payload(&[94, 1, 2]),
+            Err(ServerTransportError::Transport(TransportError::Io(error)))
+                if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        gate.borrow_mut().open();
+        server.write_payload(&[94, 1, 2])?;
+        assert_eq!(peer.receive_protected()?, [94, 1, 2]);
+        assert!(server.is_established());
+    }
+
+    // Different bytes are a caller error: a half-sent packet cannot be
+    // discarded, so the retry poisons the write buffer and fails closed.
+    {
+        let signer = signer(87);
+        let expected_key = *signer.public_key();
+        let config = ServerConfig::new(signer);
+        let gate = Rc::new(RefCell::new(WriteGate::default()));
+        let (mut server, _peer) =
+            complete_raw_initial_with_write_gate(&config, expected_key, true, Rc::clone(&gate))?;
+        gate.borrow_mut().arm(3);
+        assert!(matches!(
+            server.write_payload(&[94, 1, 2]),
+            Err(ServerTransportError::Transport(TransportError::Io(error)))
+                if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert!(matches!(
+            server.write_payload(&[94, 1, 3]),
+            Err(ServerTransportError::Transport(
+                TransportError::InvalidMessage
+            ))
+        ));
+        assert!(!server.is_established());
+        // Both directions are unusable afterwards, which is what failing closed
+        // means here.
+        assert!(matches!(
+            server.read_payload(),
+            Err(ServerTransportError::NotEstablished)
+        ));
+        assert!(matches!(
+            server.write_payload(&[94, 1, 3]),
+            Err(ServerTransportError::NotEstablished)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
 fn server_read_waits_for_the_callers_partial_write_then_answers_a_ping()
 -> Result<(), Box<dyn std::error::Error>> {
     let signer = signer(83);

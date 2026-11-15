@@ -197,22 +197,21 @@ pub enum ServerTransportError {
     UnsupportedAlgorithm,
     /// A host-key operation failed during rekeying.
     HostKey(HostKeyError),
-    /// The transport cannot proceed with this operation now, and it has not
-    /// changed: an application write or another `advance_rekey` step while a
-    /// rekey is active, `begin_rekey` while a protected write is partly sent,
-    /// `advance_rekey` while it holds a retained inbound payload, or a read
-    /// while the caller's own protected write is partly sent (a read could need
-    /// a write that cannot be reordered behind it).
+    /// The transport refused this operation, and
+    /// [`ServerTransport::is_established`] tells the two outcomes apart.
     ///
-    /// Whether the transport survives is [`ServerTransport::is_established`],
-    /// and a caller that retries must check it. The four refusals above leave the
-    /// transport usable and untouched, so finishing the pending write, read, or
-    /// exchange and retrying works. A reentrant [`ServerTransport::begin_rekey`],
-    /// a broken KEX-state invariant, and the `test-support`
-    /// `write_rekey_ignorable` refusal after this server's NEWKEYS report this
-    /// variant after failing the transport closed: callers that treat it as
-    /// fatal keep working, and callers that continue must recheck the
-    /// transport.
+    /// Recoverable, with the transport untouched: an application write or
+    /// another `advance_rekey` step while a rekey is active, `begin_rekey` while
+    /// a protected write is partly sent, `advance_rekey` while it holds a
+    /// retained inbound payload, or a read while the caller's own protected
+    /// write is partly sent (a read could need a write that cannot be reordered
+    /// behind it). Finish the pending write, read, or exchange, then retry.
+    ///
+    /// Fail-closed, with the transport dead: a reentrant
+    /// [`ServerTransport::begin_rekey`], a broken KEX-state invariant, and the
+    /// `test-support` `write_rekey_ignorable` refusal after this server's
+    /// NEWKEYS. Callers that treat the variant as fatal keep working; callers
+    /// that continue must recheck the transport.
     RekeyInProgress,
 }
 
@@ -1343,6 +1342,18 @@ where
 /// An integrity or unrecoverable protected-framing failure discards both key
 /// contexts and pending packets. Subsequent reads and writes fail without
 /// touching the stream. Short reads and `WouldBlock` preserve resumable state.
+///
+/// # Nonblocking use
+///
+/// A partly written protected packet owns the stream until the caller finishes
+/// it by calling [`Self::write_payload`] again with the same bytes; different
+/// bytes fail the transport closed. While it is pending, reads are refused
+/// rather than consuming a packet that may need a write of its own. The caller
+/// must therefore guarantee that its pending write can progress without this
+/// transport reading, or two backed-up directions stall against each other.
+/// This is not general full-duplex support and carries no total-liveness
+/// promise; see [`Self::read_payload`] and [`Self::begin_rekey`] for the
+/// recoverable refusals.
 pub struct ServerTransport<S> {
     compression_policy: crate::transport::CompressionPolicy,
     stream: S,
@@ -1469,6 +1480,9 @@ where
     }
 
     /// Sends an OpenSSH transport ping without starting a timer.
+    ///
+    /// A partial write follows [`Self::write_payload`]'s retry rule: retry with
+    /// the same bytes, or the transport fails closed.
     ///
     /// # Errors
     /// Returns a payload bound, transport, or protection error.
@@ -1670,7 +1684,9 @@ where
     /// rekey is normally consumed by [`Self::read_auth_packet`] or
     /// [`Self::read_payload`] instead. Protected-packet bytes are retained by
     /// the transport, so a staged caller may retry after `WouldBlock` at any
-    /// packet boundary or in the middle of a packet.
+    /// packet boundary or in the middle of a packet, and the retry resumes the
+    /// same packet. The rekey writes are the transport's own, so unlike
+    /// [`Self::write_payload`] there is no payload for the caller to repeat.
     ///
     /// RFC 4253 §7.1 lets application data that the peer sent before its own
     /// rekey `KEXINIT` arrive while the exchange is open. At most one such
@@ -1877,12 +1893,25 @@ where
     /// `KEXINIT`, a ping reply, a KEX reply), and that write cannot be reordered
     /// behind the pending one. This returns
     /// [`ServerTransportError::RekeyInProgress`] with the transport unchanged;
-    /// finish the packet with [`Self::write_payload`] and read again.
+    /// finish the packet with [`Self::write_payload`] and read again. That step
+    /// needs the same payload bytes, as [`Self::write_payload`] documents, so
+    /// the caller keeps the bytes it was writing.
+    ///
+    /// This is a restriction on nonblocking use, not general full-duplex
+    /// support. The caller must guarantee that its pending write can make
+    /// progress without this transport reading — in practice that the peer keeps
+    /// reading — or two fully backed-up directions stall until one side does.
+    /// The transport makes no total-liveness promise for that case: it never
+    /// discards or reorders the pending packet, and it runs no scheduler that
+    /// could interleave the two directions.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::read_auth_packet`] before
-    /// authentication, or a transport/protection/sequence error afterwards.
+    /// authentication, a transport/protection/sequence error afterwards, and
+    /// [`ServerTransportError::RekeyInProgress`] while a protected packet the
+    /// caller started is still partly written. That refusal consumes nothing;
+    /// finish the write with [`Self::write_payload`] and read again.
     pub fn read_payload(&mut self) -> Result<Vec<u8>, ServerTransportError> {
         self.read_dispatch_payload(self.authenticated)
     }
@@ -1895,12 +1924,24 @@ where
     /// while the old keys are still installed. Consuming the peer's in-flight
     /// application data does not lift this restriction.
     ///
+    /// A nonblocking stream can accept only part of a packet. That leaves the
+    /// exact packet pending, and the next call must pass **the same payload
+    /// bytes**: the retry finishes the packet already on the wire instead of
+    /// sealing a new one. Different bytes, or a different length, are a caller
+    /// error rather than a second packet: the write buffer is poisoned and the
+    /// transport fails closed, because a half-sent packet cannot be discarded
+    /// without corrupting the stream. [`Self::send_ping`] forwards the same rule,
+    /// and a partial write also stops reads until it is finished, which
+    /// [`Self::read_payload`] describes.
+    ///
     /// # Errors
     ///
     /// Returns [`ServerTransportError::NotEstablished`] before NEWKEYS,
     /// [`ServerTransportError::RekeyInProgress`] during rekey,
     /// [`ServerTransportError::Transport`] for framing, protection, I/O, or
     /// sequence failures, and rejects an empty payload as an invalid message.
+    /// A retry whose bytes differ from the pending packet fails closed with
+    /// [`TransportError::InvalidMessage`].
     pub fn write_payload(&mut self, payload: &[u8]) -> Result<(), ServerTransportError> {
         if !self.established {
             return Err(ServerTransportError::NotEstablished);
