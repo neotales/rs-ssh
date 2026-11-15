@@ -1313,9 +1313,9 @@ pub(crate) enum PlaintextSlot {
     ClearPacket,
     /// The payload a transport keeps to recognise a retried write.
     PendingPayload,
-    /// An application payload a server transport retains across a rekey
-    /// (RFC 4253 §7.1) until a read method returns it.
-    InFlightPayload,
+    /// A payload a server transport retains across a rekey (RFC 4253 §7.1)
+    /// until a read method returns it.
+    RetainedInbound,
 }
 
 /// The size of the wipe-witness table, taken from the last slot.
@@ -1324,7 +1324,7 @@ pub(crate) enum PlaintextSlot {
 /// range is a test that panics rather than a record that overwrites another
 /// site's.
 #[cfg(test)]
-const PLAINTEXT_SLOT_COUNT: usize = PlaintextSlot::InFlightPayload as usize + 1;
+const PLAINTEXT_SLOT_COUNT: usize = PlaintextSlot::RetainedInbound as usize + 1;
 
 /// What one [`PlaintextBytes`] destructor found.
 ///
