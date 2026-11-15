@@ -197,11 +197,11 @@ pub enum ServerTransportError {
     UnsupportedAlgorithm,
     /// A host-key operation failed during rekeying.
     HostKey(HostKeyError),
-    /// An application write, or another `advance_rekey` step, was refused
-    /// while a rekey was active. `advance_rekey` also returns this while it
-    /// holds an in-flight application packet: read it with
-    /// [`ServerTransport::read_payload`] or
-    /// [`ServerTransport::read_auth_packet`], then continue the exchange.
+    /// The transport cannot proceed with this operation now: an application
+    /// write or another `advance_rekey` step while a rekey is active,
+    /// `begin_rekey` while a protected packet is partly written and waiting for
+    /// the caller's own `write_payload` retry, or `advance_rekey` while it holds
+    /// a retained inbound payload. Read or finish the pending work, then retry.
     RekeyInProgress,
 }
 
@@ -224,7 +224,7 @@ impl fmt::Display for ServerTransportError {
                 write!(formatter, "SSH server rekey host-key error: {error}")
             }
             Self::RekeyInProgress => {
-                formatter.write_str("SSH server cannot proceed while a rekey is active")
+                formatter.write_str("SSH server cannot proceed with this operation now")
             }
         }
     }
@@ -1615,10 +1615,21 @@ where
     /// [`Self::rekey`] to complete the exchange. Curve25519, NIST P-256/P-384/P-521,
     /// group16-SHA512, group-exchange-SHA256 and ML-KEM768/X25519 are supported.
     ///
+    /// A keepalive PONG owed to an earlier ping is written first, with the old
+    /// keys: RFC 4253 §7.1 forbids sending it after this KEXINIT, and a packet
+    /// that a nonblocking stream stopped part-way through cannot be reordered
+    /// ahead of one. If the stream cannot take the rest of it yet, this returns
+    /// the I/O error with no rekey state touched, and a retry resumes the same
+    /// bytes. A partially written packet that is not the transport's own reply
+    /// (an application write waiting for its retry) makes this return
+    /// [`ServerTransportError::RekeyInProgress`] for the same reason, also
+    /// without touching rekey state.
+    ///
     /// # Errors
     ///
     /// Returns a transport, negotiation, KEX, or sequence error. A reentrant
-    /// or otherwise invalid transition terminally fails the rekey policy.
+    /// or otherwise invalid transition terminally fails the rekey policy. The
+    /// two refusals above are recoverable.
     pub fn begin_rekey(&mut self) -> Result<(), ServerTransportError> {
         self.begin_rekey_internal()
     }
@@ -1752,6 +1763,12 @@ where
     /// and [`Self::begin_rekey`] fails closed on an active exchange. There is no
     /// way to resume the convenience form, which is why the staged API exists.
     ///
+    /// A keepalive PONG owed to an earlier ping is written before the KEXINIT,
+    /// as [`Self::begin_rekey`] documents. On a nonblocking stream that cannot
+    /// take the rest of a partly written packet, this returns that I/O error
+    /// after `begin_rekey` refuses without touching rekey state, so no exchange
+    /// has started; retrying after the stream drains resumes the same bytes.
+    ///
     /// # Errors
     ///
     /// Returns the first transport, KEX, host-key, or sequence failure. The
@@ -1825,8 +1842,10 @@ where
     /// `KEXINIT` is outstanding (OpenSSH PROTOCOL §1.8). A received keepalive
     /// PONG is returned to the caller exactly as it is outside a rekey, because
     /// this transport surfaces replies rather than consuming them. A PONG owed
-    /// for an earlier ping is queued until the exchange completes, then flushed
-    /// with the new keys by the next read.
+    /// for an earlier ping is written before a rekey can start: [`Self::begin_rekey`]
+    /// finishes it with the old keys, or returns the I/O error without touching
+    /// rekey state so the caller can retry, because RFC 4253 §7.1 forbids sending
+    /// it after this server's `KEXINIT`.
     ///
     /// # Errors
     ///
@@ -2036,6 +2055,33 @@ where
         }
     }
 
+    /// Writes a transport reply that a keepalive ping queued, before a rekey can
+    /// start.
+    ///
+    /// RFC 4253 §7.1 forbids sending a non-KEX message after this server's
+    /// `KEXINIT`, so the reply goes first, with the old keys. A protected packet
+    /// that a nonblocking stream stopped part-way through stays exactly where it
+    /// is and the reply stays queued, so a retry resumes the same bytes rather
+    /// than restarting or reordering them. Any other failure has already closed
+    /// the transport through [`Self::write_payload`].
+    ///
+    /// The caller must guarantee that no rekey is active; [`Self::write_payload`]
+    /// would otherwise refuse the write.
+    fn flush_pending_transport_reply(&mut self) -> Result<(), ServerTransportError> {
+        let Some(reply) = self.pending_transport_reply.take() else {
+            return Ok(());
+        };
+        match self.write_payload(&reply) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if self.established {
+                    self.pending_transport_reply = Some(reply);
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn begin_rekey_internal(&mut self) -> Result<(), ServerTransportError> {
         if !self.established {
             return Err(ServerTransportError::NotEstablished);
@@ -2054,6 +2100,17 @@ where
                 };
             }
             return Err(self.fail_rekey_closed(ServerTransportError::RekeyInProgress));
+        }
+        // RFC 4253 §7.1 forbids a non-KEX message after this KEXINIT, and a
+        // protected packet that is already partly written cannot be reordered
+        // ahead of it, so nothing may be sent over a pending packet. A queued
+        // PONG is a packet this method can finish itself, with the old keys; any
+        // other partial packet belongs to the caller's own write retry. Both
+        // refusals happen before any rekey state is touched, so a retry keeps
+        // the same pending bytes and makes progress.
+        self.flush_pending_transport_reply()?;
+        if self.write_buffer.is_pending() {
+            return Err(ServerTransportError::RekeyInProgress);
         }
         if let Err(error) = self.ensure_rekey_supported() {
             return Err(self.fail_rekey_closed(error));
@@ -2137,12 +2194,13 @@ where
             if let Some(result) = self.take_retained_inbound_payload(allow_application) {
                 return result;
             }
-            // A queued transport PONG is written only when no rekey is active:
-            // RFC 4253 §7.1 forbids sending a non-KEX message after this
-            // server's KEXINIT, and OpenSSH queues rather than sends one
-            // ("During rekeying we can only send key exchange messages. Queue
-            // everything else." — packet.c, `ssh_packet_send2`). The first read
-            // after the exchange flushes it with the new keys.
+            // A queued transport PONG is flushed by the first read after the ping
+            // that queued it. An active rekey cannot coexist with one:
+            // `begin_rekey` either writes the reply with the old keys first or
+            // refuses without touching rekey state (RFC 4253 §7.1 forbids the
+            // send after this server's KEXINIT, and a partly written packet
+            // cannot be reordered). The condition is therefore an invariant
+            // guard, not the ordering mechanism.
             if self.rekey.is_none()
                 && let Some(reply) = self.pending_transport_reply.take()
                 && let Err(error) = self.write_payload(&reply)
@@ -2301,11 +2359,16 @@ where
     /// ignored", without regard to what the peer put in it. This runs before any
     /// type-based dispatch so generic, keepalive and method messages cannot take
     /// themselves out of that obligation, and it commits the sequence number
-    /// exactly once. The state is armed only by the peer's `KEXINIT`, and a
-    /// `SSH_MSG_DISCONNECT` is still processed: OpenSSH skips a packet only in
-    /// its dispatch table (dispatch.c, `dispatch_skip_packets`) and handles a
-    /// disconnect before any key-exchange bookkeeping (packet.c,
-    /// `ssh_packet_read_poll_seqnr`).
+    /// exactly once. An unrecognised message number is consumed the same way:
+    /// the requirement is about the packet, not about understanding it.
+    ///
+    /// `SSH_MSG_DISCONNECT` is a deliberate exception to that literal
+    /// requirement, and it is the only one. A disconnect ends the connection
+    /// whatever the key exchange is doing, and dropping it would leave a
+    /// half-dead transport until the peer's socket closes. OpenSSH orders it the
+    /// same way: its dispatch table does the skipping (dispatch.c,
+    /// `dispatch_skip_packets`) and a disconnect is handled before the table is
+    /// consulted (packet.c, `ssh_packet_read_poll_seqnr`).
     ///
     /// Returns whether a packet was consumed.
     fn discard_wrong_guess_packet(

@@ -838,6 +838,10 @@ fn server_rekey_discards_the_packet_after_a_wrong_guess() -> Result<(), Box<dyn 
     // Every class that reaches a type-based branch must be consumed by the
     // guess discard first, whatever the peer put in the optimistic packet.
     let optimistic_packets = [
+        // A message number this transport knows nothing about. Without the
+        // discard it is a protocol error after the peer's KEXINIT, so this is
+        // the case where "silently ignored" and "rejected" differ most.
+        vec![200, 1, 2, 3],
         vec![2, 0, 0, 0, 0],
         TransportPing::Ping(b"guess".to_vec()).encode()?,
         TransportPing::Pong(b"guess".to_vec()).encode()?,
@@ -845,7 +849,7 @@ fn server_rekey_discards_the_packet_after_a_wrong_guess() -> Result<(), Box<dyn 
         vec![30, 1, 2, 3],
     ];
     for (index, optimistic) in optimistic_packets.iter().enumerate() {
-        let seed = 70 + u8::try_from(index)?;
+        let seed = 90 + u8::try_from(index)?;
         let signer = signer(seed);
         let expected_key = *signer.public_key();
         let config = ServerConfig::new(signer);
@@ -874,6 +878,12 @@ fn server_rekey_discards_the_packet_after_a_wrong_guess() -> Result<(), Box<dyn 
         );
         assert!(server.is_established());
         assert!(server.rekey_active());
+        // Nothing was delivered either: the discard is not an application read.
+        assert!(matches!(
+            server.read_payload(),
+            Err(ServerTransportError::Transport(TransportError::Io(error)))
+                if error.kind() == io::ErrorKind::WouldBlock
+        ));
 
         // The real method still follows and completes the exchange, so the
         // discard consumed the optimistic packet and not the method.
@@ -893,6 +903,148 @@ fn server_rekey_discards_the_packet_after_a_wrong_guess() -> Result<(), Box<dyn 
         peer.send_application(&[50, 8])?;
         assert_eq!(server.read_auth_packet()?, [50, 8]);
     }
+    Ok(())
+}
+
+#[test]
+fn server_rekey_processes_a_disconnect_after_a_wrong_guess()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(80);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let (mut server, mut peer) = complete_raw_initial(&config, expected_key, true)?;
+
+    server.begin_rekey()?;
+    peer.begin_rekey()?;
+    assert_eq!(peer.receive_protected()?.first(), Some(&20));
+    let client_kexinit = wrong_guess_proposal([0x8c; 16]);
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_rekey(&client_kexinit_payload, 20)?;
+    server.advance_rekey()?;
+    assert!(server.rekey_active());
+
+    // RFC 4253 §7.1 says the packet after a wrong guess is "silently ignored".
+    // This transport deliberately excepts SSH_MSG_DISCONNECT from that literal
+    // requirement: dropping a disconnect would leave a half-dead connection
+    // until the peer's socket closed, and OpenSSH reads one before its skip
+    // counter can apply.
+    let disconnect = [1, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0];
+    peer.send_application(&disconnect)?;
+    assert!(matches!(
+        server.advance_rekey(),
+        Err(ServerTransportError::Transport(
+            TransportError::PeerDisconnected
+        ))
+    ));
+    assert!(!server.is_established());
+    assert!(server.rekey_is_terminal());
+    Ok(())
+}
+
+#[test]
+fn server_rekey_finishes_a_partial_pong_before_the_kexinit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = signer(81);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let (mut server, mut peer) =
+        complete_raw_initial_with_write_gate(&config, expected_key, true, Rc::clone(&gate))?;
+    let original_session_id = server.session_id().to_vec();
+    server.mark_authenticated();
+
+    // A ping queues a PONG, and this stream then stops part-way through it.
+    let pong = TransportPing::Pong(b"p".to_vec()).encode()?;
+    peer.send_application(&TransportPing::Ping(b"p".to_vec()).encode()?)?;
+    gate.borrow_mut().arm(3);
+    assert!(matches!(
+        server.read_payload(),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(server.is_established());
+    assert!(!server.rekey_active());
+
+    // Starting the exchange must not jump the half-written packet. The reply is
+    // this transport's own packet, so the start finishes it first and, while
+    // the stream still has no room, returns the I/O error with no rekey state
+    // created and the same bytes pending.
+    assert!(matches!(
+        server.begin_rekey(),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(!server.rekey_active());
+    assert!(server.is_established());
+
+    // Once the stream drains, the retry completes the PONG and only then sends
+    // the KEXINIT, in that order.
+    gate.borrow_mut().open();
+    server.begin_rekey()?;
+    assert!(server.rekey_active());
+    assert_eq!(peer.receive_protected()?, pong);
+    peer.begin_rekey()?;
+    let server_kexinit = peer.receive_protected()?;
+    assert_eq!(server_kexinit.first(), Some(&20));
+
+    let mut client_kexinit = proposal(KEX_MLKEM768X25519_SHA256, AES128_CTR, HMAC_SHA2_256, false);
+    client_kexinit.cookie = [0x8d; 16];
+    let client_kexinit_payload = client_kexinit.encode()?;
+    peer.send_rekey(&client_kexinit_payload, 20)?;
+    server.advance_rekey()?;
+    let client_kex = peer_sends_raw_mlkem_init(&mut peer, 0x8e)?;
+    let derived = peer_completes_raw_mlkem_rekey(
+        &mut server,
+        &mut peer,
+        &server_kexinit,
+        &client_kexinit_payload,
+        &original_session_id,
+        &expected_key,
+        client_kex,
+    )?;
+    server.advance_rekey()?;
+    assert!(!server.rekey_active());
+    peer.install_rekey_protectors(&derived)?;
+    peer.send_application(&[50, 6])?;
+    assert_eq!(server.read_auth_packet()?, [50, 6]);
+    Ok(())
+}
+
+#[test]
+fn server_rekey_refuses_over_a_partial_application_write() -> Result<(), Box<dyn std::error::Error>>
+{
+    let signer = signer(82);
+    let expected_key = *signer.public_key();
+    let config = ServerConfig::new(signer);
+    let gate = Rc::new(RefCell::new(WriteGate::default()));
+    let (mut server, mut peer) =
+        complete_raw_initial_with_write_gate(&config, expected_key, true, Rc::clone(&gate))?;
+    server.mark_authenticated();
+
+    // A caller's own packet is half written. Only that caller's retry can
+    // finish it, so the rekey start refuses without touching rekey state
+    // instead of reordering it or poisoning the write buffer.
+    gate.borrow_mut().arm(3);
+    assert!(matches!(
+        server.write_payload(&[94, 1]),
+        Err(ServerTransportError::Transport(TransportError::Io(error)))
+            if error.kind() == io::ErrorKind::WouldBlock
+    ));
+    assert!(matches!(
+        server.begin_rekey(),
+        Err(ServerTransportError::RekeyInProgress)
+    ));
+    assert!(!server.rekey_active());
+    assert!(server.is_established());
+
+    // Finishing the write keeps the packet and its place, and the exchange then
+    // starts after it.
+    gate.borrow_mut().open();
+    server.write_payload(&[94, 1])?;
+    assert_eq!(peer.receive_protected()?, [94, 1]);
+    server.begin_rekey()?;
+    assert!(server.rekey_active());
+    assert_eq!(peer.receive_protected()?.first(), Some(&20));
     Ok(())
 }
 
