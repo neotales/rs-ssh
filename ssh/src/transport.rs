@@ -6,6 +6,7 @@
 //! handshake in the sibling module supplies protocol decisions while this
 //! module enforces framing, authentication, and sequence-number boundaries.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -714,6 +715,44 @@ pub(crate) enum ExtensionState {
     Complete,
 }
 
+const OBLIGATION_CAPACITY: usize = 8;
+type Payload = Vec<u8>;
+#[allow(dead_code)] // Control is reserved for the channel driver follow-up.
+enum Obligation {
+    Pong(Vec<u8>),
+    Control(Payload),
+}
+#[derive(Debug)]
+struct Full;
+#[derive(Default)]
+struct ObligationQueue {
+    entries: VecDeque<Obligation>,
+}
+impl ObligationQueue {
+    fn push(&mut self, obligation: Obligation) -> Result<(), Full> {
+        if self.len() >= OBLIGATION_CAPACITY {
+            return Err(Full);
+        }
+        self.entries.push_back(obligation);
+        Ok(())
+    }
+    fn front(&self) -> Option<&Obligation> {
+        self.entries.front()
+    }
+    fn pop_after_successful_write(&mut self) {
+        self.entries.pop_front();
+    }
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// A synchronous client transport with authenticated packet exchange.
 ///
 /// Values of this type are created only after identification, key exchange,
@@ -732,8 +771,7 @@ pub struct ClientTransport<S> {
     server_sig_algs: Option<Vec<String>>,
     pub(crate) ext_info: ExtensionState,
     pending_transport_reply: Option<Vec<u8>>,
-    /// One PONG retained behind an actively written PONG.
-    next_transport_pong: Option<Vec<u8>>,
+    owned_obligations: ObligationQueue,
     /// Identity of the active partially written deferred PONG.
     pong_write_id: Option<OwnedPacketId>,
     pub(crate) deferred_owned_pong: bool,
@@ -794,7 +832,7 @@ where
                 server_sig_algs: None,
                 ext_info: ExtensionState::Disabled,
                 pending_transport_reply: None,
-                next_transport_pong: None,
+                owned_obligations: ObligationQueue::default(),
                 pong_write_id: None,
                 deferred_owned_pong: false,
                 owned_packet: None,
@@ -917,6 +955,7 @@ where
             && self.authenticated
             && self.owned_packet.is_none()
             && self.pending_transport_reply.is_none()
+            && self.owned_obligations.is_empty()
             && !self.write_buffer.is_pending()
             && !self.rekey_active()
     }
@@ -976,6 +1015,7 @@ where
         if self.owned_packet.is_some()
             || self.write_buffer.is_pending()
             || self.pending_transport_reply.is_some()
+            || !self.owned_obligations.is_empty()
         {
             return Err(TransportError::OwnedPacketState);
         }
@@ -1066,6 +1106,7 @@ where
             .as_ref()
             .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
             || self.pending_transport_reply.is_some()
+            || !self.owned_obligations.is_empty()
         {
             return Err(TransportError::OwnedPacketState);
         }
@@ -1156,8 +1197,8 @@ where
     ) -> Result<OwnedInbound, TransportError> {
         if self.owned_packet.is_some()
             || !self.deferred_owned_pong
-            || self.pending_transport_reply.is_none()
-            || self.next_transport_pong.is_some()
+            || self.owned_obligations.is_empty()
+            || self.owned_obligations.len() >= 2
             || !self
                 .pong_write_id
                 .as_ref()
@@ -1173,6 +1214,13 @@ where
             return Err(TransportError::InvalidMessage);
         }
         if self.rekey_active() {
+            return Err(TransportError::OwnedPacketState);
+        }
+        // An in-flight read reserves one slot until its packet is classified.
+        if self.owned_obligations.len() + usize::from(self.read_buffer.filled != 0)
+            > OBLIGATION_CAPACITY
+            || (self.read_buffer.filled == 0 && self.owned_obligations.len() == OBLIGATION_CAPACITY)
+        {
             return Err(TransportError::OwnedPacketState);
         }
         let (payload, _sequence) = match self.read_protected_packet() {
@@ -1218,15 +1266,10 @@ where
         }
         self.ext_info = ExtensionState::Complete;
         if let Some(pong) = pong {
-            if self.pong_write_id.is_some() {
-                if self.next_transport_pong.is_some() {
-                    return Err(self.fail_protected_write(TransportError::OwnedPacketState));
-                }
-                self.next_transport_pong = Some(pong);
-            } else {
-                self.pending_transport_reply = Some(pong);
-                self.deferred_owned_pong = true;
+            if self.owned_obligations.push(Obligation::Pong(pong)).is_err() {
+                return Err(self.fail_protected_write(TransportError::OwnedPacketState));
             }
+            self.deferred_owned_pong = true;
             Ok(OwnedInbound::PongDeferred)
         } else {
             Ok(OwnedInbound::Payload(payload))
@@ -1248,29 +1291,27 @@ where
         if self.owned_packet.is_some() || !self.deferred_owned_pong {
             return Err(TransportError::OwnedPacketState);
         }
-        let reply = self
-            .pending_transport_reply
-            .take()
-            .ok_or(TransportError::OwnedPacketState)?;
-        match self.write_payload_inner_with_retained(&reply, false) {
-            Ok(()) => {
-                self.pong_write_id = None;
-                self.pending_transport_reply = self.next_transport_pong.take();
-                self.deferred_owned_pong = self.pending_transport_reply.is_some();
-                Ok(())
-            }
-            Err(error) => {
-                if self.established {
-                    self.pending_transport_reply = Some(reply);
-                    if matches!(&error, TransportError::Io(error) if error.kind() == io::ErrorKind::WouldBlock)
-                    {
-                        self.pong_write_id
-                            .get_or_insert_with(|| OwnedPacketId(Arc::new(())));
-                    }
-                }
-                Err(error)
-            }
+        // Move the queue, not its payload: the writer borrows the exact bytes.
+        let mut obligations = std::mem::take(&mut self.owned_obligations);
+        let Some(Obligation::Pong(reply)) = obligations.front() else {
+            self.owned_obligations = obligations;
+            return Err(TransportError::OwnedPacketState);
+        };
+        let result = self.write_payload_inner_with_retained(reply, false);
+        if result.is_ok() {
+            obligations.pop_after_successful_write();
+            self.pong_write_id = None;
+            self.deferred_owned_pong = !obligations.is_empty();
+        } else if self.established
+            && matches!(&result, Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        {
+            self.pong_write_id
+                .get_or_insert_with(|| OwnedPacketId(Arc::new(())));
         }
+        if self.established {
+            self.owned_obligations = obligations;
+        }
+        result
     }
 
     /// Writes one protected payload and commits its outbound sequence number.
@@ -1655,7 +1696,7 @@ where
         self.owned_packet = None;
         self.deferred_owned_pong = false;
         self.pending_transport_reply = None;
-        self.next_transport_pong = None;
+        self.owned_obligations.clear();
         self.pong_write_id = None;
         self.write_buffer.abort();
         self.read_buffer.clear();
