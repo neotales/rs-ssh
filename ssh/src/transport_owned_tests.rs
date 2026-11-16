@@ -4,11 +4,11 @@ use crate::cipher::PacketKeyMaterial;
 use std::io::Cursor;
 
 #[derive(Debug)]
-struct ScriptedIo {
-    input: Cursor<Vec<u8>>,
-    output: Vec<u8>,
-    budget: usize,
-    reads: usize,
+pub(crate) struct ScriptedIo {
+    pub(crate) input: Cursor<Vec<u8>>,
+    pub(crate) output: Vec<u8>,
+    pub(crate) budget: usize,
+    pub(crate) reads: usize,
 }
 impl Read for ScriptedIo {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -31,7 +31,7 @@ impl Write for ScriptedIo {
     }
 }
 
-fn transport() -> ClientTransport<ScriptedIo> {
+pub(crate) fn transport() -> ClientTransport<ScriptedIo> {
     let (mut transport, _) = ClientTransport::start(
         ScriptedIo {
             input: Cursor::new(b"SSH-2.0-test\r\n".to_vec()),
@@ -46,6 +46,9 @@ fn transport() -> ClientTransport<ScriptedIo> {
     transport.authenticated = true;
     let suite = PacketSuite::new("chacha20-poly1305@openssh.com", None).unwrap();
     transport.write_protector = Some(
+        PacketProtector::new(suite, PacketKeyMaterial::new(&[0; 8], &[42; 64], None)).unwrap(),
+    );
+    transport.read_protector = Some(
         PacketProtector::new(suite, PacketKeyMaterial::new(&[0; 8], &[42; 64], None)).unwrap(),
     );
     transport.stream.output.clear();

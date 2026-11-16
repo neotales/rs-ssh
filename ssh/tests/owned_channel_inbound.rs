@@ -1,4 +1,7 @@
 //! Incremental inbound steps while one owned outbound packet is active.
+//! Single-successor transcripts below also retain stale-ID, wrong-channel and
+//! terminal checks. Full-capacity/non-consuming refusal is covered by
+//! `channel::owned_tests::private_capacity_boundary_counts_active_front_and_reopens_after_completion`.
 #![allow(missing_docs)]
 
 use std::{
@@ -980,10 +983,6 @@ fn reads_during_partial_window_preserve_credit_and_queue_one_reply()
                 OwnedChannelInbound::Event(ChannelEvent::Close { channel: 0 })
             )),
         }
-        assert!(matches!(
-            driver.read_while_window_adjustment(&id),
-            Err(OwnedChannelError::Busy)
-        ));
         let early = match kind {
             0 => driver.drive_deferred_pong(),
             1 => driver.drive_global_failure(),
@@ -1090,10 +1089,6 @@ fn partial_eof_reads_events_and_retains_one_reply() -> Result<(), Box<dyn std::e
                 OwnedChannelInbound::Event(ChannelEvent::Close { channel: 0 })
             )),
         }
-        assert!(matches!(
-            driver.read_while_eof(&id),
-            Err(OwnedChannelError::Busy)
-        ));
         let early = match kind {
             0 => driver.drive_deferred_pong(),
             1 => driver.drive_global_failure(),
@@ -1295,11 +1290,11 @@ fn partial_global_reply_retains_one_next_obligation() -> Result<(), Box<dyn std:
                 ..
             })
         ));
+        write.store(1, Ordering::SeqCst);
         assert!(matches!(
             driver.read_while_global_failure(),
             Err(OwnedChannelError::Busy)
         ));
-        write.store(1, Ordering::SeqCst);
         assert!(matches!(driver.drive_global_failure(),
             Err(OwnedChannelError::Transport(TransportError::Io(error))) if error.kind() == io::ErrorKind::WouldBlock));
         assert_eq!(write.load(Ordering::SeqCst), 0);
@@ -1338,10 +1333,6 @@ fn partial_global_reply_retains_one_next_obligation() -> Result<(), Box<dyn std:
                 OwnedChannelInbound::Event(ChannelEvent::Close { channel: 0 })
             )),
         }
-        assert!(matches!(
-            driver.read_while_global_failure(),
-            Err(OwnedChannelError::Busy)
-        ));
         assert_eq!(driver.outbound_sequence(), sequence);
         driver = driver
             .try_into_connection()
@@ -1349,7 +1340,6 @@ fn partial_global_reply_retains_one_next_obligation() -> Result<(), Box<dyn std:
         write.store(usize::MAX, Ordering::SeqCst);
         driver.drive_global_failure()?;
         assert_eq!(driver.outbound_sequence(), sequence + 1);
-        assert!(matches!(driver.read_idle(), Err(OwnedChannelError::Busy)));
         match kind {
             0 => driver.drive_deferred_pong()?,
             1 => driver.drive_global_failure()?,
@@ -1405,10 +1395,6 @@ fn fatal_or_cancelled_global_reply_keeps_next_request_unreleased()
                 want_reply: true,
                 ..
             })
-        ));
-        assert!(matches!(
-            driver.read_while_global_failure(),
-            Err(OwnedChannelError::Busy)
         ));
         if fatal {
             write.store(usize::MAX - 1, Ordering::SeqCst);
@@ -1605,10 +1591,6 @@ fn partial_channel_failure_retains_one_next_obligation() -> Result<(), Box<dyn s
                 OwnedChannelInbound::Event(ChannelEvent::Close { channel: 0 })
             )),
         }
-        assert!(matches!(
-            driver.read_while_channel_failure(&read_id),
-            Err(OwnedChannelError::Busy)
-        ));
         assert_eq!(driver.outbound_sequence(), sequence);
         driver = driver
             .try_into_connection()
@@ -1616,7 +1598,6 @@ fn partial_channel_failure_retains_one_next_obligation() -> Result<(), Box<dyn s
         write.store(usize::MAX, Ordering::SeqCst);
         driver.drive_channel_failure(0)?;
         assert_eq!(driver.outbound_sequence(), sequence + 1);
-        assert!(matches!(driver.read_idle(), Err(OwnedChannelError::Busy)));
         match kind {
             0 => driver.drive_deferred_pong()?,
             1 => driver.drive_global_failure()?,
@@ -1699,10 +1680,6 @@ fn partial_channel_reply_with_queued_request_fatal_or_cancel()
                 want_reply: true,
                 ..
             })
-        ));
-        assert!(matches!(
-            driver.read_while_channel_failure(&read_id),
-            Err(OwnedChannelError::Busy)
         ));
         if fatal {
             write.store(usize::MAX - 1, Ordering::SeqCst);
@@ -1973,10 +1950,6 @@ fn partial_open_rejection_retains_one_next_obligation() -> Result<(), Box<dyn st
                 OwnedChannelInbound::Event(ChannelEvent::Close { channel: 0 })
             )),
         }
-        assert!(matches!(
-            driver.read_while_open_rejection(&read_id),
-            Err(OwnedChannelError::Busy)
-        ));
         assert_eq!(driver.pending_open_count(), if kind == 3 { 2 } else { 1 });
         assert_eq!(driver.outbound_sequence(), sequence);
         driver = driver
@@ -2112,10 +2085,6 @@ fn partial_open_rejection_with_queued_request_fatal_or_cancel()
                 want_reply: true,
                 ..
             })
-        ));
-        assert!(matches!(
-            driver.read_while_open_rejection(&read_id),
-            Err(OwnedChannelError::Busy)
         ));
         if fatal {
             write.store(usize::MAX - 1, Ordering::SeqCst);
@@ -2298,10 +2267,6 @@ fn partial_close_reply_retains_one_next_obligation() -> Result<(), Box<dyn std::
                 OwnedChannelInbound::Event(ChannelEvent::Close { channel: 1 })
             )),
         }
-        assert!(matches!(
-            driver.read_while_close_reply(&id),
-            Err(OwnedChannelError::Busy)
-        ));
         let state = driver.channel(0).unwrap();
         assert!(state.remote_close_received() && !state.local_close_sent());
         assert!(!driver.is_retired_channel(0));
@@ -2408,10 +2373,6 @@ fn partial_close_with_queued_request_fatal_or_cancel() -> Result<(), Box<dyn std
                 want_reply: true,
                 ..
             })
-        ));
-        assert!(matches!(
-            driver.read_while_close_reply(&id),
-            Err(OwnedChannelError::Busy)
         ));
         if fatal {
             write.store(usize::MAX - 1, Ordering::SeqCst);
@@ -2786,16 +2747,6 @@ fn partial_pong_retains_one_next_obligation() -> Result<(), Box<dyn std::error::
                 OwnedChannelInbound::Event(ChannelEvent::Close { channel: 0 })
             )),
         }
-        assert!(matches!(
-            driver.read_while_pong(&id),
-            Err(OwnedChannelError::Busy)
-        ));
-        for _ in 0..32 {
-            assert!(matches!(
-                driver.read_while_pong(&id),
-                Err(OwnedChannelError::Busy)
-            ));
-        }
         assert_eq!(driver.outbound_sequence(), sequence);
         driver = driver
             .try_into_connection()
@@ -2821,10 +2772,6 @@ fn partial_pong_retains_one_next_obligation() -> Result<(), Box<dyn std::error::
                 assert!(matches!(
                     driver.read_while_pong(&next_id)?,
                     OwnedChannelInbound::PongDeferred
-                ));
-                assert!(matches!(
-                    driver.read_while_pong(&next_id),
-                    Err(OwnedChannelError::Busy)
                 ));
                 write.store(usize::MAX, Ordering::SeqCst);
                 driver.drive_deferred_pong()?;
@@ -2925,10 +2872,6 @@ fn partial_pong_with_next_ping_fatal_or_cancel() -> Result<(), Box<dyn std::erro
         assert!(matches!(
             driver.read_while_pong(&id)?,
             OwnedChannelInbound::PongDeferred
-        ));
-        assert!(matches!(
-            driver.read_while_pong(&id),
-            Err(OwnedChannelError::Busy)
         ));
         if fatal {
             write.store(usize::MAX - 1, Ordering::SeqCst);
@@ -3392,7 +3335,6 @@ fn idle_obligations_are_delivered_once_and_completed() -> Result<(), Box<dyn std
                 OwnedChannelInbound::Event(ChannelEvent::Close { channel: 0 })
             )),
         }
-        assert!(matches!(driver.read_idle(), Err(OwnedChannelError::Busy)));
         assert!(matches!(
             driver.admit_data(0, b"x"),
             Err(OwnedChannelError::Busy)
@@ -3647,10 +3589,6 @@ fn close_is_surfaced_but_blocks_further_reads_and_release() -> Result<(), Box<dy
     assert!(matches!(
         driver.read_inbound(&id)?,
         OwnedChannelInbound::Event(ChannelEvent::Close { channel: 0 })
-    ));
-    assert!(matches!(
-        driver.read_inbound(&id),
-        Err(OwnedChannelError::Busy)
     ));
     let Err(driver) = driver.try_into_connection() else {
         panic!("released with a close reply owed")
@@ -3972,10 +3910,6 @@ fn deferred_pong_blocks_reads_until_data_and_pong_are_driven()
         OwnedChannelInbound::PongDeferred
     ));
     assert!(matches!(
-        driver.read_inbound(&id),
-        Err(OwnedChannelError::Busy)
-    ));
-    assert!(matches!(
         driver.drive_deferred_pong(),
         Err(OwnedChannelError::Busy)
     ));
@@ -4032,10 +3966,6 @@ fn global_request_with_reply_is_surfaced_without_reply_and_blocks_release()
             want_reply: true,
             ..
         })
-    ));
-    assert!(matches!(
-        driver.read_inbound(&id),
-        Err(OwnedChannelError::Busy)
     ));
     let Err(driver) = driver.try_into_connection() else {
         panic!("released with a global reply owed")
@@ -4204,10 +4134,6 @@ fn channel_request_with_reply_is_surfaced_and_blocks_release()
             want_reply: true,
             ..
         })
-    ));
-    assert!(matches!(
-        driver.read_inbound(&id),
-        Err(OwnedChannelError::Busy)
     ));
     let Err(driver) = driver.try_into_connection() else {
         panic!("released with a channel reply owed")
@@ -4491,10 +4417,6 @@ fn open_request_is_surfaced_and_blocks_release() -> Result<(), Box<dyn std::erro
         driver.read_inbound(&id)?,
         OwnedChannelInbound::Event(ChannelEvent::OpenRequest(request))
             if request.sender_channel() == 9
-    ));
-    assert!(matches!(
-        driver.read_inbound(&id),
-        Err(OwnedChannelError::Busy)
     ));
     let Err(driver) = driver.try_into_connection() else {
         panic!("released with an open request owed")

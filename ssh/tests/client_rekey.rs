@@ -1309,6 +1309,132 @@ fn retained_peer_kexinit_behind_partial_pong_completes_before_rekey()
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One transcript checks both key epochs and every blocked FIFO front.
+fn mixed_fifo_drains_old_keys_before_retained_kexinit_and_newkeys()
+-> Result<(), Box<dyn std::error::Error>> {
+    for strict in [false, true] {
+        let (peer, stream) = Peer::new()?;
+        let mut client_proposal = proposal([0x11; 16], false);
+        if strict {
+            client_proposal
+                .kex_algorithms
+                .push(KEX_STRICT_C_V00_OPENSSH.to_owned());
+            let mut peer = peer.borrow_mut();
+            peer.server_kexinit
+                .kex_algorithms
+                .push(KEX_STRICT_S_V00_OPENSSH.to_owned());
+            peer.server_kexinit_payload = peer.server_kexinit.encode()?;
+        }
+        let gate = Rc::new(RefCell::new(WriteGate::default()));
+        let stream = GatedStream::new(stream, Rc::clone(&gate));
+        let mut transport = ClientConfig::with_kexinit(client_proposal)
+            .connect(stream, |_| Ok::<(), Infallible>(()))?;
+        peer.borrow_mut().drive();
+        transport.authenticated = true;
+        assert_eq!(transport.strict_kex(), strict);
+        let initial_outbound = transport.outbound_sequence();
+        let initial_inbound = transport.inbound_sequence();
+        let data = transport.start_owned_packet(CLIENT_BEFORE_REKEY)?;
+        gate.borrow_mut().arm(1);
+        assert!(matches!(transport.drive_owned_packet(&data),
+            Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+        peer.borrow_mut().send_ping(b"A")?;
+        peer.borrow_mut().send_application(
+            &neotales_ssh::keepalive::GlobalRequest::keepalive_with_reply().encode()?,
+        )?;
+        peer.borrow_mut().send_ping(b"B")?;
+        peer.borrow_mut().initiate_rekey()?;
+        assert!(matches!(
+            transport.read_while_owned(&data)?,
+            OwnedInbound::PongDeferred
+        ));
+        assert!(matches!(
+            transport.read_while_owned(&data)?,
+            OwnedInbound::Payload(_)
+        ));
+        let control = transport.reserve_owned_control()?;
+        assert!(matches!(
+            transport.read_while_owned(&data)?,
+            OwnedInbound::PongDeferred
+        ));
+        assert!(matches!(
+            transport.read_while_owned(&data)?,
+            OwnedInbound::PeerKexInitRetained
+        ));
+        assert_eq!(transport.inbound_sequence(), initial_inbound + 4);
+        assert!(transport.advance_retained_peer_rekey().is_err());
+        gate.borrow_mut().open();
+        transport.drive_owned_packet(&data)?;
+        assert!(
+            transport
+                .start_owned_control_packet(&control, &[82])
+                .is_err()
+        );
+        for kind in 0..3 {
+            gate.borrow_mut().arm(1);
+            if kind == 1 {
+                let packet = transport.start_owned_control_packet(&control, &[82])?;
+                assert!(matches!(transport.drive_owned_packet(&packet),
+                    Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+                assert!(transport.advance_retained_peer_rekey().is_err());
+                gate.borrow_mut().open();
+                transport.drive_owned_packet(&packet)?;
+                transport.complete_owned_control(&control)?;
+            } else {
+                assert!(matches!(transport.drive_deferred_pong(),
+                    Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+                assert!(transport.advance_retained_peer_rekey().is_err());
+                gate.borrow_mut().open();
+                transport.drive_deferred_pong()?;
+            }
+            assert_eq!(transport.outbound_sequence(), initial_outbound + kind + 2);
+        }
+        // Block the local KEXINIT separately; accepting the retained peer bytes
+        // must not recommit their already-consumed inbound sequence.
+        gate.borrow_mut().arm(1);
+        assert!(matches!(transport.advance_retained_peer_rekey(),
+            Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(transport.inbound_sequence(), initial_inbound + 4);
+        gate.borrow_mut().open();
+        peer.borrow_mut().send_application_after_rekey = true;
+        while transport.rekey_active() {
+            transport.advance_retained_peer_rekey()?;
+        }
+        let pong =
+            |data: &[u8]| neotales_ssh::keepalive::TransportPing::Pong(data.to_vec()).encode();
+        assert_eq!(
+            peer.borrow()
+                .received_application
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                CLIENT_BEFORE_REKEY.to_vec(),
+                pong(b"A")?,
+                vec![82],
+                pong(b"B")?,
+            ]
+        );
+        assert_eq!(transport.read_payload()?, PEER_PAYLOAD);
+        transport.write_payload(CLIENT_AFTER_REKEY)?;
+        peer.borrow_mut().drive();
+        assert_eq!(
+            peer.borrow().received_application.back().map(Vec::as_slice),
+            Some(CLIENT_AFTER_REKEY)
+        );
+        assert_eq!(
+            transport.inbound_sequence(),
+            peer.borrow().sequence.outbound_sequence()
+        );
+        assert_eq!(
+            transport.outbound_sequence(),
+            peer.borrow().sequence.inbound_sequence()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn retained_peer_kexinit_behind_partial_pong_terminal_write_fails_closed()
 -> Result<(), Box<dyn std::error::Error>> {
     let (peer, stream) = Peer::new()?;

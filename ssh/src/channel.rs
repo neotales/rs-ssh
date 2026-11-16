@@ -24,6 +24,7 @@
 //! multiplexer that treats that as fatal cannot open a channel against a
 //! current OpenSSH at all.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Read, Write};
 
@@ -32,7 +33,11 @@ use neotales_ssh::{Error as WireError, MAX_PACKET_CONTENT, MIN_PADDING, Reader, 
 use crate::cipher::AES_BLOCK_SIZE;
 use crate::client::ClientTransport;
 use crate::server::ServerTransport;
-use crate::transport::{OwnedInbound, OwnedPacketId, TransportError};
+use crate::transport::{ObligationId, OwnedInbound, OwnedPacketId, TransportError};
+
+#[cfg(test)]
+#[path = "channel_owned_tests.rs"]
+mod owned_tests;
 
 /// SSH message number for `SSH_MSG_CHANNEL_OPEN`.
 pub const SSH_MSG_CHANNEL_OPEN: u8 = 90;
@@ -716,22 +721,19 @@ enum GlobalFailure {
     Writing(OwnedPacketId),
 }
 
-/// The single obligation accepted behind a writing reply.
 #[derive(Debug)]
-enum NextReplyObligation {
+enum ReplyKind {
     Pong,
-    GlobalFailure,
-    ChannelFailure {
-        channel: ChannelId,
-        remote: ChannelId,
-    },
-    OpenRejection {
-        remote: ChannelId,
-    },
-    CloseReply {
-        channel: ChannelId,
-        remote: ChannelId,
-    },
+    GlobalFailure(GlobalFailure),
+    ChannelFailure(ChannelFailure),
+    OpenRejection(OpenRejection),
+    CloseReply(CloseReply),
+}
+
+#[derive(Debug)]
+struct ReplyObligation {
+    id: ObligationId,
+    reply: ReplyKind,
 }
 
 #[derive(Debug)]
@@ -858,20 +860,10 @@ pub struct OwnedChannelDriver<S> {
     connection: Box<ChannelConnection<ClientTransport<S>>>,
     pending: bool,
     failed: bool,
-    /// An inbound ping was consumed and its pong has not been written.
-    pong_owed: bool,
-    /// An inbound event requires a protocol reply.
-    control_owed: bool,
-    /// A global failure is queued, or has been sealed under this ID.
-    global_failure: Option<GlobalFailure>,
-    /// One later obligation, distinct from the writing reply packet.
-    next_reply_obligation: Option<NextReplyObligation>,
-    /// One consumed channel request, retained until its failure is complete.
-    channel_failure: Option<ChannelFailure>,
-    /// One peer open retained until its rejection has been written.
-    open_rejection: Option<OpenRejection>,
-    /// One peer close awaiting its corresponding local close.
-    close_reply: Option<CloseReply>,
+    /// Metadata mirrors the transport FIFO, including its active front.
+    reply_obligations: VecDeque<ReplyObligation>,
+    /// Parsed and accounted once, moved to the caller before another read.
+    retained_event: Option<ChannelEvent>,
     /// One admitted window adjustment; local credit is committed on completion.
     window_adjustment: Option<WindowAdjustment>,
     /// Channel whose admitted EOF is awaiting packet completion.
@@ -909,13 +901,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             connection: Box::new(connection),
             pending: false,
             failed: false,
-            pong_owed: false,
-            control_owed: false,
-            global_failure: None,
-            next_reply_obligation: None,
-            channel_failure: None,
-            open_rejection: None,
-            close_reply: None,
+            reply_obligations: VecDeque::new(),
+            retained_event: None,
             window_adjustment: None,
             pending_eof: None,
         })
@@ -981,8 +968,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             return Err(OwnedChannelError::Failed);
         }
         if self.pending
-            || self.pong_owed
-            || self.control_owed
+            || !self.reply_obligations.is_empty()
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
             || self.connection.transport.rekey_active()
@@ -1147,8 +1133,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             return Err(OwnedChannelError::Failed);
         }
         if self.pending
-            || self.pong_owed
-            || self.control_owed
+            || !self.reply_obligations.is_empty()
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
             || self.connection.transport.rekey_active()
@@ -1283,11 +1268,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.window_adjustment.is_none() || self.pong_owed || self.control_owed {
+        if self.window_adjustment.is_none() {
             return Err(OwnedChannelError::Busy);
         }
-        let result = self.connection.transport.read_while_owned(&id.0);
-        self.handle_owned_inbound(result)
+        self.read_behind_reply(&id.0)
     }
 
     /// Admits one outbound channel EOF without yet changing channel state.
@@ -1309,8 +1293,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             return Err(OwnedChannelError::Failed);
         }
         if self.pending
-            || self.pong_owed
-            || self.control_owed
+            || !self.reply_obligations.is_empty()
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
             || self.connection.transport.rekey_active()
@@ -1418,11 +1401,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending_eof.is_none() || self.pong_owed || self.control_owed {
+        if self.pending_eof.is_none() {
             return Err(OwnedChannelError::Busy);
         }
-        let result = self.connection.transport.read_while_owned(&id.0);
-        self.handle_owned_inbound(result)
+        self.read_behind_reply(&id.0)
     }
 
     /// Consumes exactly one inbound packet while the admitted data packet is active.
@@ -1470,11 +1452,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if !self.pending || self.pong_owed || self.control_owed {
+        if !self.pending {
             return Err(OwnedChannelError::Busy);
         }
-        let result = self.connection.transport.read_while_owned(&id.0);
-        self.handle_owned_inbound(result)
+        self.read_behind_reply(&id.0)
     }
 
     /// Reads at most one authenticated packet without an active data write.
@@ -1509,15 +1490,16 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending
-            || self.pong_owed
-            || self.control_owed
-            || self.window_adjustment.is_some()
-            || self.pending_eof.is_some()
-        {
+        if let Some(event) = self.take_retained_event() {
+            return Ok(OwnedChannelInbound::Event(event));
+        }
+        if self.pending || self.window_adjustment.is_some() || self.pending_eof.is_some() {
             return Err(OwnedChannelError::Busy);
         }
         if self.connection.transport.rekey_active() {
+            if !self.reply_obligations.is_empty() {
+                return Err(OwnedChannelError::Busy);
+            }
             return self.advance_peer_rekey();
         }
         let result = self.connection.transport.read_idle_owned();
@@ -1542,62 +1524,34 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         &mut self,
         result: Result<OwnedInbound, TransportError>,
     ) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        let inbound = self.retain_owned_inbound(result)?;
+        Ok(self
+            .take_retained_event()
+            .map_or(inbound, OwnedChannelInbound::Event))
+    }
+
+    fn take_retained_event(&mut self) -> Option<ChannelEvent> {
+        self.retained_event.take()
+    }
+
+    fn retain_owned_inbound(
+        &mut self,
+        result: Result<OwnedInbound, TransportError>,
+    ) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        if self.retained_event.is_some() {
+            return Err(OwnedChannelError::Busy);
+        }
         match result {
             Ok(OwnedInbound::Payload(payload)) => {
                 match self.connection.dispatch_decoded_payload(&payload) {
                     Ok(Some(event)) => {
-                        if self.event_owes_control(&event) {
-                            self.control_owed = true;
-                            if matches!(
-                                event,
-                                ChannelEvent::GlobalRequest {
-                                    want_reply: true,
-                                    ..
-                                }
-                            ) {
-                                self.global_failure = Some(GlobalFailure::Queued);
-                            }
-                            if let ChannelEvent::Request {
-                                channel,
-                                want_reply: true,
-                                ..
-                            } = &event
-                            {
-                                let remote = match self.connection.remote_channel(*channel) {
-                                    Ok(remote) => remote,
-                                    Err(error) => {
-                                        self.failed = true;
-                                        return Err(OwnedChannelError::Channel(error));
-                                    }
-                                };
-                                self.channel_failure = Some(ChannelFailure {
-                                    channel: *channel,
-                                    remote,
-                                    packet: None,
-                                });
-                            }
-                            if let ChannelEvent::OpenRequest(request) = &event {
-                                self.open_rejection = Some(OpenRejection {
-                                    remote: request.sender_channel(),
-                                    packet: None,
-                                });
-                            }
-                            if let ChannelEvent::Close { channel } = &event {
-                                let remote = match self.connection.remote_channel(*channel) {
-                                    Ok(remote) => remote,
-                                    Err(error) => {
-                                        self.failed = true;
-                                        return Err(OwnedChannelError::Channel(error));
-                                    }
-                                };
-                                self.close_reply = Some(CloseReply {
-                                    channel: *channel,
-                                    remote,
-                                    packet: None,
-                                });
-                            }
+                        if let Err(error) = self.queue_event_control(&event) {
+                            self.failed = true;
+                            self.retained_event = None;
+                            return Err(error);
                         }
-                        Ok(OwnedChannelInbound::Event(event))
+                        self.retained_event = Some(event);
+                        Ok(OwnedChannelInbound::Consumed)
                     }
                     Ok(None) => Ok(OwnedChannelInbound::Consumed),
                     Err(error) => {
@@ -1607,7 +1561,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                 }
             }
             Ok(OwnedInbound::PongDeferred) => {
-                self.pong_owed = true;
+                let Some(id) = self.connection.transport.last_owned_obligation_id() else {
+                    self.failed = true;
+                    return Err(OwnedChannelError::Transport(TransportError::InvalidMessage));
+                };
+                self.reply_obligations.push_back(ReplyObligation {
+                    id,
+                    reply: ReplyKind::Pong,
+                });
                 Ok(OwnedChannelInbound::PongDeferred)
             }
             Ok(OwnedInbound::PeerKexInitRetained) => Ok(OwnedChannelInbound::PeerRekey),
@@ -1653,10 +1614,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.next_reply_obligation.is_some() {
-            return Err(OwnedChannelError::Busy);
-        }
-        let Some(GlobalFailure::Writing(id)) = self.global_failure.as_ref() else {
+        let Some(ReplyObligation {
+            reply: ReplyKind::GlobalFailure(GlobalFailure::Writing(id)),
+            ..
+        }) = self.reply_obligations.front()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         let id = id.clone();
@@ -1680,7 +1642,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        let Some(failure) = self.channel_failure.as_ref() else {
+        let Some(ReplyObligation {
+            reply: ReplyKind::ChannelFailure(failure),
+            ..
+        }) = self.reply_obligations.front()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if failure.channel != channel {
@@ -1718,10 +1684,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.next_reply_obligation.is_some() {
-            return Err(OwnedChannelError::Busy);
-        }
-        let Some(failure) = self.channel_failure.as_ref() else {
+        let Some(ReplyObligation {
+            reply: ReplyKind::ChannelFailure(failure),
+            ..
+        }) = self.reply_obligations.front()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if failure.channel != id.channel || failure.packet.is_none() {
@@ -1747,7 +1714,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        let Some(rejection) = self.open_rejection.as_ref() else {
+        let Some(ReplyObligation {
+            reply: ReplyKind::OpenRejection(rejection),
+            ..
+        }) = self.reply_obligations.front()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if rejection.remote != remote {
@@ -1787,10 +1758,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.next_reply_obligation.is_some() {
-            return Err(OwnedChannelError::Busy);
-        }
-        let Some(rejection) = self.open_rejection.as_ref() else {
+        let Some(ReplyObligation {
+            reply: ReplyKind::OpenRejection(rejection),
+            ..
+        }) = self.reply_obligations.front()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if rejection.remote != id.remote || rejection.packet.is_none() {
@@ -1816,7 +1788,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        let Some(reply) = self.close_reply.as_ref() else {
+        let Some(ReplyObligation {
+            reply: ReplyKind::CloseReply(reply),
+            ..
+        }) = self.reply_obligations.front()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if reply.channel != channel {
@@ -1855,10 +1831,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.next_reply_obligation.is_some() {
-            return Err(OwnedChannelError::Busy);
-        }
-        let Some(reply) = self.close_reply.as_ref() else {
+        let Some(ReplyObligation {
+            reply: ReplyKind::CloseReply(reply),
+            ..
+        }) = self.reply_obligations.front()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if reply.channel != id.channel || reply.packet.is_none() {
@@ -1871,8 +1848,27 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         &mut self,
         id: &OwnedPacketId,
     ) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        if !self.connection.transport.owns_packet(id) {
+            return Err(OwnedChannelError::Busy);
+        }
+        if let Some(event) = self.take_retained_event() {
+            return Ok(OwnedChannelInbound::Event(event));
+        }
+        let inbound = self.retain_next_owned(id)?;
+        Ok(self
+            .take_retained_event()
+            .map_or(inbound, OwnedChannelInbound::Event))
+    }
+
+    fn retain_next_owned(
+        &mut self,
+        id: &OwnedPacketId,
+    ) -> Result<OwnedChannelInbound, OwnedChannelError> {
+        if self.retained_event.is_some() {
+            return Err(OwnedChannelError::Busy);
+        }
         let result = self.connection.transport.read_while_owned(id);
-        self.handle_behind_reply(result)
+        self.retain_owned_inbound(result)
     }
 
     /// Returns the identity of the actively written deferred PONG.
@@ -1888,7 +1884,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if !self.pong_owed {
+        if !matches!(
+            self.reply_obligations.front().map(|entry| &entry.reply),
+            Some(ReplyKind::Pong)
+        ) {
             return Err(OwnedChannelError::Busy);
         }
         self.connection
@@ -1921,7 +1920,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if !self.pong_owed || self.next_reply_obligation.is_some() {
+        if !matches!(
+            self.reply_obligations.front().map(|entry| &entry.reply),
+            Some(ReplyKind::Pong)
+        ) {
             return Err(OwnedChannelError::Busy);
         }
         let result = self.connection.transport.read_while_deferred_pong(&id.0);
@@ -1932,120 +1934,58 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         &mut self,
         result: Result<OwnedInbound, TransportError>,
     ) -> Result<OwnedChannelInbound, OwnedChannelError> {
-        match result {
-            Ok(OwnedInbound::Payload(payload)) => {
-                let event = match self.connection.dispatch_decoded_payload(&payload) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        self.failed = true;
-                        return Err(OwnedChannelError::Channel(error));
-                    }
-                };
-                let Some(event) = event else {
-                    return Ok(OwnedChannelInbound::Consumed);
-                };
-                if self.event_owes_control(&event) {
-                    let next = match &event {
-                        ChannelEvent::GlobalRequest {
-                            want_reply: true, ..
-                        } => NextReplyObligation::GlobalFailure,
-                        ChannelEvent::Request {
-                            channel,
-                            want_reply: true,
-                            ..
-                        } => {
-                            let remote = match self.connection.remote_channel(*channel) {
-                                Ok(remote) => remote,
-                                Err(error) => {
-                                    self.failed = true;
-                                    return Err(OwnedChannelError::Channel(error));
-                                }
-                            };
-                            NextReplyObligation::ChannelFailure {
-                                channel: *channel,
-                                remote,
-                            }
-                        }
-                        ChannelEvent::OpenRequest(request) => NextReplyObligation::OpenRejection {
-                            remote: request.sender_channel(),
-                        },
-                        ChannelEvent::Close { channel } => {
-                            let remote = match self.connection.remote_channel(*channel) {
-                                Ok(remote) => remote,
-                                Err(error) => {
-                                    self.failed = true;
-                                    return Err(OwnedChannelError::Channel(error));
-                                }
-                            };
-                            NextReplyObligation::CloseReply {
-                                channel: *channel,
-                                remote,
-                            }
-                        }
-                        _ => {
-                            self.failed = true;
-                            return Err(OwnedChannelError::Channel(ChannelError::InvalidMessage));
-                        }
-                    };
-                    self.next_reply_obligation = Some(next);
-                }
-                Ok(OwnedChannelInbound::Event(event))
-            }
-            Ok(OwnedInbound::PongDeferred) => {
-                self.next_reply_obligation = Some(NextReplyObligation::Pong);
-                Ok(OwnedChannelInbound::PongDeferred)
-            }
-            Ok(OwnedInbound::PeerKexInitRetained) => Ok(OwnedChannelInbound::PeerRekey),
-            Err(TransportError::OwnedPacketState) => {
-                if self.connection.transport.rekey_active() {
-                    Ok(OwnedChannelInbound::PeerRekey)
-                } else {
-                    Err(OwnedChannelError::Busy)
-                }
-            }
-            Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(OwnedChannelError::Transport(TransportError::Io(error)))
-            }
-            Err(error) => {
-                self.failed = true;
-                Err(OwnedChannelError::Transport(error))
-            }
-        }
+        self.handle_owned_inbound(result)
     }
 
-    fn promote_after_reply(&mut self) {
-        self.control_owed = false;
-        match self.next_reply_obligation.take() {
-            None => {}
-            Some(NextReplyObligation::Pong) => self.pong_owed = true,
-            Some(NextReplyObligation::GlobalFailure) => {
-                self.control_owed = true;
-                self.global_failure = Some(GlobalFailure::Queued);
-            }
-            Some(NextReplyObligation::ChannelFailure { channel, remote }) => {
-                self.control_owed = true;
-                self.channel_failure = Some(ChannelFailure {
-                    channel,
-                    remote,
-                    packet: None,
-                });
-            }
-            Some(NextReplyObligation::OpenRejection { remote }) => {
-                self.control_owed = true;
-                self.open_rejection = Some(OpenRejection {
-                    remote,
-                    packet: None,
-                });
-            }
-            Some(NextReplyObligation::CloseReply { channel, remote }) => {
-                self.control_owed = true;
-                self.close_reply = Some(CloseReply {
-                    channel,
-                    remote,
-                    packet: None,
-                });
-            }
+    fn queue_event_control(&mut self, event: &ChannelEvent) -> Result<(), OwnedChannelError> {
+        if !self.event_owes_control(event) {
+            return Ok(());
         }
+        let reply = match event {
+            ChannelEvent::GlobalRequest { .. } => ReplyKind::GlobalFailure(GlobalFailure::Queued),
+            ChannelEvent::Request { channel, .. } => ReplyKind::ChannelFailure(ChannelFailure {
+                channel: *channel,
+                remote: self
+                    .connection
+                    .remote_channel(*channel)
+                    .map_err(OwnedChannelError::Channel)?,
+                packet: None,
+            }),
+            ChannelEvent::OpenRequest(request) => ReplyKind::OpenRejection(OpenRejection {
+                remote: request.sender_channel(),
+                packet: None,
+            }),
+            ChannelEvent::Close { channel } => ReplyKind::CloseReply(CloseReply {
+                channel: *channel,
+                remote: self
+                    .connection
+                    .remote_channel(*channel)
+                    .map_err(OwnedChannelError::Channel)?,
+                packet: None,
+            }),
+            _ => unreachable!("event_owes_control selects only reply-requiring events"),
+        };
+        let id = self
+            .connection
+            .transport
+            .reserve_owned_control()
+            .map_err(OwnedChannelError::Transport)?;
+        self.reply_obligations
+            .push_back(ReplyObligation { id, reply });
+        Ok(())
+    }
+
+    fn complete_control(&mut self) -> Result<(), OwnedChannelError> {
+        let front = self
+            .reply_obligations
+            .front()
+            .expect("completed reply has a front");
+        if let Err(error) = self.connection.transport.complete_owned_control(&front.id) {
+            self.failed = true;
+            return Err(OwnedChannelError::Transport(error));
+        }
+        self.reply_obligations.pop_front();
+        Ok(())
     }
 
     /// Refuses a consumed global request that asked for a reply.
@@ -2067,36 +2007,34 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending
-            || self.window_adjustment.is_some()
-            || self.pending_eof.is_some()
-            || self.pong_owed
-            || self.global_failure.is_none()
-        {
+        if self.pending || self.window_adjustment.is_some() || self.pending_eof.is_some() {
             return Err(OwnedChannelError::Busy);
         }
-        if matches!(self.global_failure, Some(GlobalFailure::Queued)) {
+        let Some(ReplyObligation {
+            id: obligation,
+            reply: ReplyKind::GlobalFailure(failure),
+        }) = self.reply_obligations.front_mut()
+        else {
+            return Err(OwnedChannelError::Busy);
+        };
+        if matches!(failure, GlobalFailure::Queued) {
             match self
                 .connection
                 .transport
-                .start_owned_packet(&[SSH_MSG_REQUEST_FAILURE])
+                .start_owned_control_packet(obligation, &[SSH_MSG_REQUEST_FAILURE])
             {
-                Ok(id) => self.global_failure = Some(GlobalFailure::Writing(id)),
+                Ok(id) => *failure = GlobalFailure::Writing(id),
                 Err(error) => {
                     self.failed = true;
                     return Err(OwnedChannelError::Transport(error));
                 }
             }
         }
-        let Some(GlobalFailure::Writing(id)) = self.global_failure.as_ref() else {
+        let GlobalFailure::Writing(id) = failure else {
             unreachable!("global failure was admitted");
         };
         match self.connection.transport.drive_owned_packet(id) {
-            Ok(()) => {
-                self.global_failure = None;
-                self.promote_after_reply();
-                Ok(())
-            }
+            Ok(()) => self.complete_control(),
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 Err(OwnedChannelError::Transport(TransportError::Io(error)))
             }
@@ -2126,15 +2064,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending
-            || self.window_adjustment.is_some()
-            || self.pending_eof.is_some()
-            || self.pong_owed
-            || self.global_failure.is_some()
-        {
+        if self.pending || self.window_adjustment.is_some() || self.pending_eof.is_some() {
             return Err(OwnedChannelError::Busy);
         }
-        let Some(failure) = self.channel_failure.as_mut() else {
+        let Some(ReplyObligation {
+            id: obligation,
+            reply: ReplyKind::ChannelFailure(failure),
+        }) = self.reply_obligations.front_mut()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if failure.channel != channel {
@@ -2147,7 +2084,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             match self
                 .connection
                 .transport
-                .start_owned_packet(&writer.into_bytes())
+                .start_owned_control_packet(obligation, &writer.into_bytes())
             {
                 Ok(id) => failure.packet = Some(id),
                 Err(error) => {
@@ -2161,11 +2098,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             return Err(OwnedChannelError::Transport(TransportError::InvalidMessage));
         };
         match self.connection.transport.drive_owned_packet(id) {
-            Ok(()) => {
-                self.channel_failure = None;
-                self.promote_after_reply();
-                Ok(())
-            }
+            Ok(()) => self.complete_control(),
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 Err(OwnedChannelError::Transport(TransportError::Io(error)))
             }
@@ -2204,16 +2137,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending
-            || self.window_adjustment.is_some()
-            || self.pending_eof.is_some()
-            || self.pong_owed
-            || self.global_failure.is_some()
-            || self.channel_failure.is_some()
-        {
+        if self.pending || self.window_adjustment.is_some() || self.pending_eof.is_some() {
             return Err(OwnedChannelError::Busy);
         }
-        let Some(rejection) = self.open_rejection.as_mut() else {
+        let Some(ReplyObligation {
+            id: obligation,
+            reply: ReplyKind::OpenRejection(rejection),
+        }) = self.reply_obligations.front_mut()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if rejection.remote != remote {
@@ -2239,7 +2170,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             match self
                 .connection
                 .transport
-                .start_owned_packet(&writer.into_bytes())
+                .start_owned_control_packet(obligation, &writer.into_bytes())
             {
                 Ok(id) => rejection.packet = Some((reason, id)),
                 Err(error) => {
@@ -2258,9 +2189,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                     self.failed = true;
                     return Err(OwnedChannelError::Channel(ChannelError::UnknownChannel));
                 }
-                self.open_rejection = None;
-                self.promote_after_reply();
-                Ok(())
+                self.complete_control()
             }
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 Err(OwnedChannelError::Transport(TransportError::Io(error)))
@@ -2290,17 +2219,14 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.failed {
             return Err(OwnedChannelError::Failed);
         }
-        if self.pending
-            || self.window_adjustment.is_some()
-            || self.pending_eof.is_some()
-            || self.pong_owed
-            || self.global_failure.is_some()
-            || self.channel_failure.is_some()
-            || self.open_rejection.is_some()
-        {
+        if self.pending || self.window_adjustment.is_some() || self.pending_eof.is_some() {
             return Err(OwnedChannelError::Busy);
         }
-        let Some(reply) = self.close_reply.as_mut() else {
+        let Some(ReplyObligation {
+            id: obligation,
+            reply: ReplyKind::CloseReply(reply),
+        }) = self.reply_obligations.front_mut()
+        else {
             return Err(OwnedChannelError::Busy);
         };
         if reply.channel != channel {
@@ -2313,7 +2239,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             match self
                 .connection
                 .transport
-                .start_owned_packet(&writer.into_bytes())
+                .start_owned_control_packet(obligation, &writer.into_bytes())
             {
                 Ok(id) => reply.packet = Some(id),
                 Err(error) => {
@@ -2338,9 +2264,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
                 }
                 state.local_close_sent = true;
                 self.connection.reap_if_fully_closed(channel);
-                self.close_reply = None;
-                self.promote_after_reply();
-                Ok(())
+                self.complete_control()
             }
             Err(TransportError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 Err(OwnedChannelError::Transport(TransportError::Io(error)))
@@ -2381,14 +2305,16 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if self.pending
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
-            || !self.pong_owed
+            || !matches!(
+                self.reply_obligations.front().map(|entry| &entry.reply),
+                Some(ReplyKind::Pong)
+            )
         {
             return Err(OwnedChannelError::Busy);
         }
         match self.connection.transport.drive_deferred_pong() {
             Ok(()) => {
-                self.pong_owed = false;
-                self.promote_after_reply();
+                self.reply_obligations.pop_front();
                 Ok(())
             }
             Err(TransportError::OwnedPacketState) => Err(OwnedChannelError::Busy),
@@ -2456,9 +2382,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
             || self.failed
             || self.window_adjustment.is_some()
             || self.pending_eof.is_some()
-            || self.next_reply_obligation.is_some()
-            || self.pong_owed
-            || self.control_owed
+            || !self.reply_obligations.is_empty()
+            || self.retained_event.is_some()
             || self.connection.pending_open_count() != 0
             || close_owed
             || transport.deferred_owned_pong

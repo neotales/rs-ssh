@@ -27,7 +27,7 @@ use neotales_ssh::compression::CompressionAlgorithm;
 
 #[cfg(test)]
 #[path = "transport_owned_tests.rs"]
-mod owned_tests;
+pub(crate) mod owned_tests;
 
 /// Independent opt-ins retained across transport rekeys.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1047,8 +1047,10 @@ where
     }
 
     /// Reserve metadata storage without choosing the caller's reply policy.
-    #[allow(dead_code)] // Connected to the channel FIFO in the next slice.
     pub(crate) fn reserve_owned_control(&mut self) -> Result<ObligationId, TransportError> {
+        if !self.established {
+            return Err(TransportError::NotEstablished);
+        }
         if self.owned_obligations.len() + usize::from(self.owned_read_reserved)
             >= OBLIGATION_CAPACITY
         {
@@ -1062,7 +1064,6 @@ where
             .map_err(|_| TransportError::OwnedPacketState)
     }
 
-    #[allow(dead_code)] // Connected to the channel FIFO in the next slice.
     pub(crate) fn last_owned_obligation_id(&self) -> Option<ObligationId> {
         self.owned_obligations
             .entries
@@ -1072,7 +1073,6 @@ where
 
     /// A retained proposal is not an active exchange yet. Older replies drain
     /// under old keys, but cannot bypass any active ciphertext or FIFO front.
-    #[allow(dead_code)] // Connected to the channel FIFO in the next slice.
     pub(crate) fn start_owned_control_packet(
         &mut self,
         id: &ObligationId,
@@ -1107,7 +1107,6 @@ where
 
     /// Successful packet driving already committed and acknowledged the write.
     /// Only its matching front reservation can now be removed.
-    #[allow(dead_code)] // Connected to the channel FIFO in the next slice.
     pub(crate) fn complete_owned_control(
         &mut self,
         id: &ObligationId,
@@ -1221,16 +1220,19 @@ where
     /// Returns a state error for an invalid owner or a deferred pong, an I/O
     /// error on incomplete input, or a terminal protocol/protection error.
     pub fn read_while_owned(&mut self, id: &OwnedPacketId) -> Result<OwnedInbound, TransportError> {
-        if !self
-            .owned_packet
-            .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
+        if !self.owns_packet(id)
             || self.pending_transport_reply.is_some()
             || !self.can_admit_owned_read()
         {
             return Err(TransportError::OwnedPacketState);
         }
         self.read_owned_step()
+    }
+
+    pub(crate) fn owns_packet(&self, id: &OwnedPacketId) -> bool {
+        self.owned_packet
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
     }
 
     /// Reads one authenticated packet for the channel driver without an
@@ -1351,6 +1353,9 @@ where
         let (payload, _sequence) = match self.read_protected_packet() {
             Ok(packet) => packet,
             Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                if self.read_buffer.filled == 0 {
+                    self.owned_read_reserved = false;
+                }
                 return Err(TransportError::Io(error));
             }
             Err(error) => return Err(self.fail_protected_write(error)),
