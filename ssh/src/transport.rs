@@ -1566,9 +1566,10 @@ where
     /// Returns [`TransportError::RekeyInProgress`] while a rekey is active,
     /// including a retained peer proposal.
     ///
-    /// After the owner completes, a PONG deferred by [`Self::read_while_owned`]
-    /// is written before the next read only when no rekey is active;
-    /// `WouldBlock` preserves it for retry. A retained peer KEXINIT makes this
+    /// After the owner completes, every PONG deferred by [`Self::read_while_owned`]
+    /// is written in FIFO order before the next read, only when no rekey is active;
+    /// `WouldBlock` preserves the active front and all successors for retry
+    /// without consuming another packet. A retained peer KEXINIT makes this
     /// method return `RekeyInProgress` before that write. In that case, if a
     /// PONG is owed, drive it first; otherwise skip `drive_deferred_pong` and
     /// advance the retained proposal.

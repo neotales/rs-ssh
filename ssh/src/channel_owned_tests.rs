@@ -284,3 +284,47 @@ fn private_two_pings_behind_data_adjustment_and_eof_keep_the_original_owner() {
         assert_eq!(driver.inbound_sequence(), 2);
     }
 }
+
+#[test]
+fn private_each_reply_requiring_parser_path_makes_zero_write_calls() {
+    let mut global = Writer::new();
+    global.write_byte(80);
+    global.write_string(b"keepalive@openssh.com").unwrap();
+    global.write_bool(true);
+    let mut open = Writer::new();
+    open.write_byte(90);
+    open.write_string(b"session").unwrap();
+    for value in [9, 128, 128] {
+        open.write_uint32(value);
+    }
+    let payloads = [
+        ping(b"counter"),
+        global.into_bytes(),
+        request(),
+        open.into_bytes(),
+        vec![97, 0, 0, 0, 0],
+        crate::msg::kexinit::KexInit::server_defaults([0; 16])
+            .encode()
+            .unwrap(),
+    ];
+    for (kind, payload) in payloads.into_iter().enumerate() {
+        let mut driver = driver(&[payload]);
+        let id = driver.admit_data(0, b"partial").unwrap();
+        driver.connection.transport.stream.budget = 1;
+        assert!(driver.drive(&id).is_err());
+        let calls = driver.connection.transport.stream.writes;
+        let sequence = driver.outbound_sequence();
+        let inbound = driver.read_inbound(&id).unwrap();
+        assert_eq!(
+            driver.connection.transport.stream.writes, calls,
+            "parser kind {kind}"
+        );
+        assert_eq!(driver.outbound_sequence(), sequence, "parser kind {kind}");
+        assert_eq!(driver.inbound_sequence(), 1);
+        match kind {
+            0 => assert!(matches!(inbound, OwnedChannelInbound::PongDeferred)),
+            5 => assert!(matches!(inbound, OwnedChannelInbound::PeerRekey)),
+            _ => assert!(matches!(inbound, OwnedChannelInbound::Event(_))),
+        }
+    }
+}

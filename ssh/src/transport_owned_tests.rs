@@ -9,6 +9,7 @@ pub(crate) struct ScriptedIo {
     pub(crate) output: Vec<u8>,
     pub(crate) budget: usize,
     pub(crate) reads: usize,
+    pub(crate) writes: usize,
 }
 impl Read for ScriptedIo {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -18,6 +19,7 @@ impl Read for ScriptedIo {
 }
 impl Write for ScriptedIo {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.writes += 1;
         if self.budget == 0 {
             return Err(io::ErrorKind::WouldBlock.into());
         }
@@ -38,6 +40,7 @@ pub(crate) fn transport() -> ClientTransport<ScriptedIo> {
             output: Vec::new(),
             budget: usize::MAX,
             reads: 0,
+            writes: 0,
         },
         "SSH-2.0-test",
     )
