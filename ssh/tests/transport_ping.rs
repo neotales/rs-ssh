@@ -428,3 +428,94 @@ fn owned_pings_fill_queue_and_keep_wire_order() -> Result<(), Box<dyn std::error
 fn owned_partial_read_reserves_obligation_slot() -> Result<(), Box<dyn std::error::Error>> {
     exercise_owned_ping_capacity(true)
 }
+
+#[test]
+#[allow(clippy::too_many_lines)] // One public-API transcript checks legacy resumption and exact wire order.
+fn legacy_read_drains_all_owned_pongs_before_data_or_a_later_ping()
+-> Result<(), Box<dyn std::error::Error>> {
+    use neotales_ssh::transport::{OwnedInbound, TransportError};
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let address = listener.local_addr()?;
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let peer = std::thread::spawn(move || -> Result<(), String> {
+        let run = || -> Result<(), Box<dyn std::error::Error>> {
+            let (socket, _) = listener.accept()?;
+            socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut server =
+                ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32])).accept(socket)?;
+            let policy = neotales_ssh::ServerAuthPolicy::new(4)?
+                .with_authorized_key(&Ed25519Signer::from_seed(&mut [49; 32]).public_key_blob()?)?;
+            neotales_ssh::authenticate_server(&mut server, &policy)?;
+            server.send_ping(b"A")?;
+            server.send_ping(b"B")?;
+            server.write_payload(b"\x5eordinary")?;
+            server.send_ping(b"C")?;
+            server.write_payload(b"\x5eafter-ping")?;
+            ready_tx.send(())?;
+            assert_eq!(server.read_payload()?, b"\x5eowned");
+            for expected in [b"A", b"B", b"C"] {
+                assert_eq!(
+                    TransportPing::decode(&server.read_payload()?)?,
+                    TransportPing::Pong(expected.to_vec())
+                );
+            }
+            // Delimit the transcript: no duplicate reply may precede this.
+            assert_eq!(server.read_payload()?, [5]);
+            Ok(())
+        };
+        run().map_err(|error| error.to_string())
+    });
+    let socket = TcpStream::connect(address)?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let allowance = Arc::new(AtomicUsize::new(usize::MAX));
+    let read_allowance = Arc::new(AtomicUsize::new(usize::MAX));
+    let mut client = ClientConfig::new().connect(
+        GatedSocket {
+            socket,
+            allowance: Arc::clone(&allowance),
+            read_allowance: Arc::clone(&read_allowance),
+        },
+        |_| Ok::<(), ()>(()),
+    )?;
+    neotales_ssh::authenticate_client(
+        &mut client,
+        "user",
+        &[neotales_ssh::ClientAuthMethod::public_key(
+            neotales_ssh::auth::PublicKeySigner::ed25519(Ed25519Signer::from_seed(&mut [49; 32])),
+        )],
+        4,
+    )?;
+    let outbound = client.outbound_sequence();
+    let inbound = client.inbound_sequence();
+    let owner = client.start_owned_packet(b"\x5eowned")?;
+    allowance.store(1, Ordering::SeqCst);
+    assert!(matches!(client.drive_owned_packet(&owner),
+        Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+    ready_rx.recv_timeout(Duration::from_secs(5))?;
+    for _ in 0..2 {
+        assert!(matches!(
+            client.read_while_owned(&owner)?,
+            OwnedInbound::PongDeferred
+        ));
+    }
+    allowance.store(usize::MAX, Ordering::SeqCst);
+    client.drive_owned_packet(&owner)?;
+    allowance.store(1, Ordering::SeqCst);
+    read_allowance.store(123, Ordering::SeqCst);
+    assert!(matches!(client.read_payload(),
+        Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock));
+    assert_eq!(read_allowance.load(Ordering::SeqCst), 123);
+    assert_eq!(client.inbound_sequence(), inbound + 2);
+    assert_eq!(client.outbound_sequence(), outbound + 1);
+    allowance.store(usize::MAX, Ordering::SeqCst);
+    read_allowance.store(usize::MAX, Ordering::SeqCst);
+    assert_eq!(client.read_payload()?, b"\x5eordinary");
+    assert_eq!(client.inbound_sequence(), inbound + 3);
+    assert_eq!(client.outbound_sequence(), outbound + 3);
+    assert_eq!(client.read_payload()?, b"\x5eafter-ping");
+    assert_eq!(client.inbound_sequence(), inbound + 5);
+    assert_eq!(client.outbound_sequence(), outbound + 4);
+    client.write_payload(&[5])?;
+    peer.join().map_err(|_| "peer panicked")??;
+    Ok(())
+}

@@ -1579,7 +1579,10 @@ where
         if self.rekey_active() {
             return Err(TransportError::RekeyInProgress);
         }
-        if self.deferred_owned_pong {
+        // The owned path can retain several replies. Never start a legacy
+        // read between them: a later PING could otherwise be consumed while
+        // its write is still forbidden by an older deferred PONG.
+        while self.deferred_owned_pong {
             self.drive_deferred_pong()?;
         }
         loop {
