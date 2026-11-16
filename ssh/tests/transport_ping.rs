@@ -145,8 +145,8 @@ fn owned_packet_defers_pong_without_losing_inbound_or_sequence()
     assert_eq!(client.inbound_sequence(), inbound + 2);
     assert_eq!(client.outbound_sequence(), outbound);
     assert!(matches!(
-        client.read_while_owned(&id),
-        Err(TransportError::OwnedPacketState)
+        client.read_while_owned(&id)?,
+        OwnedInbound::Payload(bytes) if bytes == b"\x5einbound"
     ));
     allowance.store(usize::MAX, Ordering::SeqCst);
     client.drive_owned_packet(&id)?;
@@ -167,7 +167,6 @@ fn owned_packet_defers_pong_without_losing_inbound_or_sequence()
     allowance.store(usize::MAX, Ordering::SeqCst);
     client.drive_deferred_pong()?;
     assert_eq!(client.outbound_sequence(), outbound + 2);
-    assert_eq!(client.read_payload()?, b"\x5einbound");
     server
         .join()
         .map_err(|_| "server panicked")?
@@ -315,4 +314,115 @@ fn both_transports_echo_ping_and_never_treat_a_named_global_request_as_ping()
     assert!(GlobalRequest::decode(&request.encode()?)?.want_reply());
     assert_eq!(request.reply()?, Some(vec![81]));
     Ok(())
+}
+
+fn exercise_owned_ping_capacity(partial: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use neotales_ssh::transport::{OwnedInbound, TransportError};
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let address = listener.local_addr()?;
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let server = std::thread::spawn(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let (socket, _) = listener.accept()?;
+            socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut server =
+                ServerConfig::new(Ed25519Signer::from_seed(&mut [8; 32])).accept(socket)?;
+            let policy = neotales_ssh::ServerAuthPolicy::new(4)?
+                .with_authorized_key(&Ed25519Signer::from_seed(&mut [49; 32]).public_key_blob()?)?;
+            neotales_ssh::authenticate_server(&mut server, &policy)?;
+            for i in 0..9u8 {
+                server.send_ping(&[i])?;
+            }
+            ready_tx.send(())?;
+            if !partial {
+                assert_eq!(server.read_payload()?, b"\x5eoutbound");
+                for i in 0..8u8 {
+                    assert_eq!(
+                        TransportPing::decode(&server.read_payload()?)?,
+                        TransportPing::Pong(vec![i])
+                    );
+                }
+            }
+            done_rx.recv_timeout(Duration::from_secs(5))?;
+            Ok(())
+        },
+    );
+    let socket = TcpStream::connect(address)?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let allowance = Arc::new(AtomicUsize::new(usize::MAX));
+    let read_allowance = Arc::new(AtomicUsize::new(usize::MAX));
+    let mut client = ClientConfig::new().connect(
+        GatedSocket {
+            socket,
+            allowance: Arc::clone(&allowance),
+            read_allowance: Arc::clone(&read_allowance),
+        },
+        |_| Ok::<(), ()>(()),
+    )?;
+    neotales_ssh::authenticate_client(
+        &mut client,
+        "user",
+        &[neotales_ssh::ClientAuthMethod::public_key(
+            neotales_ssh::auth::PublicKeySigner::ed25519(Ed25519Signer::from_seed(&mut [49; 32])),
+        )],
+        4,
+    )?;
+    let sequence = client.inbound_sequence();
+    let id = client.start_owned_packet(b"\x5eoutbound")?;
+    allowance.store(1, Ordering::SeqCst);
+    assert!(
+        matches!(client.drive_owned_packet(&id), Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock)
+    );
+    ready_rx.recv_timeout(Duration::from_secs(5))?;
+    let count = if partial { 7 } else { 8 };
+    for _ in 0..count {
+        assert!(matches!(
+            client.read_while_owned(&id)?,
+            OwnedInbound::PongDeferred
+        ));
+    }
+    if partial {
+        read_allowance.store(1, Ordering::SeqCst);
+        assert!(
+            matches!(client.read_while_owned(&id), Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock)
+        );
+        read_allowance.store(123, Ordering::SeqCst);
+    }
+    assert!(matches!(
+        client.read_while_owned(&id),
+        Err(TransportError::OwnedPacketState)
+    ));
+    assert_eq!(client.inbound_sequence(), sequence + count);
+    if partial {
+        assert_eq!(read_allowance.load(Ordering::SeqCst), 123);
+    } else {
+        allowance.store(usize::MAX, Ordering::SeqCst);
+        client.drive_owned_packet(&id)?;
+        for _ in 0..8 {
+            client.drive_deferred_pong()?;
+        }
+        let next = client.start_owned_packet(b"\x5enext")?;
+        assert!(matches!(
+            client.read_while_owned(&next)?,
+            OwnedInbound::PongDeferred
+        ));
+        assert_eq!(client.inbound_sequence(), sequence + 9);
+    }
+    done_tx.send(())?;
+    server
+        .join()
+        .map_err(|_| "server panicked")?
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[test]
+fn owned_pings_fill_queue_and_keep_wire_order() -> Result<(), Box<dyn std::error::Error>> {
+    exercise_owned_ping_capacity(false)
+}
+
+#[test]
+fn owned_partial_read_reserves_obligation_slot() -> Result<(), Box<dyn std::error::Error>> {
+    exercise_owned_ping_capacity(true)
 }

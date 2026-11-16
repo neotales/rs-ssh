@@ -1087,8 +1087,8 @@ where
     /// Reads at most one packet while the identified outbound packet is owned.
     ///
     /// Only authenticated transports may use this method. An inbound ping
-    /// retains one pong behind the owned packet; no further inbound packet can
-    /// be consumed until that pong is sent. A peer `SSH_MSG_KEXINIT` is
+    /// retains a pong behind the owned packet; further inbound packets may be
+    /// consumed while the bounded obligation queue has room. A peer `SSH_MSG_KEXINIT` is
     /// authenticated and retained as [`OwnedInbound::PeerKexInitRetained`]:
     /// its sequence number is committed once, the owned packet can still be
     /// driven to completion, and the rekey itself waits for
@@ -1106,7 +1106,7 @@ where
             .as_ref()
             .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
             || self.pending_transport_reply.is_some()
-            || !self.owned_obligations.is_empty()
+            || !self.can_admit_owned_read()
         {
             return Err(TransportError::OwnedPacketState);
         }
@@ -1198,7 +1198,7 @@ where
         if self.owned_packet.is_some()
             || !self.deferred_owned_pong
             || self.owned_obligations.is_empty()
-            || self.owned_obligations.len() >= 2
+            || !self.can_admit_owned_read()
             || !self
                 .pong_write_id
                 .as_ref()
@@ -1209,18 +1209,16 @@ where
         self.read_owned_step()
     }
 
+    fn can_admit_owned_read(&self) -> bool {
+        self.owned_obligations.len() + usize::from(self.read_buffer.filled != 0)
+            < OBLIGATION_CAPACITY
+    }
+
     fn read_owned_step(&mut self) -> Result<OwnedInbound, TransportError> {
         if !self.authenticated {
             return Err(TransportError::InvalidMessage);
         }
         if self.rekey_active() {
-            return Err(TransportError::OwnedPacketState);
-        }
-        // An in-flight read reserves one slot until its packet is classified.
-        if self.owned_obligations.len() + usize::from(self.read_buffer.filled != 0)
-            > OBLIGATION_CAPACITY
-            || (self.read_buffer.filled == 0 && self.owned_obligations.len() == OBLIGATION_CAPACITY)
-        {
             return Err(TransportError::OwnedPacketState);
         }
         let (payload, _sequence) = match self.read_protected_packet() {
