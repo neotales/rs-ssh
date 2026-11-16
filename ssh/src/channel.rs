@@ -827,6 +827,20 @@ pub enum OwnedChannelInbound {
 /// visible to the constructor.
 /// The legacy [`ChannelConnection`] and [`ChannelTransport`] APIs are unchanged.
 ///
+/// Read-behind provides bounded backpressure, not guaranteed full-duplex
+/// progress. There is no retained inbound event slot: each returned event
+/// belongs to the caller. A caller with room for only one undelivered event
+/// cannot reach a later control packet behind it until that event is drained.
+///
+/// If a reply is owed behind a partially written data, window adjustment, or
+/// EOF packet, or a peer rekey is retained behind a partially written packet,
+/// further reads stop and the original writer must resume that packet. A reply
+/// already being written can admit one later reply obligation, which is
+/// ordered after it; once that next obligation is present, reads stop again.
+/// This mechanism does not admit a second reply behind a data packet while the
+/// first reply is merely owed. Callers must wait for readiness, not spin, and
+/// be prepared to discard the connection if progress cannot resume.
+///
 /// The wrapped connection's mutable transport cannot be reached through the
 /// driver:
 ///
