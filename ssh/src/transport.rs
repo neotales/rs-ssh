@@ -762,6 +762,7 @@ impl ObligationQueue {
 /// An integrity or unrecoverable protected-framing failure discards both key
 /// contexts and pending packets. Subsequent reads and writes fail without
 /// touching the stream. Short reads and `WouldBlock` preserve resumable state.
+#[allow(clippy::struct_excessive_bools)] // Authentication, key epoch, and inbound reservation are independent.
 pub struct ClientTransport<S> {
     pub(crate) stream: S,
     pub(crate) sequence: SequenceState,
@@ -772,6 +773,8 @@ pub struct ClientTransport<S> {
     pub(crate) ext_info: ExtensionState,
     pending_transport_reply: Option<Vec<u8>>,
     owned_obligations: ObligationQueue,
+    /// Capacity reserved for the one read context, including across `WouldBlock`.
+    owned_read_reserved: bool,
     /// Identity of the active partially written deferred PONG.
     pong_write_id: Option<OwnedPacketId>,
     pub(crate) deferred_owned_pong: bool,
@@ -833,6 +836,7 @@ where
                 ext_info: ExtensionState::Disabled,
                 pending_transport_reply: None,
                 owned_obligations: ObligationQueue::default(),
+                owned_read_reserved: false,
                 pong_write_id: None,
                 deferred_owned_pong: false,
                 owned_packet: None,
@@ -1210,8 +1214,7 @@ where
     }
 
     fn can_admit_owned_read(&self) -> bool {
-        self.owned_obligations.len() + usize::from(self.read_buffer.filled != 0)
-            < OBLIGATION_CAPACITY
+        self.owned_read_reserved || self.owned_obligations.len() < OBLIGATION_CAPACITY
     }
 
     fn read_owned_step(&mut self) -> Result<OwnedInbound, TransportError> {
@@ -1221,6 +1224,8 @@ where
         if self.rekey_active() {
             return Err(TransportError::OwnedPacketState);
         }
+        // Continuation uses the original reservation, not a second slot.
+        self.owned_read_reserved = true;
         let (payload, _sequence) = match self.read_protected_packet() {
             Ok(packet) => packet,
             Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1228,6 +1233,7 @@ where
             }
             Err(error) => return Err(self.fail_protected_write(error)),
         };
+        self.owned_read_reserved = false;
         let Some(message) = payload.first().copied() else {
             return Err(self.fail_protected_write(TransportError::InvalidMessage));
         };
@@ -1695,6 +1701,7 @@ where
         self.deferred_owned_pong = false;
         self.pending_transport_reply = None;
         self.owned_obligations.clear();
+        self.owned_read_reserved = false;
         self.pong_write_id = None;
         self.write_buffer.abort();
         self.read_buffer.clear();

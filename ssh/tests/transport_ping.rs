@@ -335,14 +335,12 @@ fn exercise_owned_ping_capacity(partial: bool) -> Result<(), Box<dyn std::error:
                 server.send_ping(&[i])?;
             }
             ready_tx.send(())?;
-            if !partial {
-                assert_eq!(server.read_payload()?, b"\x5eoutbound");
-                for i in 0..8u8 {
-                    assert_eq!(
-                        TransportPing::decode(&server.read_payload()?)?,
-                        TransportPing::Pong(vec![i])
-                    );
-                }
+            assert_eq!(server.read_payload()?, b"\x5eoutbound");
+            for i in 0..8u8 {
+                assert_eq!(
+                    TransportPing::decode(&server.read_payload()?)?,
+                    TransportPing::Pong(vec![i])
+                );
             }
             done_rx.recv_timeout(Duration::from_secs(5))?;
             Ok(())
@@ -387,28 +385,32 @@ fn exercise_owned_ping_capacity(partial: bool) -> Result<(), Box<dyn std::error:
         assert!(
             matches!(client.read_while_owned(&id), Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock)
         );
+        assert_eq!(client.inbound_sequence(), sequence + 7);
         read_allowance.store(123, Ordering::SeqCst);
+        assert!(matches!(
+            client.read_while_owned(&id)?,
+            OwnedInbound::PongDeferred
+        ));
     }
+    let remaining = read_allowance.load(Ordering::SeqCst);
     assert!(matches!(
         client.read_while_owned(&id),
         Err(TransportError::OwnedPacketState)
     ));
-    assert_eq!(client.inbound_sequence(), sequence + count);
-    if partial {
-        assert_eq!(read_allowance.load(Ordering::SeqCst), 123);
-    } else {
-        allowance.store(usize::MAX, Ordering::SeqCst);
-        client.drive_owned_packet(&id)?;
-        for _ in 0..8 {
-            client.drive_deferred_pong()?;
-        }
-        let next = client.start_owned_packet(b"\x5enext")?;
-        assert!(matches!(
-            client.read_while_owned(&next)?,
-            OwnedInbound::PongDeferred
-        ));
-        assert_eq!(client.inbound_sequence(), sequence + 9);
+    assert_eq!(client.inbound_sequence(), sequence + 8);
+    assert_eq!(read_allowance.load(Ordering::SeqCst), remaining);
+    read_allowance.store(usize::MAX, Ordering::SeqCst);
+    allowance.store(usize::MAX, Ordering::SeqCst);
+    client.drive_owned_packet(&id)?;
+    for _ in 0..8 {
+        client.drive_deferred_pong()?;
     }
+    let next = client.start_owned_packet(b"\x5enext")?;
+    assert!(matches!(
+        client.read_while_owned(&next)?,
+        OwnedInbound::PongDeferred
+    ));
+    assert_eq!(client.inbound_sequence(), sequence + 9);
     done_tx.send(())?;
     server
         .join()
