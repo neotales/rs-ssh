@@ -213,3 +213,74 @@ fn private_capacity_boundary_counts_active_front_and_reopens_after_completion() 
     }
     assert_eq!(decode_output(&driver).len(), 10);
 }
+
+#[test]
+fn private_two_pings_behind_data_adjustment_and_eof_keep_the_original_owner() {
+    enum ActivePacket {
+        Data(OwnedChannelWriteId),
+        Adjustment(OwnedWindowAdjustmentId),
+        Eof(OwnedChannelEofId),
+    }
+    for kind in 0..3 {
+        let mut driver = driver(&[ping(b"A"), ping(b"B")]);
+        let (active, expected_first) = match kind {
+            0 => {
+                let mut payload = Writer::new();
+                payload.write_byte(94);
+                payload.write_uint32(7);
+                payload.write_string(b"abc").unwrap();
+                (
+                    ActivePacket::Data(driver.admit_data(0, b"abc").unwrap()),
+                    payload.into_bytes(),
+                )
+            }
+            1 => (
+                ActivePacket::Adjustment(driver.admit_window_adjustment(0, 3).unwrap()),
+                vec![93, 0, 0, 0, 7, 0, 0, 0, 3],
+            ),
+            _ => (
+                ActivePacket::Eof(driver.admit_eof(0).unwrap()),
+                vec![96, 0, 0, 0, 7],
+            ),
+        };
+        let finish = |driver: &mut OwnedChannelDriver<ScriptedIo>| match &active {
+            ActivePacket::Data(id) => driver.drive(id),
+            ActivePacket::Adjustment(id) => driver.drive_window_adjustment(id).map(|_| ()),
+            ActivePacket::Eof(id) => driver.drive_eof(id),
+        };
+        driver.connection.transport.stream.budget = 1;
+        assert!(finish(&mut driver).is_err());
+        let sequence = driver.outbound_sequence();
+        for _ in 0..2 {
+            let inbound = match &active {
+                ActivePacket::Data(id) => driver.read_inbound(id),
+                ActivePacket::Adjustment(id) => driver.read_while_window_adjustment(id),
+                ActivePacket::Eof(id) => driver.read_while_eof(id),
+            }
+            .unwrap();
+            assert!(matches!(inbound, OwnedChannelInbound::PongDeferred));
+            assert_eq!(driver.outbound_sequence(), sequence);
+            assert_eq!(driver.connection.transport.stream.output.len(), 1);
+            assert!(matches!(
+                driver.drive_deferred_pong(),
+                Err(OwnedChannelError::Busy)
+            ));
+        }
+        assert_eq!(driver.reply_obligations.len(), 2);
+        driver.connection.transport.stream.budget = usize::MAX;
+        finish(&mut driver).unwrap();
+        driver.drive_deferred_pong().unwrap();
+        driver.drive_deferred_pong().unwrap();
+        let reply = |bytes: &[u8]| {
+            neotales_ssh::keepalive::TransportPing::Pong(bytes.to_vec())
+                .encode()
+                .unwrap()
+        };
+        assert_eq!(
+            decode_output(&driver),
+            vec![expected_first, reply(b"A"), reply(b"B")]
+        );
+        assert_eq!(driver.outbound_sequence(), sequence + 3);
+        assert_eq!(driver.inbound_sequence(), 2);
+    }
+}

@@ -772,7 +772,7 @@ pub enum OwnedChannelInbound {
     /// The driver never automatically answers a request, sends a close, or
     /// adjusts a window. When any read step surfaces a `Request` or `GlobalRequest` that asked for
     /// a reply, a channel `OpenRequest`, or a `Close` this side has not already
-    /// sent, the obligation blocks further reads and release. Global and
+    /// sent, its obligation enters the bounded reply FIFO and blocks release. Global and
     /// channel requests have explicit failure reply paths; open requests can be
     /// rejected and a peer close can be answered explicitly. If the event
     /// arrives during a window adjustment, EOF, global failure, channel
@@ -787,17 +787,17 @@ pub enum OwnedChannelInbound {
     Consumed,
     /// An inbound transport ping was consumed and its pong is owed.
     ///
-    /// No further inbound read is permitted until any admitted data packet or
-    /// window adjustment, EOF, active failure, open rejection, close reply or PONG completes and
-    /// [`OwnedChannelDriver::drive_deferred_pong`]
-    /// writes the pong. The connection cannot be released while the pong is owed.
+    /// The PONG retains its exact payload in the shared eight-entry FIFO.
+    /// Reads may continue while capacity permits, but any active packet and
+    /// earlier obligations must finish before this PONG can be written with
+    /// [`OwnedChannelDriver::drive_deferred_pong`]. Release remains blocked.
     PongDeferred,
     /// A peer-initiated rekey was retained or advanced by this step.
     ///
     /// The peer KEXINIT was authenticated with its inbound sequence number
     /// committed exactly once. No channel event was produced and no application
     /// payload may be admitted or released until the rekey completes. Finish any
-    /// active outbound packet, then call [`OwnedChannelDriver::read_idle`] to
+    /// active outbound packet and all older replies, then call [`OwnedChannelDriver::read_idle`] to
     /// advance the exchange. A `WouldBlock` from that call is retryable.
     PeerRekey,
 }
@@ -830,18 +830,19 @@ pub enum OwnedChannelInbound {
 /// The legacy [`ChannelConnection`] and [`ChannelTransport`] APIs are unchanged.
 ///
 /// Read-behind provides bounded backpressure, not guaranteed full-duplex
-/// progress. There is no retained inbound event slot: each returned event
-/// belongs to the caller. A caller with room for only one undelivered event
-/// cannot reach a later control packet behind it until that event is drained.
+/// progress. Parsing retains one event until the public read wrapper moves it
+/// to the caller, without reparsing or accounting again. Each returned event
+/// belongs to the caller, which must stop reading while unable to deliver it.
 ///
 /// If a reply is owed behind a partially written data, window adjustment, or
 /// EOF packet, or a peer rekey is retained behind a partially written packet,
-/// further reads stop and the original writer must resume that packet. A reply
-/// already being written can admit one later reply obligation, which is
-/// ordered after it; once that next obligation is present, reads stop again.
-/// This mechanism does not admit a second reply behind a data packet while the
-/// first reply is merely owed. Callers must wait for readiness, not spin, and
-/// be prepared to discard the connection if progress cannot resume.
+/// the original writer must resume that packet before any reply is written.
+/// Up to eight obligations, including an active reply, are retained in arrival
+/// order. A partial inbound packet reserves one of those slots; resuming it
+/// does not reserve another. At capacity, reads return busy without touching
+/// the stream or sequence. A retained peer KEXINIT stops ordinary reads;
+/// older replies drain under old keys before its local KEXINIT is sent.
+/// Callers must wait for write progress at capacity, not spin on readability.
 ///
 /// The wrapped connection's mutable transport cannot be reached through the
 /// driver:
@@ -944,8 +945,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// Returns whether a peer-initiated rekey is retained or in progress.
     ///
     /// While this is true, channel-data admission, window adjustments, EOF,
-    /// replies, further owned reads, and release are refused. Finish the active
-    /// packet and call [`Self::read_idle`] to advance the exchange.
+    /// further ordinary reads, and release are refused. Finish the active
+    /// packet and earlier FIFO replies, then call [`Self::read_idle`] to advance
+    /// the exchange. Older replies may still be sealed before a retained proposal.
     #[must_use]
     pub fn rekey_active(&self) -> bool {
         self.connection.transport.rekey_active()
@@ -1243,7 +1245,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// It uses the same bounded event and reply handling as [`Self::read_inbound`].
     /// A reply-requiring event or PING is retained behind the active packet;
-    /// further reads stop until that obligation is answered. The adjustment
+    /// further reads may continue while the eight-entry FIFO has capacity. The adjustment
     /// must finish before any such reply can be driven. Inbound data reduces
     /// local window immediately; the admitted increment is added to the
     /// then-current window only when its protected write completes.
@@ -1259,7 +1261,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy for a stale or foreign ID or an owed reply, failed after a
+    /// Returns busy for a stale or foreign ID or full FIFO, failed after a
     /// terminal error, or a channel or transport error.
     pub fn read_while_window_adjustment(
         &mut self,
@@ -1392,7 +1394,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy for a stale or foreign ID or an owed reply, failed after a
+    /// Returns busy for a stale or foreign ID or full FIFO, failed after a
     /// terminal error, or a channel or transport error.
     pub fn read_while_eof(
         &mut self,
@@ -1416,15 +1418,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// message, so one packet produces at most one event and no event is
     /// consumed after an event has been produced.
     ///
-    /// The driver refuses the read while an inbound obligation is outstanding:
-    ///
-    /// * a pong deferred by an inbound transport ping blocks reads until the
-    ///   admitted data packet completes and [`Self::drive_deferred_pong`]
-    ///   writes the pong;
-    /// * a channel open the peer is waiting to be confirmed or refused, a peer
-    ///   close this side has not already answered, or a channel request or
-    ///   global request whose `want_reply` is set is surfaced as an event and
-    ///   also blocks further reads and release.
+    /// PINGs and reply-requiring events enter one eight-entry FIFO, including
+    /// any active reply. Only its front can write, after the admitted data.
+    /// A full FIFO refuses a new read before stream access; a partial packet
+    /// keeps its existing slot and can resume. A retained event is moved out
+    /// before another packet is read. Returning or dropping a request event
+    /// does not remove its reply obligation.
     ///
     /// A deferred pong, global failure, channel failure, open rejection and
     /// peer close reply have driver completion paths. This is not a general
@@ -1461,8 +1460,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// Reads at most one authenticated packet without an active data write.
     ///
     /// Events and reply obligations are handled exactly as in
-    /// [`Self::read_inbound`]. While any reply is owed, another read, data
-    /// admission and release are refused. A PING retains a pong for
+    /// [`Self::read_inbound`]. Queued, unsealed replies permit another read
+    /// while capacity remains; data admission and release are refused. A PING retains a pong for
     /// [`Self::drive_deferred_pong`].
     ///
     /// A peer `SSH_MSG_KEXINIT` is authenticated and retained as
@@ -1483,7 +1482,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy for an active data write, window adjustment, EOF or obligation,
+    /// Returns busy for an active write, full FIFO, or a retained rekey with older replies,
     /// failed after a terminal error, a channel error for a consumed invalid
     /// packet, or a transport error. `WouldBlock` is retryable.
     pub fn read_idle(&mut self) -> Result<OwnedChannelInbound, OwnedChannelError> {
@@ -1594,8 +1593,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// This step is available only once the global failure packet has been
     /// admitted by [`Self::drive_global_failure`]. The active packet remains
     /// the sole protected writer. A PING or reply-requiring event occupies one
-    /// separate bounded next-obligation slot, after which further reads are
-    /// busy. Complete the active global failure first, then drive the deferred
+    /// shared bounded FIFO. Reads are busy at capacity. Complete the active global failure first, then drive the deferred
     /// pong or reply using its corresponding method. Inbound data and window
     /// events are delivered one at a time without queuing.
     ///
@@ -1608,7 +1606,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy if the packet is not writing or the next slot is occupied,
+    /// Returns busy if the packet is not writing or the FIFO is full,
     /// failed after a terminal error, or a channel or transport error.
     pub fn read_while_global_failure(&mut self) -> Result<OwnedChannelInbound, OwnedChannelError> {
         if self.failed {
@@ -1661,8 +1659,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// Reads one authenticated packet behind a partially written channel failure.
     ///
     /// `id` comes from [`Self::channel_failure_read_id`] and identifies the
-    /// packet's retained owner. One PING or reply-requiring event can be
-    /// retained behind it; further reads then return busy. Complete the active
+    /// packet's retained owner. PINGs and reply-requiring events can be
+    /// retained behind it up to shared capacity eight. Complete the active
     /// channel failure before driving the promoted reply or PONG.
     ///
     /// `WouldBlock` retains partial input. On cancellation keep the driver or
@@ -1675,8 +1673,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy for a stale or foreign ID, no active packet or a full next
-    /// slot, failed after a terminal error, or a channel or transport error.
+    /// Returns busy for a stale or foreign ID, no active packet or a full
+    /// FIFO, failed after a terminal error, or a channel or transport error.
     pub fn read_while_channel_failure(
         &mut self,
         id: &OwnedChannelFailureReadId,
@@ -1736,8 +1734,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// Reads one packet behind the identified partially written open rejection.
     ///
     /// The active rejection remains the only protected writer. A PING or
-    /// reply-requiring event occupies one separate next-obligation slot; no
-    /// more reads are permitted while that slot is full. Finish the active
+    /// reply-requiring event enters the shared FIFO; no
+    /// more reads are permitted while it is full. Finish the active
     /// rejection before driving its promoted reply or PONG. The active pending
     /// open is removed only after its full rejection is written.
     ///
@@ -1749,8 +1747,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy for a stale or foreign ID, no active packet or a full next
-    /// slot, failed after a terminal error, or a channel or transport error.
+    /// Returns busy for a stale or foreign ID, no active packet or a full
+    /// FIFO, failed after a terminal error, or a channel or transport error.
     pub fn read_while_open_rejection(
         &mut self,
         id: &OwnedOpenRejectionReadId,
@@ -1807,7 +1805,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// Reads one packet behind the identified partially written close reply.
     ///
     /// The active close remains the sole protected writer. A PING or
-    /// reply-requiring event occupies one separate bounded next-obligation slot;
+    /// reply-requiring event enters the shared eight-entry FIFO;
     /// further reads return busy while it is full. Finish the active close
     /// before driving the promoted reply or PONG. The active channel is marked
     /// locally closed and retired only after its complete reply is written.
@@ -1822,8 +1820,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy for a stale or foreign ID, no active packet or a full next
-    /// slot, failed after a terminal error, or a channel or transport error.
+    /// Returns busy for a stale or foreign ID, no active packet or a full
+    /// FIFO, failed after a terminal error, or a channel or transport error.
     pub fn read_while_close_reply(
         &mut self,
         id: &OwnedCloseReplyReadId,
@@ -1899,10 +1897,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
 
     /// Reads one authenticated packet behind the identified partial PONG.
     ///
-    /// The active PONG remains the sole protected writer. At most one later
-    /// PING or reply-requiring event is retained separately; further reads are
-    /// busy until the active PONG and that subsequent obligation complete.
-    /// The two PONGs retain their exact payloads and wire order.
+    /// The active PONG remains the sole protected writer and counts toward
+    /// shared capacity eight. Later PINGs and control replies retain arrival
+    /// order; reads are busy at capacity. Every PONG keeps its exact payload.
     ///
     /// `WouldBlock` retains partial input and the active packet. On
     /// cancellation retain the driver or drop it and separately held socket
@@ -1911,8 +1908,8 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// # Errors
     ///
-    /// Returns busy for a stale or foreign ID, no active PONG or a full next
-    /// slot, failed after a terminal error, or a channel or transport error.
+    /// Returns busy for a stale or foreign ID, no active PONG or a full
+    /// FIFO, failed after a terminal error, or a channel or transport error.
     pub fn read_while_pong(
         &mut self,
         id: &OwnedPongReadId,
@@ -1923,8 +1920,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
         if !matches!(
             self.reply_obligations.front().map(|entry| &entry.reply),
             Some(ReplyKind::Pong)
-        ) {
+        ) || !self.connection.transport.owns_deferred_pong(&id.0)
+        {
             return Err(OwnedChannelError::Busy);
+        }
+        if let Some(event) = self.take_retained_event() {
+            return Ok(OwnedChannelInbound::Event(event));
         }
         let result = self.connection.transport.read_while_deferred_pong(&id.0);
         self.handle_behind_reply(result)
@@ -1990,11 +1991,11 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
 
     /// Refuses a consumed global request that asked for a reply.
     ///
-    /// Any admitted data, window adjustment or EOF and deferred pong must
-    /// complete first. The
+    /// Any admitted data, window adjustment or EOF and earlier FIFO entries
+    /// must complete first. The
     /// reply occupies at most one protected packet and is retained across
     /// `WouldBlock`. Once it starts, [`Self::read_while_global_failure`] may
-    /// read with one bounded next obligation; new data and release remain
+    /// read while the bounded FIFO has capacity; new data and release remain
     /// blocked until the reply completes. Dropping the driver discards the
     /// connection, not just the obligation. A non-retryable transport error
     /// makes the driver terminal.
@@ -2049,10 +2050,10 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     ///
     /// `channel` is the local channel from the delivered event. A wrong
     /// channel is rejected without changing the obligation. Data, a window
-    /// adjustment, EOF, a deferred pong and any global failure must complete
+    /// adjustment, EOF and earlier FIFO entries must complete
     /// first. The protected reply is
     /// retained across `WouldBlock`; [`Self::read_while_channel_failure`] may
-    /// read with one bounded next obligation once the reply starts. Admission
+    /// read while the bounded FIFO has capacity once the reply starts. Admission
     /// and release remain blocked until completion. Dropping the driver
     /// discards its connection.
     ///
@@ -2117,7 +2118,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// changed reason is busy; an invalid reason is rejected without consuming
     /// the obligation. Earlier data, deferred pong and control replies must
     /// complete first. Once the reply starts, [`Self::read_while_open_rejection`]
-    /// may read with one bounded next obligation. Data admission and release
+    /// may read while the bounded FIFO has capacity. Data admission and release
     /// remain blocked until the entire rejection is written and its pending
     /// open is removed.
     ///
@@ -2207,7 +2208,7 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// or a close already answered locally, returns busy without changes.
     /// Earlier data and obligations must complete first. On `WouldBlock`, the
     /// same protected packet remains owned; [`Self::read_while_close_reply`]
-    /// may read with one bounded next obligation. Admission and release remain
+    /// may read while the bounded FIFO has capacity. Admission and release remain
     /// blocked until the entire reply is written and the channel is marked
     /// locally closed and retired. Dropping the driver discards its transport.
     ///
@@ -2282,12 +2283,12 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// [`Self::read_while_open_rejection`], [`Self::read_while_close_reply`],
     /// or [`Self::read_while_pong`].
     ///
-    /// Any admitted data packet, window adjustment, EOF or active global or
-    /// channel failure, open rejection or close reply must complete first.
+    /// Any admitted data packet, window adjustment, EOF and earlier FIFO
+    /// entries must complete first. This method never skips a front control.
     /// `WouldBlock` preserves the pong and is retryable; once partially
     /// written, [`Self::pong_read_id`] and [`Self::read_while_pong`] permit a
-    /// bounded inbound step. The active PONG completes before the one next
-    /// PONG or reply is promoted. Any other write failure makes the driver
+    /// bounded inbound step. The active PONG completes before later FIFO
+    /// entries become eligible. Any other write failure makes the driver
     /// terminal. A pong is owed only after
     /// [`OwnedChannelInbound::PongDeferred`], and the connection cannot be
     /// released until this succeeds. Global and channel requests have their own
@@ -2355,9 +2356,9 @@ impl<S: Read + Write> OwnedChannelDriver<S> {
     /// If [`Self::read_while_global_failure`] or
     /// [`Self::read_while_channel_failure`], [`Self::read_while_open_rejection`],
     /// [`Self::read_while_close_reply`], or [`Self::read_while_pong`] receives a PING or a reply-requiring
-    /// event, it retains at most one next
-    /// obligation. Complete the active reply first; only then drive the promoted
-    /// pong or reply. Further reads are blocked while that next slot is occupied.
+    /// event, it retains the obligation in the same eight-entry FIFO.
+    /// Complete the active reply first; only then drive the next
+    /// pong or reply. Further reads are blocked at capacity.
     ///
     /// Drive a deferred pong with [`Self::drive_deferred_pong`], a global
     /// failure with [`Self::drive_global_failure`], a channel failure with

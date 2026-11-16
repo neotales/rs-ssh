@@ -39,15 +39,21 @@ transport. The owned-packet example in `ClientTransport::start_owned_packet`
 shows nonblocking retry and error handling.
 
 For an authenticated connection, `read_while_owned` permits one inbound packet
-per call. It defers at most one transport PONG behind the owned packet and
-refuses further inbound reads until that PONG is sent. Finish the owner, then
-call `drive_deferred_pong` before a new write or local rekey. A peer
+per call. One FIFO retains up to eight PONG/control obligations, including an
+active reply. A partial inbound packet reserves a slot and resumes using that
+same reservation. At capacity a new read is refused without consuming bytes
+or advancing sequence. Finish the owner, then drive FIFO replies before a new
+write or local rekey. Only the front can be sealed; it stays queued across
+`WouldBlock` and is removed only after its complete write commits. A peer
 `SSH_MSG_KEXINIT` received through this limited path is authenticated and
 retained: its sequence number is committed once, the owned packet can still be
 completed, and the owned channel driver advances the rekey from its idle read
 step. Extension messages, malformed KEXINIT, and rekey messages other than
 KEXINIT still terminally disable protected I/O; this is not yet a full-duplex
-rekey scheduler.
+rekey scheduler. Older replies drain under old outbound keys before the local
+KEXINIT is sent. The owned channel driver retains one parsed event until its
+read wrapper moves it to the caller, exactly once; the caller must retain an
+undeliverable event and stop ordinary reads until it has room.
 
 The crate manifest currently says `0.0.0-alpha.2`. This notice does not assign
 a release version: the repository material inspected does not establish a

@@ -1217,7 +1217,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a state error for an invalid owner or a deferred pong, an I/O
+    /// Returns a state error for an invalid owner or full obligation FIFO, an I/O
     /// error on incomplete input, or a terminal protocol/protection error.
     pub fn read_while_owned(&mut self, id: &OwnedPacketId) -> Result<OwnedInbound, TransportError> {
         if !self.owns_packet(id)
@@ -1261,7 +1261,7 @@ where
     /// apply its own step budget. The original session identifier remains the
     /// NEWKEYS derivation input.
     ///
-    /// The caller must have finished every owned packet and deferred pong; an
+    /// The caller must have finished every owned packet and queued reply; an
     /// active one returns [`TransportError::OwnedPacketState`]. Unsupported
     /// proposals, malformed or out-of-order rekey packets, and protection
     /// failures fail closed and disable protected I/O. A `WouldBlock` keeps the
@@ -1319,6 +1319,12 @@ where
         self.pong_write_id.clone()
     }
 
+    pub(crate) fn owns_deferred_pong(&self, id: &OwnedPacketId) -> bool {
+        self.pong_write_id
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
+    }
+
     pub(crate) fn read_while_deferred_pong(
         &mut self,
         id: &OwnedPacketId,
@@ -1327,10 +1333,7 @@ where
             || !self.deferred_owned_pong
             || self.owned_obligations.is_empty()
             || !self.can_admit_owned_read()
-            || !self
-                .pong_write_id
-                .as_ref()
-                .is_some_and(|active| Arc::ptr_eq(&active.0, &id.0))
+            || !self.owns_deferred_pong(id)
         {
             return Err(TransportError::OwnedPacketState);
         }
