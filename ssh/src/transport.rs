@@ -25,6 +25,10 @@ pub use crate::sequence::RekeyPhase;
 use crate::sequence::{Direction, SequenceError, SequenceState};
 use neotales_ssh::compression::CompressionAlgorithm;
 
+#[cfg(test)]
+#[path = "transport_owned_tests.rs"]
+mod owned_tests;
+
 /// Independent opt-ins retained across transport rekeys.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CompressionPolicy {
@@ -716,27 +720,47 @@ pub(crate) enum ExtensionState {
 }
 
 const OBLIGATION_CAPACITY: usize = 8;
-type Payload = Vec<u8>;
-#[allow(dead_code)] // Control is reserved for the channel driver follow-up.
+/// Opaque identity of one FIFO entry, independent of any sealed packet.
+#[derive(Clone, Debug)]
+pub(crate) struct ObligationId(Arc<()>);
+
+impl PartialEq for ObligationId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for ObligationId {}
+
 enum Obligation {
     Pong(Vec<u8>),
-    Control(Payload),
+    Control {
+        payload: Option<Vec<u8>>,
+        packet: Option<OwnedPacketId>,
+    },
+}
+struct ObligationEntry {
+    id: ObligationId,
+    obligation: Obligation,
 }
 #[derive(Debug)]
 struct Full;
 #[derive(Default)]
 struct ObligationQueue {
-    entries: VecDeque<Obligation>,
+    entries: VecDeque<ObligationEntry>,
 }
 impl ObligationQueue {
-    fn push(&mut self, obligation: Obligation) -> Result<(), Full> {
+    fn push(&mut self, obligation: Obligation) -> Result<ObligationId, Full> {
         if self.len() >= OBLIGATION_CAPACITY {
             return Err(Full);
         }
-        self.entries.push_back(obligation);
-        Ok(())
+        let id = ObligationId(Arc::new(()));
+        self.entries.push_back(ObligationEntry {
+            id: id.clone(),
+            obligation,
+        });
+        Ok(id)
     }
-    fn front(&self) -> Option<&Obligation> {
+    fn front(&self) -> Option<&ObligationEntry> {
         self.entries.front()
     }
     fn pop_after_successful_write(&mut self) {
@@ -1013,18 +1037,110 @@ where
     /// Refuses an unestablished or busy transport, an active rekey, or an
     /// invalid payload. A protection failure terminally disables protected I/O.
     pub fn start_owned_packet(&mut self, payload: &[u8]) -> Result<OwnedPacketId, TransportError> {
+        if !self.owned_obligations.is_empty() {
+            return Err(TransportError::OwnedPacketState);
+        }
+        if self.rekey_active() {
+            return Err(TransportError::RekeyInProgress);
+        }
+        self.seal_owned_packet(payload)
+    }
+
+    /// Reserve metadata storage without choosing the caller's reply policy.
+    #[allow(dead_code)] // Connected to the channel FIFO in the next slice.
+    pub(crate) fn reserve_owned_control(&mut self) -> Result<ObligationId, TransportError> {
+        if self.owned_obligations.len() + usize::from(self.owned_read_reserved)
+            >= OBLIGATION_CAPACITY
+        {
+            return Err(TransportError::OwnedPacketState);
+        }
+        self.owned_obligations
+            .push(Obligation::Control {
+                payload: None,
+                packet: None,
+            })
+            .map_err(|_| TransportError::OwnedPacketState)
+    }
+
+    #[allow(dead_code)] // Connected to the channel FIFO in the next slice.
+    pub(crate) fn last_owned_obligation_id(&self) -> Option<ObligationId> {
+        self.owned_obligations
+            .entries
+            .back()
+            .map(|entry| entry.id.clone())
+    }
+
+    /// A retained proposal is not an active exchange yet. Older replies drain
+    /// under old keys, but cannot bypass any active ciphertext or FIFO front.
+    #[allow(dead_code)] // Connected to the channel FIFO in the next slice.
+    pub(crate) fn start_owned_control_packet(
+        &mut self,
+        id: &ObligationId,
+        payload: &[u8],
+    ) -> Result<OwnedPacketId, TransportError> {
+        if !self.owned_obligations.front().is_some_and(|entry| {
+            entry.id == *id
+                && matches!(
+                    entry.obligation,
+                    Obligation::Control {
+                        payload: None,
+                        packet: None
+                    }
+                )
+        }) || self.rekey.is_some()
+            || self.sequence.rekey_active()
+        {
+            return Err(TransportError::OwnedPacketState);
+        }
+        let packet = self.seal_owned_packet(payload)?;
+        let entry = self
+            .owned_obligations
+            .entries
+            .front_mut()
+            .expect("validated front");
+        entry.obligation = Obligation::Control {
+            payload: Some(payload.to_vec()),
+            packet: Some(packet.clone()),
+        };
+        Ok(packet)
+    }
+
+    /// Successful packet driving already committed and acknowledged the write.
+    /// Only its matching front reservation can now be removed.
+    #[allow(dead_code)] // Connected to the channel FIFO in the next slice.
+    pub(crate) fn complete_owned_control(
+        &mut self,
+        id: &ObligationId,
+    ) -> Result<(), TransportError> {
+        if !self.established
+            || self.owned_packet.is_some()
+            || self.write_buffer.is_pending()
+            || !self.owned_obligations.front().is_some_and(|entry| {
+                entry.id == *id
+                    && matches!(
+                        entry.obligation,
+                        Obligation::Control {
+                            payload: Some(_),
+                            packet: Some(_)
+                        }
+                    )
+            })
+        {
+            return Err(TransportError::OwnedPacketState);
+        }
+        self.owned_obligations.pop_after_successful_write();
+        Ok(())
+    }
+
+    fn seal_owned_packet(&mut self, payload: &[u8]) -> Result<OwnedPacketId, TransportError> {
         if !self.established {
             return Err(TransportError::NotEstablished);
         }
         if self.owned_packet.is_some()
             || self.write_buffer.is_pending()
             || self.pending_transport_reply.is_some()
-            || !self.owned_obligations.is_empty()
         {
             return Err(TransportError::OwnedPacketState);
-        }
-        if self.rekey_active() {
-            return Err(TransportError::RekeyInProgress);
         }
         if payload.is_empty() || matches!(payload[0], 20 | 21 | 30..=49) {
             return Err(TransportError::InvalidMessage);
@@ -1120,7 +1236,13 @@ where
     /// Reads one authenticated packet for the channel driver without an
     /// outbound owner. The channel driver retains any resulting obligation.
     pub(crate) fn read_idle_owned(&mut self) -> Result<OwnedInbound, TransportError> {
-        if !self.can_start_owned_channel_driver() {
+        if !self.established
+            || !self.authenticated
+            || self.owned_packet.is_some()
+            || self.write_buffer.is_pending()
+            || self.pending_transport_reply.is_some()
+            || !self.can_admit_owned_read()
+        {
             return Err(TransportError::OwnedPacketState);
         }
         self.read_owned_step()
@@ -1151,7 +1273,7 @@ where
     /// Returns a state, I/O, negotiation, KEX, host-key, sequence, or
     /// protection error. A non-`WouldBlock` failure is terminal.
     pub fn advance_retained_peer_rekey(&mut self) -> Result<bool, TransportError> {
-        if self.owned_packet.is_some() || self.deferred_owned_pong {
+        if self.owned_packet.is_some() || !self.owned_obligations.is_empty() {
             return Err(TransportError::OwnedPacketState);
         }
         if !self.established {
@@ -1213,7 +1335,7 @@ where
         self.read_owned_step()
     }
 
-    fn can_admit_owned_read(&self) -> bool {
+    pub(crate) fn can_admit_owned_read(&self) -> bool {
         self.owned_read_reserved || self.owned_obligations.len() < OBLIGATION_CAPACITY
     }
 
@@ -1292,30 +1414,57 @@ where
     /// Returns a state error if no deferred pong is ready or the owner is still
     /// active, or a transport error if the pong cannot be written.
     pub fn drive_deferred_pong(&mut self) -> Result<(), TransportError> {
-        if self.owned_packet.is_some() || !self.deferred_owned_pong {
+        if self.owned_packet.is_some() || !self.established {
             return Err(TransportError::OwnedPacketState);
         }
-        // Move the queue, not its payload: the writer borrows the exact bytes.
-        let mut obligations = std::mem::take(&mut self.owned_obligations);
-        let Some(Obligation::Pong(reply)) = obligations.front() else {
-            self.owned_obligations = obligations;
+        if self.rekey.is_some() || self.sequence.rekey_active() {
+            return Err(TransportError::RekeyInProgress);
+        }
+        let Some(ObligationEntry {
+            obligation: Obligation::Pong(reply),
+            ..
+        }) = self.owned_obligations.front()
+        else {
             return Err(TransportError::OwnedPacketState);
         };
-        let result = self.write_payload_inner_with_retained(reply, false);
-        if result.is_ok() {
-            obligations.pop_after_successful_write();
-            self.pong_write_id = None;
-            self.deferred_owned_pong = !obligations.is_empty();
-        } else if self.established
-            && matches!(&result, Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
-        {
-            self.pong_write_id
-                .get_or_insert_with(|| OwnedPacketId(Arc::new(())));
+        let sequence = self.sequence.outbound_sequence();
+        let protector = self
+            .write_protector
+            .as_mut()
+            .ok_or(TransportError::NotEstablished)?;
+        let result = write_protected_packet_buffered(
+            &mut self.stream,
+            &mut self.write_buffer,
+            protector,
+            sequence,
+            reply,
+            None,
+        );
+        match result {
+            Ok(_) => {}
+            Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.pong_write_id
+                    .get_or_insert_with(|| OwnedPacketId(Arc::new(())));
+                return Err(TransportError::Io(error));
+            }
+            Err(error) => return Err(self.fail_protected_write(error)),
         }
-        if self.established {
-            self.owned_obligations = obligations;
+        match self.sequence.commit_outbound() {
+            Ok(committed) if committed == sequence => {}
+            Ok(_) => return Err(self.fail_protected_write(TransportError::InvalidMessage)),
+            Err(error) => return Err(self.fail_protected_write(error.into())),
         }
-        result
+        if let Err(error) = self.write_buffer.acknowledge(sequence) {
+            return Err(self.fail_protected_write(error));
+        }
+        self.owned_obligations.pop_after_successful_write();
+        self.pong_write_id = None;
+        self.deferred_owned_pong = self
+            .owned_obligations
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.obligation, Obligation::Pong(_)));
+        Ok(())
     }
 
     /// Writes one protected payload and commits its outbound sequence number.
