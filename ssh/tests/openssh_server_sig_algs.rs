@@ -52,7 +52,7 @@
 //!
 //! `sshd` and `ssh-keygen` are the system OpenSSH programs, resolved at run
 //! time by `openssh_tools` rather than named by absolute path. Without
-//! `NEOTALES_SSH_E2E=1` both tests return before creating a directory or
+//! `NEOTALES_SSH_E2E=1` all tests return before creating a directory or
 //! starting a process. With it set, a missing program is a failure: these lanes
 //! are evidence, and a lane that reported success because it never started a
 //! peer would make the evidence unfalsifiable.
@@ -151,6 +151,10 @@ fn effective_config(sshd: &Path, config: &Path) -> Result<String, Box<dyn Error>
 /// Starts a loopback-only server that advertises and accepts only
 /// [`ACCEPTED_RSA_SIGNATURE`].
 fn start_server() -> Result<OpenSshServer, Box<dyn Error>> {
+    start_server_with_rekey(false)
+}
+
+fn start_server_with_rekey(rekey: bool) -> Result<OpenSshServer, Box<dyn Error>> {
     let directory = openssh_tools::temp_dir::TempDir::new("neotales-server-sig-algs")
         .map_err(|error| format!("could not create the server-sig-algs test directory: {error}"))?;
     let ssh_keygen = openssh_tools::ssh_keygen()?;
@@ -186,11 +190,14 @@ fn start_server() -> Result<OpenSshServer, Box<dyn Error>> {
              StrictModes no\n\
              MaxAuthTries 100\n\
              LoginGraceTime 60\n\
-             LogLevel DEBUG1\n\
-             PubkeyAcceptedAlgorithms {ACCEPTED_RSA_SIGNATURE}\n",
+             LogLevel {}\n\
+             PubkeyAcceptedAlgorithms {ACCEPTED_RSA_SIGNATURE}\n\
+             {}\n",
             host_key.display(),
             directory.join("sshd.pid").display(),
             user_key.with_extension("pub").display(),
+            if rekey { "DEBUG3" } else { "DEBUG1" },
+            if rekey { "RekeyLimit 64K 1h" } else { "" },
         ),
     )
     .map_err(|error| {
@@ -201,6 +208,13 @@ fn start_server() -> Result<OpenSshServer, Box<dyn Error>> {
     })?;
 
     let effective = effective_config(&sshd, &config)?;
+    if rekey
+        && !effective
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("rekeylimit 65536 3600"))
+    {
+        return Err(format!("sshd did not apply RekeyLimit: {effective}").into());
+    }
     let expected = format!("pubkeyacceptedalgorithms {ACCEPTED_RSA_SIGNATURE}");
     if !effective.lines().any(|line| {
         line.split_whitespace()
@@ -251,6 +265,82 @@ fn start_server() -> Result<OpenSshServer, Box<dyn Error>> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Exchanges patterned bytes through `cat` in small chunks, so both directions
+/// cross the server's byte limit without deadlocking the channel windows.
+/// OpenSSH's second NEWKEYS proves a rekey beyond the initial handshake, and
+/// the second channel proves the same connection remains usable afterwards.
+#[test]
+#[ignore = "live OpenSSH rekey lane: NEOTALES_SSH_E2E=1"]
+fn live_openssh_rekeys_during_bidirectional_channel_traffic() -> Result<(), Box<dyn Error>> {
+    use neotales_ssh::session::{ClientSessions, SessionEvent};
+
+    if !live_lane_requested() {
+        return Ok(());
+    }
+    let server = start_server_with_rekey(true)?;
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let signer = sha512_rsa_signer(&server.directory)?;
+        let mut transport = connect(server.port, true)?;
+        authenticate_client(
+            &mut transport,
+            openssh_tools::current_user()?,
+            &[ClientAuthMethod::public_key(signer)],
+            4,
+        )?;
+        let mut sessions = ClientSessions::new(transport);
+        for size in [256 * 1024, 4096] {
+            let id = sessions.open_session()?;
+            while !matches!(sessions.dispatch_one()?, SessionEvent::Opened { session } if session == id)
+            {
+            }
+            sessions.request_exec(id, b"cat", true)?;
+            let data: Vec<u8> = (0..size)
+                .map(|i| u8::try_from((i * 31 + i / 251) % 256).unwrap())
+                .collect();
+            let mut received = Vec::new();
+            for chunk in data.chunks(4096) {
+                while sessions
+                    .connection()
+                    .channel(id)
+                    .ok_or("missing channel")?
+                    .remote_window()
+                    < 4096
+                {
+                    sessions.dispatch_one()?;
+                }
+                let target = received.len() + chunk.len();
+                let written = sessions.send_data(id, chunk)?;
+                assert_eq!(written, chunk.len());
+                while received.len() < target {
+                    match sessions.dispatch_one()? {
+                        SessionEvent::Data { session, data } if session == id => {
+                            sessions.increase_local_window(id, u32::try_from(data.len())?)?;
+                            received.extend(data);
+                        }
+                        SessionEvent::Close { .. } => return Err("cat closed early".into()),
+                        _ => {}
+                    }
+                }
+            }
+            sessions.send_eof(id)?;
+            while !matches!(sessions.dispatch_one()?, SessionEvent::Close { session } if session == id)
+            {
+            }
+            assert_eq!(received, data);
+        }
+        Ok(())
+    })();
+    let log = fs::read_to_string(&server.log).unwrap_or_default();
+    if let Err(error) = result {
+        return Err(format!("rekey traffic failed: {error}\nsshd log:\n{log}").into());
+    }
+    assert!(
+        log.matches("SSH2_MSG_NEWKEYS sent").count() >= 2,
+        "no peer rekey:\n{log}"
+    );
+    Ok(())
 }
 
 /// Decodes the base64 body of an armored `ssh-keygen` private key.
