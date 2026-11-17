@@ -83,6 +83,15 @@ packet, and callers must not pass secrets.
 
 ## Opening a connection
 
+`AuthError::AuthenticationFailed` does not prove that credentials were offered
+or rejected: public-key methods can be skipped because their signature
+algorithms are incompatible with the server's advertised list.
+`ClientAuthenticator::server_rejected_authentication()` separately records a
+validated authentication-failure response during the latest authentication
+call. It resets for each call, excludes service-negotiation failures, and also
+records partial success; a later method may still succeed. It never classifies
+failure from diagnostic wording or the attempt counter.
+
 The builder is for anything the destination string cannot express: an explicit
 pin, or a port you set per copy.
 

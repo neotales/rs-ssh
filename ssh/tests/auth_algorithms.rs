@@ -82,6 +82,67 @@ fn round_trip(
 }
 
 #[test]
+fn skipped_methods_and_real_refusals_have_distinct_server_failure_observations()
+-> Result<(), Box<dyn std::error::Error>> {
+    use neotales_ssh::auth::{AuthError, ClientAuthenticator, ServerAuthStep, ServerAuthenticator};
+    for refused in [false, true] {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut transport = ServerConfig::new(Ed25519Signer::from_seed(&mut [9; 32]))
+                .connect(socket)
+                .unwrap();
+            let algorithms = if refused {
+                &["ssh-ed25519"][..]
+            } else {
+                &["rsa-sha2-256"][..]
+            };
+            let policy = ServerAuthPolicy::new(4)
+                .unwrap()
+                .with_signature_algorithms(algorithms)
+                .unwrap();
+            let mut auth = ServerAuthenticator::new(&mut transport, &policy);
+            assert_eq!(auth.step().unwrap(), ServerAuthStep::ServiceAccepted);
+            if refused {
+                assert_eq!(auth.step().unwrap(), ServerAuthStep::Failure);
+            } else {
+                drop(auth);
+                assert!(
+                    transport.read_payload().is_err(),
+                    "a method was offered despite algorithm incompatibility"
+                );
+            }
+        });
+        let socket = TcpStream::connect(address)?;
+        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut transport = ClientConfig::new()
+            .with_extension_info()
+            .connect(socket, |_| Ok::<(), ()>(()))?;
+        let mut auth = ClientAuthenticator::new(&mut transport, "fixture", 4)?;
+        let result = auth.authenticate(&[ClientAuthMethod::public_key(PublicKeySigner::ed25519(
+            Ed25519Signer::from_seed(&mut [10; 32]),
+        ))]);
+        assert_eq!(result.unwrap_err(), AuthError::AuthenticationFailed);
+        assert_eq!(auth.server_rejected_authentication(), refused);
+        // A new call must not misattribute an old refusal to skipped/no methods.
+        assert_eq!(auth.authenticate(&[]).unwrap_err(), AuthError::NoMethods);
+        assert!(!auth.server_rejected_authentication());
+        drop(auth);
+        drop(transport);
+        server.join().unwrap();
+    }
+    Ok(())
+}
+
+#[test]
 fn rsa_uses_sha512_only_when_listed_and_falls_back_to_sha256_without_ext_info()
 -> Result<(), Box<dyn std::error::Error>> {
     let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024)?;

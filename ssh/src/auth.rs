@@ -138,7 +138,9 @@ pub enum AuthError {
     CallbackPanicked,
     /// The caller-selected attempt bound was exhausted.
     AttemptsExhausted,
-    /// No configured client method remained after a failure response.
+    /// No configured client method completed authentication. This also includes
+    /// methods skipped for incompatible signature algorithms, without an offer
+    /// or failure response. See [`ClientAuthenticator::server_rejected_authentication`].
     AuthenticationFailed,
     /// The method list supplied to the client was empty.
     NoMethods,
@@ -3292,6 +3294,7 @@ pub struct ClientAuthenticator<'a, S> {
     banner_callback: Box<BannerCallback>,
     server_methods: Option<Vec<String>>,
     partial_success: bool,
+    server_rejected_authentication: bool,
 }
 
 impl<S> fmt::Debug for ClientAuthenticator<'_, S> {
@@ -3342,10 +3345,13 @@ where
             banner_callback: Box::new(|_message, _language| {}),
             server_methods: None,
             partial_success: false,
+            server_rejected_authentication: false,
         })
     }
 
-    /// Returns the number of user-authentication requests sent.
+    /// Returns the attempts charged against the bound, including a public-key
+    /// method skipped for incompatible signature algorithms. This is not proof
+    /// that credentials or even a public-key query were offered on the wire.
     #[must_use]
     pub const fn attempts(&self) -> usize {
         self.attempts
@@ -3356,6 +3362,18 @@ where
     #[must_use]
     pub const fn partial_success(&self) -> bool {
         self.partial_success
+    }
+
+    /// Whether the latest authentication call observed a validated server
+    /// authentication-failure response (message 51), including partial success.
+    ///
+    /// Service-negotiation failures, local errors and skipped methods do not
+    /// set this flag. It resets at each authentication call. True does not mean
+    /// the whole call failed: a later method can still succeed, and partial
+    /// success can mean another factor is required rather than bad credentials.
+    #[must_use]
+    pub const fn server_rejected_authentication(&self) -> bool {
+        self.server_rejected_authentication
     }
 
     /// Installs a callback invoked for every received authentication banner.
@@ -3427,6 +3445,7 @@ where
         &mut self,
         methods: impl IntoIterator<Item = &'method ClientAuthMethod>,
     ) -> Result<ClientAuthSuccess, AuthError> {
+        self.server_rejected_authentication = false;
         let mut methods = methods.into_iter().peekable();
         if methods.peek().is_none() {
             return Err(AuthError::NoMethods);
@@ -3615,6 +3634,7 @@ where
                     }
                     self.server_methods = Some(methods);
                     self.partial_success = partial;
+                    self.server_rejected_authentication = true;
                     return Ok(payload);
                 }
                 Some(&SSH_MSG_USERAUTH_BANNER) => {
@@ -3875,6 +3895,7 @@ where
                     }
                     self.server_methods = Some(methods.clone());
                     self.partial_success = partial_success;
+                    self.server_rejected_authentication |= context != ResponseContext::Service;
                     return Ok(ClientResponse::Failure {
                         methods,
                         partial_success,
