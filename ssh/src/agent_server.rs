@@ -44,24 +44,43 @@ impl AgentServer {
     /// # Errors
     /// Rejects unsupported algorithms or an invalid public key.
     pub fn from_signer(signer: PublicKeySigner) -> Result<Self, AgentError> {
-        if !matches!(
-            signer,
-            PublicKeySigner::Ed25519(_) | PublicKeySigner::Rsa(_)
-        ) {
-            return Err(AgentError::UnsupportedKey);
+        Self::from_signers(vec![signer])
+    }
+
+    /// Constructs a read-only agent from explicitly supplied signers.
+    ///
+    /// # Errors
+    /// Rejects excessive identities, unsupported algorithms or invalid keys.
+    pub fn from_signers(signers: Vec<PublicKeySigner>) -> Result<Self, AgentError> {
+        if signers.len() > MAX_AGENT_IDENTITIES {
+            return Err(AgentError::AgentFailure);
         }
-        let blob = signer
-            .public_key_blob()
-            .map_err(|_| AgentError::AgentFailure)?;
-        if blob.len() + 13 > MAX_FRAME_SIZE {
-            return Err(AgentError::FrameTooLarge);
-        }
-        Ok(Self {
-            identities: vec![Identity {
+        let mut identities = Vec::with_capacity(signers.len());
+        let mut size = 5_usize;
+        for signer in signers {
+            if !matches!(
+                signer,
+                PublicKeySigner::Ed25519(_) | PublicKeySigner::Rsa(_)
+            ) {
+                return Err(AgentError::UnsupportedKey);
+            }
+            let blob = signer
+                .public_key_blob()
+                .map_err(|_| AgentError::AgentFailure)?;
+            size = size
+                .checked_add(blob.len() + 8)
+                .ok_or(AgentError::FrameTooLarge)?;
+            if size > MAX_FRAME_SIZE {
+                return Err(AgentError::FrameTooLarge);
+            }
+            identities.push(Identity {
                 signer,
                 blob,
                 comment: Vec::new(),
-            }],
+            });
+        }
+        Ok(Self {
+            identities,
             lock: None,
         })
     }
