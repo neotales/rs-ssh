@@ -39,6 +39,43 @@ impl std::fmt::Debug for AgentServer {
     }
 }
 impl AgentServer {
+    /// Constructs a read-only agent with one explicitly provided signer.
+    ///
+    /// # Errors
+    /// Rejects unsupported algorithms or an invalid public key.
+    pub fn from_signer(signer: PublicKeySigner) -> Result<Self, AgentError> {
+        if !matches!(
+            signer,
+            PublicKeySigner::Ed25519(_) | PublicKeySigner::Rsa(_)
+        ) {
+            return Err(AgentError::UnsupportedKey);
+        }
+        let blob = signer
+            .public_key_blob()
+            .map_err(|_| AgentError::AgentFailure)?;
+        if blob.len() + 13 > MAX_FRAME_SIZE {
+            return Err(AgentError::FrameTooLarge);
+        }
+        Ok(Self {
+            identities: vec![Identity {
+                signer,
+                blob,
+                comment: Vec::new(),
+            }],
+            lock: None,
+        })
+    }
+
+    /// Answers an agent request without allowing changes to the keyring.
+    /// The request excludes its four-byte length; failures return code 5.
+    #[must_use]
+    pub fn answer_read_only(&mut self, request: &[u8]) -> Vec<u8> {
+        if request.len() > MAX_FRAME_SIZE || !matches!(request.first(), Some(11 | 13)) {
+            return vec![5];
+        }
+        self.answer(request).unwrap_or_else(|_| vec![5])
+    }
+
     /// Reads, processes and answers exactly one length-framed request.
     /// Caller owns transport I/O limits. Private request buffers are wiped.
     /// Protocol denials return message 5, without diagnostic/key bytes.

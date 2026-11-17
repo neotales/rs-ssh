@@ -3,6 +3,7 @@ use neotales_ssh::{
     Writer,
     agent::AgentClient,
     agent_server::AgentServer,
+    auth::PublicKeySigner,
     hostkey::{Ed25519PublicKey, Ed25519Signer, verify_host_key_signature},
 };
 use std::io::{self, Cursor, Read, Write};
@@ -68,6 +69,64 @@ fn identity(seed: u8) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> 
     record.write_string(&private)?;
     record.write_string("synthetic identity")?;
     Ok((record.into_bytes(), blob))
+}
+
+#[test]
+fn explicit_read_only_signer_enumerates_and_signs_without_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let signer = Ed25519Signer::from_seed(&mut [71; 32]);
+    let blob = signer.public_key_blob()?;
+    let mut server = AgentServer::from_signer(PublicKeySigner::ed25519(signer))?;
+    let identities = server.answer_read_only(&[11]);
+    assert_eq!(identities[0], 12);
+    assert!(identities.windows(blob.len()).any(|window| window == blob));
+    let mut request = Writer::new();
+    request.write_byte(13);
+    request.write_string(&blob)?;
+    request.write_string(b"explicit-agent-test")?;
+    request.write_uint32(0);
+    let response = server.answer_read_only(request.as_bytes());
+    let mut reader = neotales_ssh::Reader::new(&response);
+    assert_eq!(reader.read_byte()?, 14);
+    let signature = reader.read_string()?;
+    verify_host_key_signature(
+        &Ed25519PublicKey::from_blob(&blob)?,
+        signature,
+        b"explicit-agent-test",
+    )?;
+    assert_eq!(server.answer_read_only(&[19]), [5]);
+    assert_eq!(server.answer_read_only(&[22]), [5]);
+    assert_eq!(server.answer_read_only(&[11])[0], 12);
+    Ok(())
+}
+
+#[test]
+fn read_only_rsa_signing_enforces_sha2_flags() -> Result<(), Box<dyn std::error::Error>> {
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024)?;
+    let signer = neotales_ssh::auth::RsaAuthSigner::from_private_key(key)?;
+    let blob = signer.public_key_blob().to_vec();
+    let public = neotales_ssh::rsa_hostkey::RsaPublicKey::from_blob(&blob)?;
+    let mut server = AgentServer::from_signer(PublicKeySigner::rsa(signer))?;
+    for flags in [0, 2, 4, 6] {
+        let mut request = Writer::new();
+        request.write_byte(13);
+        request.write_string(&blob)?;
+        request.write_string(b"rsa payload")?;
+        request.write_uint32(flags);
+        let result = server.answer_read_only(request.as_bytes());
+        if flags == 2 || flags == 4 {
+            let mut reader = neotales_ssh::Reader::new(&result);
+            assert_eq!(reader.read_byte()?, 14);
+            neotales_ssh::rsa_hostkey::verify_host_key_signature(
+                &public,
+                reader.read_string()?,
+                b"rsa payload",
+            )?;
+        } else {
+            assert_eq!(result, [5]);
+        }
+    }
+    Ok(())
 }
 
 #[test]
