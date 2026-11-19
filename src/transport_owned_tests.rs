@@ -69,7 +69,7 @@ fn private_control_identity_front_and_completion_boundaries() {
         assert!(transport.start_owned_control_packet(id, &[82]).is_err());
         assert!(transport.complete_owned_control(id).is_err());
     }
-    assert!(transport.stream.output.is_empty());
+    assert_eq!(transport.stream.output, Vec::<u8>::new());
     transport.drive_owned_packet(&data).unwrap();
     transport.stream.output.clear();
     assert!(
@@ -122,7 +122,7 @@ fn private_mixed_fifo_counts_active_reply_and_blocks_rekey() {
     transport.retained_peer_kexinit = Some(vec![20]);
     assert!(transport.advance_retained_peer_rekey().is_err());
     assert!(transport.drive_deferred_pong().is_err());
-    assert!(transport.stream.output.is_empty());
+    assert_eq!(transport.stream.output, Vec::<u8>::new());
     let reads = transport.stream.reads;
     assert!(transport.reserve_owned_control().is_err());
     assert!(transport.read_idle_owned().is_err());

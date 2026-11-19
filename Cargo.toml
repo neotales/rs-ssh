@@ -1,0 +1,84 @@
+[package]
+name = "neotales-ssh"
+description = "SSH-2 wire codec, key exchange, authentication and transport"
+version = "0.0.0-alpha.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+repository = "https://github.com/neotales/rs-ssh"
+authors = ["Neotales"]
+readme = "README.md"
+keywords = ["ssh", "sftp", "scp", "cryptography", "network-programming"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Public opt-in protected-packet counter and controlled-peer
+# `ServerTransport::write_rekey_ignorable` hook for authenticated, active,
+# non-strict rekeys. Cargo feature unification depends on resolver and dependency
+# kind; dev-dependencies and test builds are not security boundaries. Review the
+# capability before enabling it in production; see the README for contracts.
+test-support = []
+
+[dependencies]
+aes = { version = "0.9.2", features = ["zeroize"] }
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+chacha20 = { version = "0.10.2", features = ["cipher", "legacy", "xchacha", "zeroize"] }
+ctr = { version = "0.10.1", features = ["zeroize"] }
+des = { version = "0.9.0", features = ["zeroize"] }
+ed25519-dalek = { version = "3.0.0", features = ["alloc", "pkcs8"] }
+flate2 = "1.1"
+getrandom = "0.3"
+hmac = "0.13.0"
+ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+ml-dsa = { version = "=0.1.2", default-features = false, features = ["alloc", "zeroize", "rand_core"] }
+neotales-x509 = "0.0.0-alpha.1"
+p256 = { version = "0.14.0", features = ["arithmetic"] }
+p384 = { version = "0.14.0", features = ["arithmetic"] }
+p521 = { version = "0.14.0", features = ["arithmetic"] }
+poly1305 = "0.9.1"
+rsa = { version = "0.9.10", features = ["sha2"] }
+sha1 = "0.11.0"
+sha2 = "0.11"
+sntrup-kem = { version = "=0.1.0-rc.0", features = ["force-scalar"] }
+subtle = "2.6.1"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+# A direct dependency because a public type carries `zeroize::Zeroizing`.
+zeroize = { version = "=1.9.0", features = ["derive"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
+
+[dev-dependencies]
+tempfile = "3.24"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.6", features = ["fs"] }
+
+[lints]
+workspace = true
+
+[workspace]
+resolver = "3"
+members = [".", "e2e"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+repository = "https://github.com/neotales/rs-ssh"
+authors = ["Neotales"]
+version = "0.0.0-alpha.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
