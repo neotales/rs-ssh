@@ -85,7 +85,7 @@ impl TransferRoot {
     pub(crate) fn new(root: &Path) -> Result<Self, RootedTransferError> {
         let path = root.canonicalize()?;
         if !path.is_dir() {
-            return Err(io::ErrorKind::NotADirectory.into());
+            return Err(io::Error::from(io::ErrorKind::NotADirectory).into());
         }
         Ok(Self { path })
     }
