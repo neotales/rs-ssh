@@ -55,7 +55,7 @@ KEXINIT is sent. The owned channel driver retains one parsed event until its
 read wrapper moves it to the caller, exactly once; the caller must retain an
 undeliverable event and stop ordinary reads until it has room.
 
-The crate manifest currently says `0.0.0-alpha.2`. This notice does not assign
+The crate manifest currently says `0.0.0-alpha.0`. This notice does not assign
 a release version: the repository material inspected does not establish a
 versioning policy for `neotales-ssh`, so release status and treatment remain
 to be decided before any publication of this change.

@@ -1,18 +1,19 @@
 [package]
 name = "neotales-ssh-e2e"
-version = "0.0.0-alpha.1"
+version.workspace = true
 publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
 
 [dev-dependencies]
-neotales-ssh = { path = "../ssh" }
+neotales-ssh = { path = ".." }
 testcontainers = "=0.28.0"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
-base64.workspace = true
-tempfile.workspace = true
+base64 = "0.22"
+tempfile = "3.24"
 
 [lints]
 workspace = true
