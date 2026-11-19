@@ -6,15 +6,19 @@ By [x0craft](https://github.com/x0craft).
 
 [![Neotales](https://github.com/neotales/brand/raw/main/assets/logo.png)](https://github.com/neotales/rs-ssh)
 
+![One does not simply negotiate SSH keys](https://media.giphy.com/media/smW5FBep69d3q/giphy.gif)
+
+**One does not simply negotiate SSH keys.** `neotales-ssh` handles the wire exchange, while your application decides which host keys to trust.
+
 <!-- badges: crates.io, docs.rs, CI. Add once the first version exists. -->
 
-## Install
+## Install 📦
 
 ```sh
 cargo add neotales-ssh
 ```
 
-## What you can do 🔐
+## What you can do 🔧
 
 **Encode SSH wire strings.** `encode_string` writes the SSH length prefix and bytes. `decode_string` reads that format and returns the payload.
 
@@ -34,11 +38,11 @@ assert_eq!(decode_string(&encoded)?, b"hello");
 
 The crate provides protocol building blocks and client helpers; applications choose host-key trust policy and server session policy.
 
-## Licence
+## Licence 📜
 
 [MIT](LICENSE.md)
 
-## Test
+## Test 🧪
 
 The crate uses Rust 1.100 and RustCrypto dependencies. Run its library and doctests offline from this repository:
 
