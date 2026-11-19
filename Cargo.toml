@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/neotales/rs-ssh"
-authors = ["x0craft"]
+authors = ["x0craft <https://github.com/x0craft>"]
 readme = "README.md"
 keywords = ["ssh", "sftp", "scp", "cryptography", "network-programming"]
 categories = ["cryptography", "network-programming"]
@@ -66,7 +66,7 @@ edition = "2024"
 rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/neotales/rs-ssh"
-authors = ["x0craft"]
+authors = ["x0craft <https://github.com/x0craft>"]
 version = "0.0.0-alpha.0"
 
 [workspace.lints.rust]
