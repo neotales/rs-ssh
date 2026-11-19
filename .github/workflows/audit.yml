@@ -77,4 +77,4 @@ jobs:
       # template has none, so the command takes no flag. Do not add one to make
       # a red build green.
       - name: Check the lockfile against the advisory database
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071

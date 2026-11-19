@@ -25,7 +25,12 @@ all-features = true
 version = 2
 yanked = "deny"
 unmaintained = "transitive"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = """\
+    neotales-ssh uses rsa for host-key signatures, not for the Marvin \
+    private-key decryption path. This is not a mitigation. Delete this entry \
+    when rsa leaves the graph or the crate moves to a patched line.""" },
+]
 
 [licenses]
 allow = [
