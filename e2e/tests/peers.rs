@@ -154,62 +154,66 @@ impl Drop for Native {
     }
 }
 
+// The native fixture runs a real `sshd`, which only exists on Unix. Splitting
+// the test per platform keeps the Unix body able to fail: on any other target
+// it has nothing to do, and a `Result` that is always `Ok` is a lie.
+#[cfg(unix)]
 #[test]
 fn native_openssh() -> Result<(), Error> {
     if !enabled() {
         return Ok(());
     }
-    #[cfg(unix)]
-    {
-        let (Some(sshd), Some(keygen)) = (program("sshd"), program("ssh-keygen")) else {
-            eprintln!("skipping native SSH peer: sshd or ssh-keygen is missing");
-            return Ok(());
-        };
-        let directory = tempfile::tempdir()?;
-        let host = directory.path().join("host");
-        let status = Command::new(keygen)
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(&host)
+    let (Some(sshd), Some(keygen)) = (program("sshd"), program("ssh-keygen")) else {
+        eprintln!("skipping native SSH peer: sshd or ssh-keygen is missing");
+        return Ok(());
+    };
+    let directory = tempfile::tempdir()?;
+    let host = directory.path().join("host");
+    let status = Command::new(keygen)
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&host)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err("fixture host-key generation failed".into());
+    }
+    let expected = public_key(&std::fs::read(host.with_extension("pub"))?)?;
+    let authorized = directory.path().join("authorized_keys");
+    std::fs::write(&authorized, authorized_key()?)?;
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let config = directory.path().join("sshd_config");
+    std::fs::write(
+        &config,
+        format!(
+            "Port {}\nListenAddress 127.0.0.1\nHostKey \"{}\"\nAuthorizedKeysFile \"{}\"\nPidFile \"{}\"\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nUsePAM no\n",
+            address.port(),
+            host.display(),
+            authorized.display(),
+            directory.path().join("pid").display()
+        ),
+    )?;
+    let username = Command::new("id").arg("-un").output()?;
+    if !username.status.success() {
+        return Err("could not identify native fixture user".into());
+    }
+    let username = std::str::from_utf8(&username.stdout)?.trim();
+    let _server = Native(
+        Command::new(sshd)
+            .args(["-D", "-e", "-f"])
+            .arg(&config)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err("fixture host-key generation failed".into());
-        }
-        let expected = public_key(&std::fs::read(host.with_extension("pub"))?)?;
-        let authorized = directory.path().join("authorized_keys");
-        std::fs::write(&authorized, authorized_key()?)?;
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-        let address = listener.local_addr()?;
-        drop(listener);
-        let config = directory.path().join("sshd_config");
-        std::fs::write(
-            &config,
-            format!(
-                "Port {}\nListenAddress 127.0.0.1\nHostKey \"{}\"\nAuthorizedKeysFile \"{}\"\nPidFile \"{}\"\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nUsePAM no\n",
-                address.port(),
-                host.display(),
-                authorized.display(),
-                directory.path().join("pid").display()
-            ),
-        )?;
-        let username = Command::new("id").arg("-un").output()?;
-        if !username.status.success() {
-            return Err("could not identify native fixture user".into());
-        }
-        let username = std::str::from_utf8(&username.stdout)?.trim();
-        let _server = Native(
-            Command::new(sshd)
-                .args(["-D", "-e", "-f"])
-                .arg(&config)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?,
-        );
-        cases(address, expected, username)?;
-    }
-    #[cfg(not(unix))]
+            .spawn()?,
+    );
+    cases(address, expected, username)
+}
+
+#[cfg(not(unix))]
+#[test]
+fn native_openssh() {
     eprintln!("skipping native SSH peer: the native fixture requires Unix");
-    Ok(())
 }
