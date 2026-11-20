@@ -44,16 +44,41 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # `--workspace`, always: the default members of a virtual workspace are
+      # every member, so the root package alone is no longer the unit under
+      # test. `e2e/` is compiled here even though it is unpublished and its
+      # container peer only runs where Docker exists.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets --all-features
+        run: cargo test --workspace --all-targets --all-features
+
+      # The README and rustdoc samples are `no_run`. They must still compile,
+      # which `--all-targets` does not do; only the doctest target does.
+      - name: Doc tests
+        run: cargo test --workspace --doc --all-features
 
       - name: Documentation
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --all-features --no-deps
+        run: cargo doc --workspace --all-features --no-deps
+
+      # The real peers. The gate is set here and nowhere else, so a Windows or
+      # macOS job compiles `neotales-ssh-e2e` and skips at runtime rather than
+      # requiring Docker that those runners may not have. Ubuntu runners ship a
+      # Docker daemon, so the container peer is required there. `openssh-server`
+      # is installed because `native_openssh` must run a present `sshd`; it
+      # skips only when the binary is genuinely absent.
+      - name: Real-peer end-to-end tests
+        if: runner.os == 'Linux'
+        env:
+          NEOTALES_SSH_E2E: "1"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openssh-server
+          cargo test --workspace -p neotales-ssh-e2e --all-features
 
   msrv:
     name: msrv
@@ -98,5 +123,11 @@ jobs:
           sys.exit(1 if failed else 0)
           PY
 
+      # The whole workspace, so the unpublished `e2e` member is compiled on the
+      # minimum version too. Its runtime gate is unset here, so the real peers
+      # skip; compiling them is the point.
       - name: Test on the minimum supported Rust version
-        run: cargo test --all-targets --all-features
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Doc tests on the minimum supported Rust version
+        run: cargo test --workspace --doc --all-features

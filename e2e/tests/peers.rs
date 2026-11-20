@@ -156,10 +156,6 @@ impl Drop for Native {
 
 #[test]
 fn native_openssh() -> Result<(), Error> {
-    if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        eprintln!("skipping optional native peer in GitHub Actions");
-        return Ok(());
-    }
     if !enabled() {
         return Ok(());
     }
