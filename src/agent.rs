@@ -425,7 +425,7 @@ pub fn connect_unix(path: impl AsRef<Path>) -> Result<AgentClient<io::Empty>, Ag
 /// Opens a caller-supplied local Windows named pipe in synchronous byte mode.
 /// Accepts the explicit `\\.\pipe\` namespace only, with a nonempty name.
 /// No default pipe name or process environment is consulted. The caller owns
-/// blocking-I/O policy; unlike UnixStream, File has no portable timeout setter.
+/// blocking-I/O policy; unlike `UnixStream`, `File` has no portable timeout setter.
 ///
 /// # Errors
 /// Returns a fixed invalid-frame error for non-pipe paths, or an I/O error
