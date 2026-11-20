@@ -458,6 +458,22 @@ impl<T: ChannelTransport> SshClient<T> {
         self.exec(bytes)
     }
 
+    /// Opens a session, requests a shell, and returns its byte stream.
+    ///
+    /// The stream is an SSH shell channel, not a terminal: no PTY is requested,
+    /// so `read` receives whatever the server writes and `write` sends channel
+    /// data. Dropping the stream closes the session.
+    ///
+    /// # Errors
+    /// Returns session, request or transport errors, including
+    /// [`SessionError::RequestRejected`] when the server declines the shell.
+    pub fn shell(&mut self) -> Result<SessionStream<'_, T>, SessionError> {
+        let session = open_session(&mut self.sessions)?;
+        self.sessions.request_shell(session, true)?;
+        accepted(&mut self.sessions, session)?;
+        Ok(SessionStream::new(&mut self.sessions, session))
+    }
+
     /// Uploads one in-memory file and reports payload bytes after success.
     /// Failure may leave a partial remote file; retrying may overwrite it.
     ///
@@ -1202,6 +1218,36 @@ mod tests {
             let peer = client.sessions.into_inner();
             assert_eq!(peer.outgoing.last(), Some(&vec![97, 0, 0, 0, 42]));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shell_returns_a_readable_writable_channel() -> Result<(), Box<dyn std::error::Error>> {
+        let mut peer = peer()?;
+        peer.incoming.truncate(1);
+        peer.incoming.push_back(vec![99, 0, 0, 0, 0]);
+        let mut data = Writer::new();
+        data.write_byte(94);
+        data.write_uint32(0);
+        data.write_string(b"$ ")?;
+        peer.incoming.push_back(data.into_bytes());
+        peer.incoming.push_back(vec![97, 0, 0, 0, 0]);
+        let mut client = SshClient {
+            sessions: ClientSessions::new(peer),
+        };
+        let mut shell = client.shell()?;
+        let mut buffer = [0u8; 8];
+        assert_eq!(shell.read(&mut buffer)?, 2);
+        assert_eq!(&buffer[..2], b"$ ");
+        shell.write_all(b"ls\n")?;
+        drop(shell);
+        let peer = client.sessions.into_inner();
+        let request = peer
+            .outgoing
+            .iter()
+            .find(|packet| packet.first() == Some(&98))
+            .expect("shell request");
+        assert!(request.windows(b"shell".len()).any(|part| part == b"shell"));
         Ok(())
     }
 
