@@ -665,7 +665,18 @@ mod tests {
         assert!(LocalListener::bind("127.0.0.1", address.port(), b"destination", 80).is_err());
         let mut origin = TcpStream::connect(address)?;
         origin.set_nonblocking(true)?;
-        let mut copies = [listener.poll_accept(&mut client)?.ok_or("no accept")?];
+        // A completed local connect does not guarantee that the socket is already
+        // queued for acceptance, and macOS loopback can lag the `connect` above.
+        // Retry within a bounded window; exhausting it is still a failure.
+        let accept_deadline = Instant::now() + Duration::from_secs(3);
+        let accepted = loop {
+            if let Some(copy) = listener.poll_accept(&mut client)? {
+                break copy;
+            }
+            assert!(Instant::now() < accept_deadline, "no accept");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let mut copies = [accepted];
         origin.write_all(b"l")?;
         copies[0].poll_tcp(&mut client)?;
         let ChannelEvent::OpenRequest(request) = server.dispatch_one()? else {
