@@ -6,9 +6,7 @@ By [x0craft](https://github.com/x0craft).
 
 [![Neotales](https://github.com/neotales/brand/raw/main/assets/logo.png)](https://github.com/neotales/rs-ssh)
 
-![One does not simply negotiate SSH keys](https://media.giphy.com/media/smW5FBep69d3q/giphy.gif)
-
-**One does not simply negotiate SSH keys.** `neotales-ssh` handles the wire exchange, while your application decides which host keys to trust.
+**Negotiate keys, leave trust policy to the application.** `neotales-ssh` handles the wire exchange, while your application decides which host keys to trust.
 
 <!-- badges: crates.io, docs.rs, CI. Add once the first version exists. -->
 
