@@ -182,6 +182,7 @@ fn malformed_peer_kexinit_while_owned_terminally_disables_protected_io()
     let address = listener.local_addr()?;
     let (proceed_tx, proceed_rx) = mpsc::channel();
     let (malformed_kex_tx, malformed_kex_rx) = mpsc::channel();
+    let (observed_tx, observed_rx) = mpsc::channel();
     let server = std::thread::spawn(
         move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let (stream, _) = listener.accept()?;
@@ -194,6 +195,12 @@ fn malformed_peer_kexinit_while_owned_terminally_disables_protected_io()
             proceed_rx.recv_timeout(Duration::from_secs(5))?;
             server.write_payload(&[20])?;
             malformed_kex_tx.send(())?;
+            // Hold the connection open until the client has read the malformed
+            // packet. Closing with the client's partially written outbound
+            // packet still unread makes Windows abort the connection with RST,
+            // which discards the bytes the client is about to read and turns
+            // the assertion below into an I/O error.
+            observed_rx.recv_timeout(Duration::from_secs(5))?;
             Ok(())
         },
     );
@@ -224,10 +231,14 @@ fn malformed_peer_kexinit_while_owned_terminally_disables_protected_io()
     );
     proceed_tx.send(())?;
     malformed_kex_rx.recv_timeout(Duration::from_secs(5))?;
-    assert!(matches!(
-        client.read_while_owned(&id),
-        Err(TransportError::UnexpectedMessage)
-    ));
+    let malformed = client.read_while_owned(&id);
+    observed_tx
+        .send(())
+        .map_err(|_| "the server exited before the malformed packet was read")?;
+    assert!(
+        matches!(malformed, Err(TransportError::UnexpectedMessage)),
+        "the malformed KEXINIT must fail the owned read, got {malformed:?}"
+    );
     assert!(!client.is_established());
     assert_eq!(client.outbound_sequence(), outbound);
     assert!(matches!(
