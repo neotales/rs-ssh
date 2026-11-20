@@ -288,18 +288,23 @@ fn is_program(path: &Path) -> bool {
     let Ok(metadata) = path.metadata() else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    metadata.is_file() && is_executable(&metadata)
+}
+
+/// Whether an existing regular file may be run as a program.
+///
+/// Unix reads the execute bits. Windows has no mode bit to consult here: the
+/// `.exe` suffix already decided which names are considered in
+/// [`executable_names`], and `Command::new` does the rest.
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Runs the ordered lookup and retains the exact candidate list on a miss.
